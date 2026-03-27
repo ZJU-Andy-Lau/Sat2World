@@ -11,7 +11,7 @@ from .heads import (
     PointHead,
     SharedDenseDecoder,
 )
-from .rpc_anysplat import RPCAnySplat, RPCAnySplatCfg
+from .sat2world import Sat2World, Sat2WorldCfg
 
 __all__ = [
     "DINOv3Backbone",
@@ -32,6 +32,6 @@ __all__ = [
     "HeightHead",
     "PointHead",
     "GaussianHead",
-    "RPCAnySplat",
-    "RPCAnySplatCfg",
+    "Sat2World",
+    "Sat2WorldCfg",
 ]

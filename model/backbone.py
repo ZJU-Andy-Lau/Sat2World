@@ -9,9 +9,8 @@
 from __future__ import annotations
 
 import os
-import sys
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -23,16 +22,10 @@ class DINOv3BackboneCfg:
     """DINOv3Backbone 配置。
 
     字段说明:
-        model_name: dinov3 hub 中的模型构造函数名，如 dinov3_vitl16。
-        pretrained: 是否加载预训练权重。
-        weights: 可选，权重路径或 URL；当为空时使用官方默认权重。
-        freeze: 是否冻结 backbone 参数。
+        dino_weight_path: dinov3 预训练参数路径。
     """
 
-    model_name: str = "dinov3_vitl16"
-    pretrained: bool = False
-    weights: Optional[str] = None
-    freeze: bool = False
+    dino_weight_path: str = ""
 
 
 class DINOv3Backbone(nn.Module):
@@ -59,38 +52,23 @@ class DINOv3Backbone(nn.Module):
         self.patch_size = int(getattr(self.model, "patch_size", 16))
         self.embed_dim = int(getattr(self.model, "embed_dim", 1024))
 
-        if cfg.freeze:
-            for p in self.model.parameters():
-                p.requires_grad = False
+        # DINOv3 当前阶段始终冻结，不参与训练。
+        self.model.eval()
+        self.model.requires_grad_(False)
 
     def _build_model(self, cfg: DINOv3BackboneCfg) -> nn.Module:
-        """加载 DINOv3 模型。
-
-        优先使用 dinov3.hub.backbones 的工厂函数，若失败则回退到本地 ViT 构造。
-        """
+        """按约定方式加载本地 DINOv3 ViT-L/16 模型。"""
+        if cfg.dino_weight_path == "":
+            raise ValueError("DINOv3BackboneCfg.dino_weight_path 不能为空，请传入本地预训练权重路径。")
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        dino_root = os.path.join(repo_root, "third_party", "dinov3")
-        if dino_root not in sys.path:
-            sys.path.append(dino_root)
-
-        try:
-            from dinov3.hub import backbones as dino_backbones
-
-            if not hasattr(dino_backbones, cfg.model_name):
-                raise ValueError(f"Unknown dinov3 model_name: {cfg.model_name}")
-            ctor = getattr(dino_backbones, cfg.model_name)
-
-            kwargs: Dict[str, Any] = {"pretrained": cfg.pretrained}
-            if cfg.weights is not None:
-                kwargs["weights"] = cfg.weights
-            model = ctor(**kwargs)
-            return model
-        except Exception:
-            from dinov3.models.vision_transformer import vit_large
-
-            model = vit_large(patch_size=16)
-            model.init_weights()
-            return model
+        dino_repo = os.path.join(repo_root, "third_party", "dinov3")
+        model = torch.hub.load(
+            dino_repo,
+            "dinov3_vitl16",
+            source="local",
+            weights=cfg.dino_weight_path,
+        )
+        return model
 
     def _pad_to_patch_multiple(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int], tuple[int, int]]:
         """将输入在右侧和下侧 padding 到 patch_size 的整数倍。"""

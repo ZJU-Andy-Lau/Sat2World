@@ -14,7 +14,7 @@ from typing import Optional, Sequence
 
 import torch
 
-from rpc import RPCModelParameterTorch
+from geometry.rpc import RPCModelParameterTorch
 
 
 class RPCGeometryOps:

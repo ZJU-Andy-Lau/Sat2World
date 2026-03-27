@@ -183,8 +183,11 @@ class AlternatingEncoder(nn.Module):
         """初始化 AlternatingEncoder。"""
         super().__init__()
         self.cfg = cfg
-        self.scene_token = nn.Parameter(torch.zeros(1, 1, cfg.dim))
-        self.view_token = nn.Parameter(torch.zeros(1, 1, cfg.dim))
+        # 参考视图与其他视图分别使用不同的初始化 token（借鉴 VGGT 的双 token 思路）。
+        self.scene_token_ref = nn.Parameter(torch.zeros(1, 1, cfg.dim))
+        self.scene_token_other = nn.Parameter(torch.zeros(1, 1, cfg.dim))
+        self.view_token_ref = nn.Parameter(torch.zeros(1, 1, cfg.dim))
+        self.view_token_other = nn.Parameter(torch.zeros(1, 1, cfg.dim))
 
         self.intra_blocks = nn.ModuleList(
             [IntraViewBlock(cfg.dim, cfg.num_heads, cfg.ffn_ratio, cfg.dropout) for _ in range(cfg.num_layers)]
@@ -193,8 +196,10 @@ class AlternatingEncoder(nn.Module):
             [CrossViewBlock(cfg.dim, cfg.num_heads, cfg.ffn_ratio, cfg.dropout) for _ in range(cfg.num_layers)]
         )
 
-        nn.init.trunc_normal_(self.scene_token, std=0.02)
-        nn.init.trunc_normal_(self.view_token, std=0.02)
+        nn.init.trunc_normal_(self.scene_token_ref, std=0.02)
+        nn.init.trunc_normal_(self.scene_token_other, std=0.02)
+        nn.init.trunc_normal_(self.view_token_ref, std=0.02)
+        nn.init.trunc_normal_(self.view_token_other, std=0.02)
 
     @staticmethod
     def patch_tokens_to_map(patch_tokens: torch.Tensor, grid_hw: tuple[int, int]) -> torch.Tensor:
@@ -205,12 +210,31 @@ class AlternatingEncoder(nn.Module):
             raise ValueError(f"Token number mismatch: N={n}, Gh*Gw={gh*gw}")
         return patch_tokens.view(b, v, gh, gw, c).permute(0, 1, 4, 2, 3).contiguous()
 
-    def forward(self, patch_tokens: torch.Tensor, patch_valid_mask: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _build_ref_mask(self, b: int, v: int, ref_view_idx: int | torch.Tensor) -> torch.Tensor:
+        """构建 [B,V] 的参考视图掩码。"""
+        if isinstance(ref_view_idx, int):
+            idx = torch.full((b,), ref_view_idx, dtype=torch.long, device=self.scene_token_ref.device)
+        else:
+            idx = ref_view_idx.to(device=self.scene_token_ref.device, dtype=torch.long).view(-1)
+            if idx.numel() != b:
+                raise ValueError(f"ref_view_idx must have B={b} entries, got {idx.numel()}")
+        idx = idx.clamp(0, v - 1)
+        mask = torch.zeros((b, v), device=self.scene_token_ref.device, dtype=torch.bool)
+        mask[torch.arange(b, device=mask.device), idx] = True
+        return mask
+
+    def forward(
+        self,
+        patch_tokens: torch.Tensor,
+        patch_valid_mask: torch.Tensor,
+        ref_view_idx: int | torch.Tensor = 0,
+    ) -> dict[str, torch.Tensor]:
         """执行交替编码。
 
         参数:
             patch_tokens: [B,V,N,C]，融合后的视觉-几何 token。
             patch_valid_mask: [B,V,N]，True 为有效 patch。
+            ref_view_idx: 参考视图索引，支持 int 或 [B]。
 
         返回:
             dict:
@@ -227,8 +251,16 @@ class AlternatingEncoder(nn.Module):
         if c != self.cfg.dim:
             raise ValueError(f"Channel mismatch: got {c}, expect {self.cfg.dim}")
 
-        scene = self.scene_token.expand(b, -1, -1).squeeze(1).contiguous()
-        view = self.view_token.expand(b, v, -1).contiguous()
+        ref_mask = self._build_ref_mask(b, v, ref_view_idx).to(device=patch_tokens.device)
+
+        view_ref = self.view_token_ref.expand(b, v, -1).to(device=patch_tokens.device)
+        view_other = self.view_token_other.expand(b, v, -1).to(device=patch_tokens.device)
+        view = torch.where(ref_mask.unsqueeze(-1), view_ref, view_other).contiguous()
+
+        scene_ref = self.scene_token_ref.expand(b, v, -1).to(device=patch_tokens.device)
+        scene_other = self.scene_token_other.expand(b, v, -1).to(device=patch_tokens.device)
+        scene_per_view = torch.where(ref_mask.unsqueeze(-1), scene_ref, scene_other)
+        scene = scene_per_view.mean(dim=1).contiguous()
         patch = patch_tokens
 
         for intra, cross in zip(self.intra_blocks, self.cross_blocks):
