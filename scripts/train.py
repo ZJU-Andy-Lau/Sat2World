@@ -118,6 +118,7 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
             "lambda_affine_grid": float(lcfg.get("lambda_affine_grid", 1.0)),
             "lambda_affine_pair": float(lcfg.get("lambda_affine_pair", 1.0)),
             "lambda_affine_reg": float(lcfg.get("lambda_affine_reg", 0.1)),
+            "lambda_affine_ref": float(lcfg.get("lambda_affine_ref", 0.1)),
             "lambda_height": float(lcfg.get("lambda_height", 1.0)),
             "lambda_point": float(lcfg.get("lambda_point", 1.0)),
             "lambda_center": float(lcfg.get("lambda_center", 0.2)),
