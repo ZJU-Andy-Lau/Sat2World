@@ -1,7 +1,24 @@
 import numpy as np
 import os
 import torch
-import cv2
+
+try:
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover
+    cv2 = None
+
+
+def _affine_from_3pts(corners: np.ndarray, offset_corners: np.ndarray) -> np.ndarray:
+    """计算 2x3 仿射矩阵。
+
+    优先使用 OpenCV；若环境无 cv2，则回退到 numpy 线性求解，保持工程可运行性。
+    """
+    if cv2 is not None:
+        return cv2.getAffineTransform(corners, offset_corners)
+    a = np.concatenate([corners, np.ones((3, 1), dtype=corners.dtype)], axis=1)  # [3,3]
+    x = np.linalg.solve(a, offset_corners[:, 0])
+    y = np.linalg.solve(a, offset_corners[:, 1])
+    return np.stack([x, y], axis=0)
 
 
 class RPCModelParameterTorch:
@@ -252,7 +269,7 @@ class RPCModelParameterTorch:
 
         offset_corners = corners - np.stack([offset_line, offset_samp], axis=1)
 
-        af_trans = cv2.getAffineTransform(corners, offset_corners)
+        af_trans = _affine_from_3pts(corners, offset_corners)
         self.Update_Adjust(torch.from_numpy(af_trans))
 
     def Merge_Adjust(self):

@@ -332,12 +332,23 @@ def rasterize_projected_gaussians(
         w = torch.exp(-0.5 * m)
 
         alpha = torch.clamp(opacity[g] * w, 0.0, alpha_clamp_max).unsqueeze(0)
-        contrib = trans[:, l0 : l1 + 1, s0 : s1 + 1] * alpha
+        trans_patch = trans[:, l0 : l1 + 1, s0 : s1 + 1]
+        contrib = trans_patch * alpha
 
-        canvas_rgb[:, l0 : l1 + 1, s0 : s1 + 1] = canvas_rgb[:, l0 : l1 + 1, s0 : s1 + 1] + contrib * rgb[g].view(3, 1, 1)
-        canvas_height[:, l0 : l1 + 1, s0 : s1 + 1] = canvas_height[:, l0 : l1 + 1, s0 : s1 + 1] + contrib * height_value[g]
-        canvas_alpha[:, l0 : l1 + 1, s0 : s1 + 1] = canvas_alpha[:, l0 : l1 + 1, s0 : s1 + 1] + contrib
-        trans[:, l0 : l1 + 1, s0 : s1 + 1] = trans[:, l0 : l1 + 1, s0 : s1 + 1] * (1.0 - alpha)
+        new_canvas_rgb = canvas_rgb.clone()
+        new_canvas_height = canvas_height.clone()
+        new_canvas_alpha = canvas_alpha.clone()
+        new_trans = trans.clone()
+
+        new_canvas_rgb[:, l0 : l1 + 1, s0 : s1 + 1] = canvas_rgb[:, l0 : l1 + 1, s0 : s1 + 1] + contrib * rgb[g].view(3, 1, 1)
+        new_canvas_height[:, l0 : l1 + 1, s0 : s1 + 1] = canvas_height[:, l0 : l1 + 1, s0 : s1 + 1] + contrib * height_value[g]
+        new_canvas_alpha[:, l0 : l1 + 1, s0 : s1 + 1] = canvas_alpha[:, l0 : l1 + 1, s0 : s1 + 1] + contrib
+        new_trans[:, l0 : l1 + 1, s0 : s1 + 1] = trans_patch * (1.0 - alpha)
+
+        canvas_rgb = new_canvas_rgb
+        canvas_height = new_canvas_height
+        canvas_alpha = new_canvas_alpha
+        trans = new_trans
 
     rendered_height = canvas_height / canvas_alpha.clamp_min(1e-8)
     rendered_height = torch.where(canvas_alpha > 1e-6, rendered_height, torch.zeros_like(rendered_height))

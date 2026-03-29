@@ -1,29 +1,27 @@
-"""独立验证脚本。"""
+"""Sat2World 独立验证脚本。"""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 from typing import Any
 
 import torch
 import yaml
 from torch.utils.data import DataLoader, DistributedSampler
 
-from dataset import build_dataset, rpc_scene_collate_fn
-from engine import TensorBoardMonitor, Trainer, destroy_distributed, init_distributed, is_main_process, resume_from_checkpoint
-from engine.distributed import configure_cuda_runtime, seed_everything, wrap_ddp
-from loss.total_loss import RPCAnySplatTrainingObjective
-from model import Sat2World, Sat2WorldCfg
-from render import RPCGaussianRenderer, RPCGaussianRendererCfg
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("Sat2World Validate")
-    p.add_argument("--config", type=str, required=True)
+    p.add_argument("--config", type=str, default="config/default.yaml")
     p.add_argument("--checkpoint", type=str, required=True)
-    p.add_argument("--work-dir", type=str, required=True)
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--work-dir", type=str, default="")
+    p.add_argument("--seed", type=int, default=-1)
     p.add_argument("--local-rank", type=int, default=0)
     return p.parse_args()
 
@@ -34,48 +32,120 @@ def load_cfg(path: str) -> dict[str, Any]:
 
 
 def build_model(cfg: dict[str, Any]) -> Sat2World:
-    mcfg = Sat2WorldCfg()
-    backbone = cfg.get("model", {}).get("backbone", {})
-    if "dino_weight_path" in backbone:
-        mcfg.backbone.dino_weight_path = backbone["dino_weight_path"]
-    return Sat2World(mcfg)
+    from model import Sat2World, Sat2WorldCfg
+
+    m = cfg.get("model", {})
+    scfg = Sat2WorldCfg()
+    scfg.backbone.dino_weight_path = str(m.get("dino_weight_path", scfg.backbone.dino_weight_path))
+    scfg.encoder.dim = int(m.get("embed_dim", scfg.encoder.dim))
+    scfg.encoder.num_heads = int(m.get("encoder_num_heads", scfg.encoder.num_heads))
+    scfg.encoder.num_layers = int(m.get("encoder_depth", scfg.encoder.num_layers))
+    scfg.encoder.ffn_ratio = float(m.get("encoder_ffn_ratio", scfg.encoder.ffn_ratio))
+    scfg.encoder.dropout = float(m.get("encoder_dropout", scfg.encoder.dropout))
+    scfg.affine_head.diag_scale = float(m.get("affine_diag_scale", scfg.affine_head.diag_scale))
+    scfg.affine_head.offdiag_scale = float(m.get("affine_offdiag_scale", scfg.affine_head.offdiag_scale))
+    scfg.affine_head.trans_scale = float(m.get("affine_trans_scale", scfg.affine_head.trans_scale))
+    scfg.height_bins = int(m.get("height_bins", scfg.height_bins))
+    scfg.point_bins = int(m.get("point_bins", scfg.point_bins))
+    scfg.sh_dim = int(m.get("sh_dim", scfg.sh_dim))
+    return Sat2World(scfg)
+
+
+def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTrainingObjective:
+    from loss.affine_loss import AffineGridLossCfg, AffinePairwiseGeometryLossCfg
+    from loss.total_loss import LossWeightScheduler, RPCAnySplatTrainingObjective
+
+    lcfg = cfg.get("loss", {})
+    pair_cfg = AffinePairwiseGeometryLossCfg(
+        anchors_per_pair=int(lcfg.get("anchors_per_pair", 256)),
+        max_pairs=lcfg.get("max_pairs", None),
+        sample_from_valid_only=bool(lcfg.get("sample_from_valid_only", True)),
+    )
+    grid_cfg = AffineGridLossCfg(
+        grid_h=int(lcfg.get("affine_grid_h", 16)),
+        grid_w=int(lcfg.get("affine_grid_w", 16)),
+    )
+    scheduler = LossWeightScheduler(
+        warmup_steps_geom_only=int(lcfg.get("warmup_steps_geom_only", 1000)),
+        render_ramp_steps=int(lcfg.get("render_ramp_steps", 2000)),
+    )
+    return RPCAnySplatTrainingObjective(
+        geometry_ops=geometry_ops,
+        affine_grid_cfg=grid_cfg,
+        affine_pair_cfg=pair_cfg,
+        height_beta=float(lcfg.get("height_beta", 1.0)),
+        point_beta=float(lcfg.get("point_beta", 1.0)),
+        scale_min=float(lcfg.get("scale_min", 1e-4)),
+        scale_max=float(lcfg.get("scale_max", 0.5)),
+        scheduler=scheduler,
+    )
 
 
 def main() -> None:
+    from dataset import build_dataset, rpc_scene_collate_fn
+    from engine import (
+        TensorBoardMonitor,
+        Trainer,
+        configure_cuda_runtime,
+        destroy_distributed,
+        init_distributed,
+        is_main_process,
+        resume_from_checkpoint,
+        seed_everything,
+        wrap_ddp,
+    )
+    from render import RPCGaussianRenderer, RPCGaussianRendererCfg
+
     args = parse_args()
     cfg = load_cfg(args.config)
-    work_dir = Path(args.work_dir)
+
+    system_cfg = cfg.get("system", {})
+    if args.work_dir:
+        system_cfg["work_dir"] = args.work_dir
+    if args.seed >= 0:
+        system_cfg["seed"] = args.seed
+
+    work_dir = Path(system_cfg.get("work_dir", "work_dirs/default"))
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    dist_state = init_distributed(backend=str(cfg.get("ddp", {}).get("backend", "nccl")))
+    dist_state = init_distributed(backend=str(system_cfg.get("ddp_backend", "nccl")))
     device = dist_state["device"]
-    seed_everything(args.seed)
-    configure_cuda_runtime(cfg.get("runtime", {}))
+    seed_everything(int(system_cfg.get("seed", 42)))
+    configure_cuda_runtime(
+        {
+            "cudnn_benchmark": bool(system_cfg.get("cudnn_benchmark", True)),
+            "allow_tf32": bool(system_cfg.get("allow_tf32", True)),
+        }
+    )
 
-    val_dataset = build_dataset(mode="val", **cfg.get("dataset", {}).get("val", {}))
+    data_cfg = cfg.get("data", {})
+    loader_cfg = data_cfg.get("loader", {})
+    val_dataset = build_dataset(mode="val", **data_cfg.get("val", {}))
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if dist_state["distributed"] else None
     val_loader = DataLoader(
         val_dataset,
-        batch_size=int(cfg.get("dataloader", {}).get("val_batch_size", 1)),
-        num_workers=int(cfg.get("dataloader", {}).get("num_workers", 4)),
+        batch_size=int(loader_cfg.get("val_batch_size", 1)),
+        num_workers=int(loader_cfg.get("num_workers", 4)),
         sampler=val_sampler,
         shuffle=False,
         collate_fn=rpc_scene_collate_fn,
-        pin_memory=True,
+        pin_memory=bool(loader_cfg.get("pin_memory", True)),
         drop_last=False,
     )
 
     model = build_model(cfg).to(device)
-    renderer_cfg = RPCGaussianRendererCfg()
+    rcfg = RPCGaussianRendererCfg()
     for k, v in cfg.get("renderer", {}).items():
-        if hasattr(renderer_cfg, k):
-            setattr(renderer_cfg, k, v)
-    renderer = RPCGaussianRenderer(model.rpc_ops, renderer_cfg)
-    objective = RPCAnySplatTrainingObjective(geometry_ops=model.rpc_ops)
-
+        if hasattr(rcfg, k):
+            setattr(rcfg, k, v)
+    renderer = RPCGaussianRenderer(model.rpc_ops, rcfg)
+    objective = build_objective(cfg, model.rpc_ops)
     model = wrap_ddp(model, device)
 
-    monitor = TensorBoardMonitor(log_dir=str(work_dir / "tb_val"), is_enabled=is_main_process()) if is_main_process() else None
+    monitor = None
+    if is_main_process() and bool(cfg.get("logging", {}).get("tensorboard", {}).get("enable", True)):
+        tb_cfg = cfg.get("logging", {}).get("tensorboard", {})
+        monitor = TensorBoardMonitor(log_dir=str(tb_cfg.get("log_dir", work_dir / "tb_val")), is_enabled=True)
 
     _ = resume_from_checkpoint(
         args.checkpoint,
@@ -86,8 +156,12 @@ def main() -> None:
         map_location="cpu",
     )
 
+    trainer_cfg = dict(cfg.get("train", {}))
+    trainer_cfg["enable_render_train"] = False
+    trainer_cfg["enable_render_val"] = bool(cfg.get("train", {}).get("enable_render_val", True))
+
     trainer = Trainer(
-        cfg=cfg.get("trainer", {}),
+        cfg=trainer_cfg,
         model=model,
         renderer=renderer,
         objective=objective,

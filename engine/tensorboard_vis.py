@@ -75,7 +75,8 @@ class TensorBoardMonitor:
             fv = self._to_float(v)
             if fv is None:
                 continue
-            self.writer.add_scalar(f"{tag_prefix}/{k}", fv, global_step)
+            tag = k if "/" in k else f"{tag_prefix}/{k}"
+            self.writer.add_scalar(tag, fv, global_step)
 
     def log_histograms(self, hist_dict: dict[str, Any], global_step: int) -> None:
         """记录直方图。"""

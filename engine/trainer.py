@@ -81,12 +81,16 @@ class Trainer:
         self.ckpt_interval = int(cfg.get("ckpt_interval", 500))
         self.val_interval = int(cfg.get("val_interval", 1000))
         self.validate_each_epoch = bool(cfg.get("validate_each_epoch", True))
+        self.validate_first = bool(cfg.get("validate_first", False))
         self.best_metric_name = str(cfg.get("best_metric", "loss_total"))
         self.best_mode = str(cfg.get("best_mode", "min"))
         self.grad_clip_norm = float(cfg.get("grad_clip_norm", 0.0))
         self.amp_dtype = str(cfg.get("amp_dtype", "fp16"))
         self.enable_render_train = bool(cfg.get("enable_render_train", True))
         self.enable_render_val = bool(cfg.get("enable_render_val", True))
+        self.skip_nan_batch = bool(cfg.get("skip_nan_batch", True))
+        self.max_train_steps_per_epoch = int(cfg.get("max_train_steps_per_epoch", -1))
+        self.max_val_steps = int(cfg.get("max_val_steps", -1))
 
         self.epoch = 0
         self.global_step = 0
@@ -236,7 +240,10 @@ class Trainer:
                 loss_to_backward = loss / float(self.accumulate_steps)
 
             if not torch.isfinite(loss):
-                return {"skip_non_finite": 1.0}
+                if self.skip_nan_batch:
+                    self.optimizer.zero_grad(set_to_none=True)
+                    return {"skip_non_finite": 1.0}
+                raise FloatingPointError("Non-finite total_loss encountered in training step.")
 
             if self.scaler is not None:
                 self.scaler.scale(loss_to_backward).backward()
@@ -359,6 +366,8 @@ class Trainer:
         self.model.train()
         prev_time = time.time()
         for step_idx, batch in enumerate(self.train_loader):
+            if self.max_train_steps_per_epoch > 0 and step_idx >= self.max_train_steps_per_epoch:
+                break
             if self.skip_steps_in_current_epoch > 0 and step_idx < self.skip_steps_in_current_epoch:
                 continue
             if self.skip_steps_in_current_epoch > 0 and step_idx >= self.skip_steps_in_current_epoch:
@@ -366,6 +375,7 @@ class Trainer:
 
             data_time = time.time() - prev_time
             logs = self._train_one_step(batch, step_idx, data_time)
+            self.step_in_epoch = step_idx + 1
             prev_time = time.time()
 
             if is_main_process() and (step_idx % self.log_interval == 0):
@@ -389,7 +399,9 @@ class Trainer:
         agg: dict[str, float] = {}
         n = 0
         with torch.no_grad():
-            for batch in self.val_loader:
+            for step_idx, batch in enumerate(self.val_loader):
+                if self.max_val_steps > 0 and step_idx >= self.max_val_steps:
+                    break
                 batch_dev = move_batch_to_device(batch, self.device)
                 with self._autocast_context():
                     _, _, _, scalar, _ = self._forward_batch(batch_dev, mode="val")
@@ -416,6 +428,8 @@ class Trainer:
     def fit(self) -> None:
         """训练主循环。"""
         try:
+            if self.validate_first:
+                self.validate()
             for ep in range(self.start_epoch, self.max_epochs):
                 self.epoch = ep
                 self._set_epoch_for_samplers(ep)
