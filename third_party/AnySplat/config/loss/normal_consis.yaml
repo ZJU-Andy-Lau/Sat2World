@@ -1,5 +1,0 @@
-normal_consis:
-  normal_weight: 1.0
-  smooth_weight: 1.0
-  sigma_image: null
-  use_second_derivative: false
