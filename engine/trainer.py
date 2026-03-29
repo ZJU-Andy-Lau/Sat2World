@@ -177,6 +177,13 @@ class Trainer:
                     rid = int(ref[bi].item()) if torch.is_tensor(ref) else int(ref)
                     errs.append((a[bi, rid] - eye).abs().mean())
                 p["probe_reference_affine_identity_error"] = float(torch.stack(errs).mean().detach().item())
+            a = outputs["affine_pred"]
+            tx_ty_abs = a[..., :, 2].abs().mean()
+            linear = a[..., :, :2]
+            eye2 = torch.eye(2, dtype=linear.dtype, device=linear.device).view(1, 1, 2, 2)
+            linear_dev = (linear - eye2).abs().mean()
+            p["probe_affine_pred_translation_abs_mean"] = float(tx_ty_abs.detach().item())
+            p["probe_affine_pred_linear_deviation_mean"] = float(linear_dev.detach().item())
         for name, key in [
             ("probe_nan_ratio_height", "height_abs"),
             ("probe_nan_ratio_point", "point_abs"),
