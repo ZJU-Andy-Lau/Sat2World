@@ -29,6 +29,7 @@ data:
     base_seed: 12345
     reference_policy: first
     strict_same_hw: true
+    crop_size: 512
     perturb_cfg:
       tx_range: [ -2.0, 2.0 ]
       ty_range: [ -2.0, 2.0 ]
@@ -47,6 +48,7 @@ data:
     base_seed: 22345
     reference_policy: first
     strict_same_hw: true
+    crop_size: 512
     perturb_cfg:
       tx_range: [ -2.0, 2.0 ]
       ty_range: [ -2.0, 2.0 ]
@@ -54,6 +56,7 @@ data:
       shear_range: [ -0.0005, 0.0005 ]
   test:
     root: test_data
+    crop_size: 512
   loader:
     batch_size: 1
     val_batch_size: 1

@@ -39,6 +39,7 @@ class ViewRecord:
     image_path: str
     height_path: str
     rpc_path: str
+    full_hw: tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -129,6 +130,7 @@ def scan_dataset_root(root_dir: str | os.PathLike[str]) -> list[SceneRecord]:
             image_path = _select_unique_file(view_dir, image_pat, "image tif")
             height_path = _select_unique_file(view_dir, height_pat, "height tif")
             rpc_path = _select_unique_file(view_dir, rpc_pat, "rpc txt")
+            full_hw = inspect_raster_shape(str(image_path))[:2]
 
             views.append(
                 ViewRecord(
@@ -137,6 +139,7 @@ def scan_dataset_root(root_dir: str | os.PathLike[str]) -> list[SceneRecord]:
                     image_path=str(image_path),
                     height_path=str(height_path),
                     rpc_path=str(rpc_path),
+                    full_hw=full_hw,
                 )
             )
 
@@ -155,6 +158,30 @@ def _read_tif_with_rasterio(path: str) -> tuple[np.ndarray, Optional[float]]:
     return arr, nodata
 
 
+def inspect_raster_shape(path: str) -> tuple[int, int, int, str]:
+    """读取栅格元信息，返回 (H, W, C, dtype_str)。"""
+    try:
+        import rasterio
+
+        with rasterio.open(path) as ds:
+            return int(ds.height), int(ds.width), int(ds.count), str(ds.dtypes[0])
+    except Exception:
+        import tifffile
+
+        arr = tifffile.imread(path)
+        arr_chw = _to_chw(arr)
+        return int(arr_chw.shape[1]), int(arr_chw.shape[2]), int(arr_chw.shape[0]), str(arr.dtype)
+
+
+def _normalize_window(window: tuple[int, int, int, int], image_h: int, image_w: int) -> tuple[int, int, int, int]:
+    top, left, h, w = [int(v) for v in window]
+    if top < 0 or left < 0 or h <= 0 or w <= 0:
+        raise ValueError(f"Invalid window={window}")
+    if top + h > image_h or left + w > image_w:
+        raise ValueError(f"window out of bounds: window={window}, image_hw=({image_h},{image_w})")
+    return top, left, h, w
+
+
 def _read_tif_with_tifffile(path: str) -> tuple[np.ndarray, Optional[float]]:
     """用 tifffile 读取 tif，返回数组与 nodata(None)。"""
     import tifffile
@@ -163,12 +190,28 @@ def _read_tif_with_tifffile(path: str) -> tuple[np.ndarray, Optional[float]]:
     return arr, None
 
 
-def _read_tif(path: str) -> tuple[np.ndarray, Optional[float]]:
+def _read_tif(path: str, window: tuple[int, int, int, int] | None = None) -> tuple[np.ndarray, Optional[float]]:
     """按优先级读取 tif：rasterio -> tifffile。"""
     try:
-        return _read_tif_with_rasterio(path)
+        import rasterio
+        from rasterio.windows import Window
+
+        with rasterio.open(path) as ds:
+            if window is None:
+                arr = ds.read()
+            else:
+                top, left, h, w = _normalize_window(window, int(ds.height), int(ds.width))
+                win = Window(col_off=left, row_off=top, width=w, height=h)
+                arr = ds.read(window=win)
+            nodata = ds.nodata
+        return arr, nodata
     except Exception:
-        return _read_tif_with_tifffile(path)
+        arr, nodata = _read_tif_with_tifffile(path)
+        if window is not None:
+            arr_chw = _to_chw(arr)
+            top, left, h, w = _normalize_window(window, int(arr_chw.shape[1]), int(arr_chw.shape[2]))
+            arr = arr_chw[:, top : top + h, left : left + w]
+        return arr, nodata
 
 
 def _to_chw(arr: np.ndarray) -> np.ndarray:
@@ -184,7 +227,12 @@ def _to_chw(arr: np.ndarray) -> np.ndarray:
     return np.transpose(arr, (2, 0, 1))
 
 
-def read_image_tif(path: str, image_scale_mode: str = "dtype") -> torch.Tensor:
+def read_image_tif(
+    path: str,
+    image_scale_mode: str = "dtype",
+    *,
+    window: tuple[int, int, int, int] | None = None,
+) -> torch.Tensor:
     """读取 RGB 影像 tif 并输出 [3,H,W] float32。
 
     参数:
@@ -195,7 +243,7 @@ def read_image_tif(path: str, image_scale_mode: str = "dtype") -> torch.Tensor:
     返回:
         image: torch.float32, [3,H,W]。
     """
-    arr, _ = _read_tif(path)
+    arr, _ = _read_tif(path, window=window)
     arr = _to_chw(arr)
 
     if arr.shape[0] == 1:
@@ -222,7 +270,7 @@ def read_image_tif(path: str, image_scale_mode: str = "dtype") -> torch.Tensor:
     return torch.from_numpy(arr).to(torch.float32)
 
 
-def read_height_tif(path: str) -> tuple[torch.Tensor, torch.Tensor]:
+def read_height_tif(path: str, *, window: tuple[int, int, int, int] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """读取高程 tif，返回高程与有效掩码。
 
     参数:
@@ -233,7 +281,7 @@ def read_height_tif(path: str) -> tuple[torch.Tensor, torch.Tensor]:
                 对 NaN/Inf/nodata 无效位置使用“有效像素平均高程”填充。
         valid_mask: float32, [1,H,W]，有效为1，无效为0（后续 loss 可据此屏蔽）。
     """
-    arr, nodata = _read_tif(path)
+    arr, nodata = _read_tif(path, window=window)
     arr = _to_chw(arr)
 
     # 若多通道高程，按约定使用第一个通道。
@@ -268,6 +316,66 @@ def read_rpc_file(path: str) -> "RPCModelParameterTorch":
     from geometry.rpc import load_rpc
 
     return load_rpc(path, to_gpu=False)
+
+
+def linesamp_to_raw_xy(
+    rpc_obj: "RPCModelParameterTorch",
+    line: torch.Tensor,
+    samp: torch.Tensor,
+    h: torch.Tensor,
+) -> torch.Tensor:
+    """将像平面 (line,samp,h) 转为 raw 物方 (x,y)（米制）。"""
+    x, y = rpc_obj.RPC_LINESAMP2XY(line_in=line, samp_in=samp, h_in=h, output_type="tensor")
+    return torch.stack([x, y], dim=-1)
+
+
+def raw_xy_to_linesamp(
+    rpc_obj: "RPCModelParameterTorch",
+    x: torch.Tensor,
+    y: torch.Tensor,
+    h: torch.Tensor,
+) -> torch.Tensor:
+    """将 raw 物方 (x,y,h) 投影到像平面 (line,samp)。"""
+    line, samp = rpc_obj.RPC_XY2LINESAMP(x_in=x, y_in=y, h_in=h, output_type="tensor")
+    return torch.stack([line, samp], dim=-1)
+
+
+def compute_valid_crop_anchor_bbox(
+    rpc_obj: "RPCModelParameterTorch",
+    full_h: int,
+    full_w: int,
+    crop_size: int,
+    h_anchor: float,
+    support_grid_size: int = 3,
+) -> tuple[float, float, float, float]:
+    """估计某视图合法 crop center 区域在 raw 物方平面的保守 bbox。
+
+    返回 (x_min, x_max, y_min, y_max)。
+    """
+    if full_h < crop_size or full_w < crop_size:
+        raise ValueError(f"full_hw=({full_h},{full_w}) smaller than crop_size={crop_size}")
+    if support_grid_size < 2:
+        support_grid_size = 2
+
+    half = float(crop_size) * 0.5
+    line_min = half
+    line_max = float(full_h) - half
+    samp_min = half
+    samp_max = float(full_w) - half
+
+    line_vec = torch.linspace(line_min, line_max, steps=support_grid_size, device=rpc_obj.device, dtype=torch.double)
+    samp_vec = torch.linspace(samp_min, samp_max, steps=support_grid_size, device=rpc_obj.device, dtype=torch.double)
+    gl, gs = torch.meshgrid(line_vec, samp_vec, indexing="ij")
+    line = gl.reshape(-1)
+    samp = gs.reshape(-1)
+    h = torch.full_like(line, float(h_anchor), dtype=torch.double, device=rpc_obj.device)
+    xy = linesamp_to_raw_xy(rpc_obj, line=line, samp=samp, h=h)  # [N,2], x,y
+
+    x_min = float(xy[:, 0].min().item())
+    x_max = float(xy[:, 0].max().item())
+    y_min = float(xy[:, 1].min().item())
+    y_max = float(xy[:, 1].max().item())
+    return x_min, x_max, y_min, y_max
 
 
 def estimate_scene_xy_center_scale(
