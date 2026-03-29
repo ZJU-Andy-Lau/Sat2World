@@ -112,7 +112,11 @@ def configure_cuda_runtime(cfg: dict[str, Any] | None = None) -> None:
 def _reduce_tensor_mean(x: torch.Tensor) -> torch.Tensor:
     if not is_distributed():
         return x
-    y = x.clone()
+    y = x
+    if dist.get_backend() == "nccl" and (not y.is_cuda):
+        if torch.cuda.is_available():
+            y = y.to(device=torch.device("cuda", get_local_rank()))
+    y = y.clone()
     dist.all_reduce(y, op=dist.ReduceOp.SUM)
     y = y / float(get_world_size())
     return y
@@ -126,7 +130,11 @@ def all_reduce_mean(value: Any) -> Any:
     if torch.is_tensor(value):
         return _reduce_tensor_mean(value)
     if isinstance(value, (int, float)):
-        t = torch.tensor(float(value), device="cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            dev = torch.device("cuda", get_local_rank())
+        else:
+            dev = torch.device("cpu")
+        t = torch.tensor(float(value), device=dev)
         return float(_reduce_tensor_mean(t).item())
     if isinstance(value, dict):
         out: dict[str, Any] = {}
@@ -156,6 +164,22 @@ def move_batch_to_device(batch: Any, device: torch.device, non_blocking: bool = 
     if isinstance(batch, tuple):
         return tuple(move_batch_to_device(v, device, non_blocking=non_blocking) for v in batch)
     return batch
+
+
+def assert_tensor_tree_device(obj: Any, expected_device: torch.device, prefix: str = "") -> None:
+    """递归检查嵌套结构中所有 tensor 的 device 一致性。"""
+    if torch.is_tensor(obj):
+        if obj.device != expected_device:
+            raise RuntimeError(f"Device mismatch at {prefix or '<root>'}: got {obj.device}, expect {expected_device}")
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            assert_tensor_tree_device(v, expected_device, prefix=f"{prefix}.{k}" if prefix else str(k))
+        return
+    if isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            assert_tensor_tree_device(v, expected_device, prefix=f"{prefix}[{i}]")
+        return
 
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:

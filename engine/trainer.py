@@ -21,6 +21,7 @@ from torch import nn
 from engine.checkpoint import save_checkpoint
 from engine.distributed import (
     all_reduce_mean,
+    assert_tensor_tree_device,
     barrier,
     get_cuda_memory_stats,
     is_main_process,
@@ -91,6 +92,7 @@ class Trainer:
         self.skip_nan_batch = bool(cfg.get("skip_nan_batch", True))
         self.max_train_steps_per_epoch = int(cfg.get("max_train_steps_per_epoch", -1))
         self.max_val_steps = int(cfg.get("max_val_steps", -1))
+        self.device_sanity_check = bool(cfg.get("device_sanity_check", False))
 
         self.epoch = 0
         self.global_step = 0
@@ -157,10 +159,18 @@ class Trainer:
 
     def _forward_batch(self, batch_dev: dict[str, Any], mode: str):
         """统一前向：model -> renderer(optional) -> objective。"""
+        if self.device_sanity_check:
+            assert_tensor_tree_device(batch_dev, self.device, prefix="batch")
         outputs = self.model(batch_dev)
+        if self.device_sanity_check:
+            assert_tensor_tree_device(outputs, self.device, prefix="outputs")
         use_render = (mode == "train" and self.enable_render_train) or (mode != "train" and self.enable_render_val)
         render_outputs = self.renderer.render_paths(outputs, batch_dev, mode=mode) if (self.renderer is not None and use_render) else None
+        if self.device_sanity_check and render_outputs is not None:
+            assert_tensor_tree_device(render_outputs, self.device, prefix="render_outputs")
         total_loss, scalar_dict, aux_dict = self.objective(outputs, batch_dev, self.global_step, self.epoch, render_outputs, mode)
+        if self.device_sanity_check and torch.is_tensor(total_loss) and total_loss.device != self.device:
+            raise RuntimeError(f"total_loss device mismatch: got {total_loss.device}, expect {self.device}")
         return outputs, render_outputs, total_loss, scalar_dict, aux_dict
 
     def _sanity_probe(self, outputs: dict[str, Any], batch_dev: dict[str, Any]) -> dict[str, float]:
