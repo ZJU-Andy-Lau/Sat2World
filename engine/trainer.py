@@ -21,6 +21,7 @@ from torch import nn
 from engine.checkpoint import save_checkpoint
 from engine.distributed import (
     all_reduce_mean,
+    assert_tensor_tree_device,
     barrier,
     get_cuda_memory_stats,
     is_main_process,
@@ -91,6 +92,8 @@ class Trainer:
         self.skip_nan_batch = bool(cfg.get("skip_nan_batch", True))
         self.max_train_steps_per_epoch = int(cfg.get("max_train_steps_per_epoch", -1))
         self.max_val_steps = int(cfg.get("max_val_steps", -1))
+        self.device_sanity_check = bool(cfg.get("device_sanity_check", False))
+        self.enable_fixed_monitor_cache = bool(cfg.get("enable_fixed_monitor_cache", True))
 
         self.epoch = 0
         self.global_step = 0
@@ -108,7 +111,6 @@ class Trainer:
 
         self.fixed_train_monitor_batch = None
         self.fixed_val_monitor_batch = None
-        self._prepare_fixed_monitor_batches()
 
     def _clone_batch_cpu(self, batch: dict[str, Any], keep_samples: int = 1) -> dict[str, Any]:
         """把 batch 截取并拷贝到 CPU，作为固定监控样本。"""
@@ -121,19 +123,6 @@ class Trainer:
             else:
                 out[k] = copy.deepcopy(v)
         return out
-
-    def _prepare_fixed_monitor_batches(self) -> None:
-        """缓存固定 train/val 监控样本。"""
-        try:
-            train_first = next(iter(self.train_loader))
-            self.fixed_train_monitor_batch = self._clone_batch_cpu(train_first, keep_samples=1)
-        except Exception:
-            self.fixed_train_monitor_batch = None
-        try:
-            val_first = next(iter(self.val_loader))
-            self.fixed_val_monitor_batch = self._clone_batch_cpu(val_first, keep_samples=1)
-        except Exception:
-            self.fixed_val_monitor_batch = None
 
     def _set_epoch_for_samplers(self, epoch: int) -> None:
         """同步 sampler 与 dataset epoch。"""
@@ -157,10 +146,21 @@ class Trainer:
 
     def _forward_batch(self, batch_dev: dict[str, Any], mode: str):
         """统一前向：model -> renderer(optional) -> objective。"""
+        if self.device_sanity_check:
+            assert_tensor_tree_device(batch_dev, self.device, prefix="batch")
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        if hasattr(model_ref, "set_runtime_context"):
+            model_ref.set_runtime_context(global_step=self.global_step, mode=mode)
         outputs = self.model(batch_dev)
+        if self.device_sanity_check:
+            assert_tensor_tree_device(outputs, self.device, prefix="outputs")
         use_render = (mode == "train" and self.enable_render_train) or (mode != "train" and self.enable_render_val)
         render_outputs = self.renderer.render_paths(outputs, batch_dev, mode=mode) if (self.renderer is not None and use_render) else None
+        if self.device_sanity_check and render_outputs is not None:
+            assert_tensor_tree_device(render_outputs, self.device, prefix="render_outputs")
         total_loss, scalar_dict, aux_dict = self.objective(outputs, batch_dev, self.global_step, self.epoch, render_outputs, mode)
+        if self.device_sanity_check and torch.is_tensor(total_loss) and total_loss.device != self.device:
+            raise RuntimeError(f"total_loss device mismatch: got {total_loss.device}, expect {self.device}")
         return outputs, render_outputs, total_loss, scalar_dict, aux_dict
 
     def _sanity_probe(self, outputs: dict[str, Any], batch_dev: dict[str, Any]) -> dict[str, float]:
@@ -177,6 +177,13 @@ class Trainer:
                     rid = int(ref[bi].item()) if torch.is_tensor(ref) else int(ref)
                     errs.append((a[bi, rid] - eye).abs().mean())
                 p["probe_reference_affine_identity_error"] = float(torch.stack(errs).mean().detach().item())
+            a = outputs["affine_pred"]
+            tx_ty_abs = a[..., :, 2].abs().mean()
+            linear = a[..., :, :2]
+            eye2 = torch.eye(2, dtype=linear.dtype, device=linear.device).view(1, 1, 2, 2)
+            linear_dev = (linear - eye2).abs().mean()
+            p["probe_affine_pred_translation_abs_mean"] = float(tx_ty_abs.detach().item())
+            p["probe_affine_pred_linear_deviation_mean"] = float(linear_dev.detach().item())
         for name, key in [
             ("probe_nan_ratio_height", "height_abs"),
             ("probe_nan_ratio_point", "point_abs"),
@@ -368,6 +375,8 @@ class Trainer:
         for step_idx, batch in enumerate(self.train_loader):
             if self.max_train_steps_per_epoch > 0 and step_idx >= self.max_train_steps_per_epoch:
                 break
+            if self.enable_fixed_monitor_cache and self.fixed_train_monitor_batch is None:
+                self.fixed_train_monitor_batch = self._clone_batch_cpu(batch, keep_samples=1)
             if self.skip_steps_in_current_epoch > 0 and step_idx < self.skip_steps_in_current_epoch:
                 continue
             if self.skip_steps_in_current_epoch > 0 and step_idx >= self.skip_steps_in_current_epoch:
@@ -402,6 +411,8 @@ class Trainer:
             for step_idx, batch in enumerate(self.val_loader):
                 if self.max_val_steps > 0 and step_idx >= self.max_val_steps:
                     break
+                if self.enable_fixed_monitor_cache and self.fixed_val_monitor_batch is None:
+                    self.fixed_val_monitor_batch = self._clone_batch_cpu(batch, keep_samples=1)
                 batch_dev = move_batch_to_device(batch, self.device)
                 with self._autocast_context():
                     _, _, _, scalar, _ = self._forward_batch(batch_dev, mode="val")

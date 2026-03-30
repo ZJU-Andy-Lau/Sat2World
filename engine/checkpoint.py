@@ -55,6 +55,24 @@ def _state_dict_or_none(obj: Any) -> Any:
     return obj.state_dict()
 
 
+def _infer_model_device(model: torch.nn.Module) -> torch.device:
+    base = unwrap_model(model)
+    for p in base.parameters():
+        return p.device
+    for _, b in base.named_buffers():
+        return b.device
+    return torch.device("cpu")
+
+
+def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    """把 optimizer.state 中的 tensor 迁移到目标 device。"""
+    for state in optimizer.state.values():
+        if isinstance(state, dict):
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(device=device)
+
+
 def save_checkpoint(
     path: str | os.PathLike,
     *,
@@ -109,11 +127,12 @@ def load_checkpoint(
     map_location: str = "cpu",
 ) -> dict[str, Any]:
     """加载 checkpoint 并恢复对象状态。"""
-    ckpt = torch.load(path, map_location=map_location)
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
     unwrap_model(model).load_state_dict(ckpt["model"], strict=False)
 
     if optimizer is not None and ckpt.get("optimizer", None) is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
+        _move_optimizer_state_to_device(optimizer, _infer_model_device(model))
     if scheduler is not None and ckpt.get("scheduler", None) is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
     if scaler is not None and ckpt.get("scaler", None) is not None:

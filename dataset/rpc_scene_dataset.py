@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 
 import torch
 from torch.utils.data import Dataset
@@ -63,7 +63,7 @@ class RPCSceneDataset(Dataset):
         min_views: int = 2,
         apply_perturbation: bool = True,
         synthetic_perturbation_in_eval: bool = False,
-        perturb_cfg: Optional[PerturbationConfig] = None,
+        perturb_cfg: Optional[PerturbationConfig | Mapping[str, Any]] = None,
         cache_rpc: bool = True,
         cache_image: bool = False,
         cache_height: bool = False,
@@ -71,6 +71,7 @@ class RPCSceneDataset(Dataset):
         reference_policy: str = "first",
         strict_same_hw: bool = True,
         crop_size: int = 512,
+        anchors_per_view_per_sample: int = 0,
     ) -> None:
         super().__init__()
         mode = mode.lower()
@@ -84,7 +85,17 @@ class RPCSceneDataset(Dataset):
         self.min_views = int(min_views)
         self.apply_perturbation = bool(apply_perturbation)
         self.synthetic_perturbation_in_eval = bool(synthetic_perturbation_in_eval)
-        self.perturb_cfg = perturb_cfg or PerturbationConfig()
+        if perturb_cfg is None:
+            self.perturb_cfg = PerturbationConfig()
+        elif isinstance(perturb_cfg, PerturbationConfig):
+            self.perturb_cfg = perturb_cfg
+        elif isinstance(perturb_cfg, Mapping):
+            self.perturb_cfg = PerturbationConfig.from_mapping(perturb_cfg)
+        else:
+            raise TypeError(
+                "perturb_cfg must be PerturbationConfig | mapping | None, "
+                f"got {type(perturb_cfg).__name__}"
+            )
 
         self.cache_rpc = bool(cache_rpc)
         self.cache_image = bool(cache_image)
@@ -101,6 +112,7 @@ class RPCSceneDataset(Dataset):
         self.crop_size = int(crop_size)
         if self.crop_size <= 0:
             raise ValueError("crop_size must be > 0")
+        self.anchors_per_view_per_sample = int(anchors_per_view_per_sample)
 
         all_scenes = scan_dataset_root(root)
         scenes = [s for s in all_scenes if len(s.views) >= self.min_views]
@@ -203,6 +215,43 @@ class RPCSceneDataset(Dataset):
             y = float(rng.uniform(inter_y_min, inter_y_max)) if inter_y_max > inter_y_min else float(inter_y_min)
             return x, y
         return None
+
+    def _sample_view_anchors(
+        self,
+        height_gt: torch.Tensor,
+        height_valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """为单个视图从有效高程区域抽样控制点。
+
+        输入:
+            height_gt: [1,H,W]
+            height_valid_mask: [1,H,W]
+        返回:
+            line_samp: [K,2]
+            h_true: [K]
+        """
+        k = self.anchors_per_view_per_sample
+        if k <= 0:
+            return torch.zeros((0, 2), dtype=torch.float32), torch.zeros((0,), dtype=torch.float32)
+
+        valid = (height_valid_mask[0] > 0.5).nonzero(as_tuple=False)
+        h, w = height_gt.shape[-2:]
+        if valid.numel() == 0:
+            ys = torch.randint(low=0, high=h, size=(k,), dtype=torch.long)
+            xs = torch.randint(low=0, high=w, size=(k,), dtype=torch.long)
+        else:
+            if valid.shape[0] >= k:
+                ids = torch.randperm(valid.shape[0])[:k]
+                pick = valid[ids]
+            else:
+                rep = torch.randint(low=0, high=valid.shape[0], size=(k,), dtype=torch.long)
+                pick = valid[rep]
+            ys = pick[:, 0]
+            xs = pick[:, 1]
+
+        line_samp = torch.stack([ys.to(torch.float32), xs.to(torch.float32)], dim=-1)
+        h_true = height_gt[0, ys, xs].to(torch.float32)
+        return line_samp, h_true
 
     def _select_joint_crop_windows(
         self,
@@ -375,6 +424,14 @@ class RPCSceneDataset(Dataset):
             "crop_anchor_height": torch.tensor(crop_dbg["crop_anchor_h"], dtype=torch.float32),
             "max_center_distance_m": torch.tensor(crop_dbg["max_center_distance_m"], dtype=torch.float32),
         }
+        if self.anchors_per_view_per_sample > 0:
+            anchor_ls, anchor_h = [], []
+            for vi in range(len(selected_views)):
+                ls_i, h_i = self._sample_view_anchors(height_gt_t[vi], height_mask_t[vi])
+                anchor_ls.append(ls_i)
+                anchor_h.append(h_i)
+            sample["anchor_line_samp_true"] = torch.stack(anchor_ls, dim=0).to(torch.float32)  # [V,K,2]
+            sample["anchor_height_true"] = torch.stack(anchor_h, dim=0).to(torch.float32)  # [V,K]
         return sample
 
 
@@ -477,6 +534,10 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         out["crop_anchor_height"] = torch.stack(crop_anchor_h_b, dim=0).to(torch.float32)
     if len(max_center_dist_b) > 0:
         out["max_center_distance_m"] = torch.stack(max_center_dist_b, dim=0).to(torch.float32)
+    if "anchor_line_samp_true" in batch[0]:
+        out["anchor_line_samp_true"] = torch.stack([x["anchor_line_samp_true"] for x in batch], dim=0).to(torch.float32)
+    if "anchor_height_true" in batch[0]:
+        out["anchor_height_true"] = torch.stack([x["anchor_height_true"] for x in batch], dim=0).to(torch.float32)
     return out
 
 
