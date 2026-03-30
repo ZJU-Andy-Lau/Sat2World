@@ -150,11 +150,12 @@ def estimate_local_view_direction(
     方法:
         在中心像素处取 h_ref 和 h_ref+delta_h 两个高度反投影，方向取差分单位向量。
     """
-    c_line = torch.tensor([(image_h - 1) * 0.5], dtype=torch.float32)
-    c_samp = torch.tensor([(image_w - 1) * 0.5], dtype=torch.float32)
+    base_device = getattr(target_rpc, "device", torch.device("cpu"))
+    c_line = torch.tensor([(image_h - 1) * 0.5], dtype=torch.float32, device=base_device)
+    c_samp = torch.tensor([(image_w - 1) * 0.5], dtype=torch.float32, device=base_device)
 
-    h0 = torch.tensor([float(h_ref)], dtype=torch.float32)
-    h1 = torch.tensor([float(h_ref + delta_h_dir)], dtype=torch.float32)
+    h0 = torch.tensor([float(h_ref)], dtype=torch.float32, device=base_device)
+    h1 = torch.tensor([float(h_ref + delta_h_dir)], dtype=torch.float32, device=base_device)
 
     x0, y0 = geometry_ops.linesamp_to_xy(
         target_rpc,
