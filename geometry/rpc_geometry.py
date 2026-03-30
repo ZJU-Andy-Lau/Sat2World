@@ -15,6 +15,7 @@ from typing import Optional, Sequence
 import torch
 
 from geometry.rpc import RPCModelParameterTorch
+from geometry.scene_geometry import make_image_grid
 
 
 class RPCGeometryOps:
@@ -303,6 +304,7 @@ class RPCGeometryOps:
         *,
         scene_xy_center: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
         scene_xy_scale: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
+        downsample_factor: int = 1,
     ) -> torch.Tensor:
         """由 corrected RPC + 绝对高程图生成三维中心。
 
@@ -320,17 +322,33 @@ class RPCGeometryOps:
             raise ValueError("height_abs must be [B,V,1,H,W]")
 
         b, v, _, h, w = height_abs.shape
+        ds = max(int(downsample_factor), 1)
+        if ds > 1:
+            h_ds = max(h // ds, 1)
+            w_ds = max(w // ds, 1)
+            height_abs_work = torch.nn.functional.interpolate(
+                height_abs.view(b * v, 1, h, w),
+                size=(h_ds, w_ds),
+                mode="bilinear",
+                align_corners=False,
+            ).view(b, v, 1, h_ds, w_ds)
+            pixel_grid_work = make_image_grid(h_ds, w_ds, device=height_abs.device, dtype=height_abs.dtype)
+        else:
+            h_ds, w_ds = h, w
+            height_abs_work = height_abs
+            pixel_grid_work = pixel_grid
+
         centers, scales = self._normalize_scene_xy(scene_xy_center, scene_xy_scale, b, height_abs.device)
 
-        line = pixel_grid[..., 0].reshape(-1).to(device=height_abs.device)
-        samp = pixel_grid[..., 1].reshape(-1).to(device=height_abs.device)
+        line = pixel_grid_work[..., 0].reshape(-1).to(device=height_abs.device)
+        samp = pixel_grid_work[..., 1].reshape(-1).to(device=height_abs.device)
 
-        out = torch.empty((b, v, 3, h, w), device=height_abs.device, dtype=self.net_dtype)
+        out = torch.empty((b, v, 3, h_ds, w_ds), device=height_abs.device, dtype=self.net_dtype)
 
         for bi in range(b):
             for vi in range(v):
                 rpc_obj = corrected_rpc_batch[bi][vi]
-                h_flat = height_abs[bi, vi, 0].reshape(-1)
+                h_flat = height_abs_work[bi, vi, 0].reshape(-1)
 
                 x, y = self.linesamp_to_xy(
                     rpc_obj,
@@ -340,10 +358,18 @@ class RPCGeometryOps:
                     xy_center=centers[bi],
                     xy_scale=scales[bi],
                 )
-                x = x.reshape(h, w).to(dtype=self.net_dtype, device=height_abs.device)
-                y = y.reshape(h, w).to(dtype=self.net_dtype, device=height_abs.device)
-                z = height_abs[bi, vi, 0].to(dtype=self.net_dtype)
+                x = x.reshape(h_ds, w_ds).to(dtype=self.net_dtype, device=height_abs.device)
+                y = y.reshape(h_ds, w_ds).to(dtype=self.net_dtype, device=height_abs.device)
+                z = height_abs_work[bi, vi, 0].to(dtype=self.net_dtype)
                 out[bi, vi] = torch.stack([x, y, z], dim=0)
+
+        if ds > 1:
+            out = torch.nn.functional.interpolate(
+                out.view(b * v, 3, h_ds, w_ds),
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            ).view(b, v, 3, h, w)
 
         return out
 

@@ -92,6 +92,72 @@ class TensorBoardMonitor:
         imgs = images_vchw[:v].clamp(0, 1)
         return torch.cat([imgs[i] for i in range(v)], dim=-1)
 
+    def _invert_affine_2x3(self, affine_2x3: torch.Tensor) -> torch.Tensor:
+        """求 2x3 仿射逆（单视图）。"""
+        if affine_2x3.shape != (2, 3):
+            raise ValueError("affine_2x3 must be [2,3]")
+        a = affine_2x3[:, :2]
+        t = affine_2x3[:, 2:]
+        a_inv = torch.linalg.inv(a)
+        t_inv = -(a_inv @ t)
+        return torch.cat([a_inv, t_inv], dim=1)
+
+    def _warp_crop_by_affine_forward(
+        self,
+        image_chw: torch.Tensor,
+        affine_forward_2x3: torch.Tensor,
+        affine_correction_2x3: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """把 I_crop 按 affine_gt_forward 变换得到 I_crop_af。"""
+        if image_chw.ndim != 3 or image_chw.shape[0] != 3:
+            raise ValueError("image_chw must be [3,H,W]")
+        h, w = int(image_chw.shape[-2]), int(image_chw.shape[-1])
+        img = image_chw.unsqueeze(0).detach().float()
+        aff_corr = affine_correction_2x3 if affine_correction_2x3 is not None else self._invert_affine_2x3(affine_forward_2x3)
+        aff_corr = aff_corr.to(device=img.device, dtype=img.dtype)
+
+        line = torch.arange(h, device=img.device, dtype=img.dtype)
+        samp = torch.arange(w, device=img.device, dtype=img.dtype)
+        yy, xx = torch.meshgrid(line, samp, indexing="ij")
+        obs_grid = torch.stack([yy, xx], dim=-1).view(1, -1, 2)  # [1,HW,2], [line,samp]
+        src_grid = apply_affine_to_points(obs_grid, aff_corr.unsqueeze(0)).view(1, h, w, 2)
+
+        x = 2.0 * src_grid[..., 1] / max(w - 1, 1) - 1.0
+        y = 2.0 * src_grid[..., 0] / max(h - 1, 1) - 1.0
+        grid = torch.stack([x, y], dim=-1)
+        out = F.grid_sample(img, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+        return out[0].clamp(0, 1)
+
+    def _overlay_points_on_image(
+        self,
+        image_chw: torch.Tensor,
+        points_n2: torch.Tensor,
+        *,
+        color: tuple[float, float, float] = (1.0, 0.2, 0.2),
+        radius: int = 1,
+    ) -> torch.Tensor:
+        """在图像上叠加 [line,samp] 点。"""
+        if image_chw.ndim != 3 or image_chw.shape[0] != 3:
+            raise ValueError("image_chw must be [3,H,W]")
+        out = image_chw.detach().float().clone()
+        h, w = int(out.shape[-2]), int(out.shape[-1])
+        pts = points_n2.detach().to(device=out.device, dtype=torch.float32)
+        line = pts[:, 0].round().long()
+        samp = pts[:, 1].round().long()
+        valid = (line >= 0) & (line < h) & (samp >= 0) & (samp < w)
+        line = line[valid]
+        samp = samp[valid]
+        if line.numel() == 0:
+            return out.clamp(0, 1)
+        for dl in range(-radius, radius + 1):
+            for ds in range(-radius, radius + 1):
+                li = (line + dl).clamp(0, h - 1)
+                si = (samp + ds).clamp(0, w - 1)
+                out[0, li, si] = color[0]
+                out[1, li, si] = color[1]
+                out[2, li, si] = color[2]
+        return out.clamp(0, 1)
+
     def make_colormap_image(self, x: torch.Tensor, vmin: float | None = None, vmax: float | None = None) -> torch.Tensor:
         """把单通道图转为伪彩色（简单 heatmap）。"""
         t = x.detach().float()
@@ -163,6 +229,24 @@ class TensorBoardMonitor:
         pred_p = outputs.get("point_abs", None)
 
         self.writer.add_image(f"vis/{split}/input_rgb", self.make_rgb_montage(images), global_step)
+        self.writer.add_image(f"vis/{split}/I_crop", self.make_rgb_montage(images), global_step)
+
+        if "affine_gt_forward" in batch:
+            aff_fwd = batch["affine_gt_forward"][0]
+            aff_corr = batch.get("affine_gt_correction", None)
+            aff_corr0 = aff_corr[0] if aff_corr is not None else None
+            v = min(images.shape[0], self.image_max_views)
+            warped = []
+            for vi in range(v):
+                aff_corr_i = aff_corr0[vi] if aff_corr0 is not None else None
+                warped.append(self._warp_crop_by_affine_forward(images[vi], aff_fwd[vi], affine_correction_2x3=aff_corr_i))
+            self.writer.add_image(f"vis/{split}/I_crop_af", torch.cat(warped, dim=-1), global_step)
+
+        if "anchor_line_samp_true" in batch:
+            anchors = batch["anchor_line_samp_true"][0]  # [V,K,2]
+            v = min(images.shape[0], self.image_max_views)
+            overlays = [self._overlay_points_on_image(images[vi], anchors[vi]) for vi in range(v)]
+            self.writer.add_image(f"vis/{split}/crop_anchor_overlay", torch.cat(overlays, dim=-1), global_step)
 
         if height_gt is not None and pred_h is not None:
             gt = height_gt[0, 0]
