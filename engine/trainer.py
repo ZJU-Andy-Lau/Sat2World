@@ -94,6 +94,7 @@ class Trainer:
         self.max_val_steps = int(cfg.get("max_val_steps", -1))
         self.device_sanity_check = bool(cfg.get("device_sanity_check", False))
         self.enable_fixed_monitor_cache = bool(cfg.get("enable_fixed_monitor_cache", True))
+        self.monitor_use_current_batch = bool(cfg.get("monitor_use_current_batch", True))
 
         self.epoch = 0
         self.global_step = 0
@@ -112,14 +113,15 @@ class Trainer:
         self.fixed_train_monitor_batch = None
         self.fixed_val_monitor_batch = None
 
-    def _clone_batch_cpu(self, batch: dict[str, Any], keep_samples: int = 1) -> dict[str, Any]:
+    def _clone_batch_cpu(self, batch: dict[str, Any], keep_samples: int | None = 1) -> dict[str, Any]:
         """把 batch 截取并拷贝到 CPU，作为固定监控样本。"""
         out: dict[str, Any] = {}
+        full_batch = keep_samples is None or int(keep_samples) <= 0
         for k, v in batch.items():
             if torch.is_tensor(v):
-                out[k] = v[:keep_samples].detach().cpu().clone()
+                out[k] = (v.detach().cpu().clone() if full_batch else v[:keep_samples].detach().cpu().clone())
             elif isinstance(v, list):
-                out[k] = copy.deepcopy(v[:keep_samples])
+                out[k] = copy.deepcopy(v if full_batch else v[:keep_samples])
             else:
                 out[k] = copy.deepcopy(v)
         return out
@@ -307,16 +309,19 @@ class Trainer:
             if self.global_step % self.hist_interval == 0 and is_update_step:
                 self.monitor.log_histograms(self._build_hist_dict(outputs), self.global_step)
             if self.global_step % self.vis_interval == 0 and is_update_step:
-                self._run_monitor_visual(split="train")
+                self._run_monitor_visual(split="train", batch_override=batch)
                 self._run_monitor_visual(split="val")
 
         return {k: float(v) if isinstance(v, (int, float)) else v for k, v in scalar.items()}
 
-    def _run_monitor_visual(self, split: str) -> None:
+    def _run_monitor_visual(self, split: str, batch_override: dict[str, Any] | None = None) -> None:
         """在固定监控样本上执行可视化推理。"""
         if self.monitor is None:
             return
-        fixed = self.fixed_train_monitor_batch if split == "train" else self.fixed_val_monitor_batch
+        if split == "train" and self.monitor_use_current_batch and batch_override is not None:
+            fixed = self._clone_batch_cpu(batch_override, keep_samples=None)
+        else:
+            fixed = self.fixed_train_monitor_batch if split == "train" else self.fixed_val_monitor_batch
         if fixed is None:
             return
         self.model.eval()

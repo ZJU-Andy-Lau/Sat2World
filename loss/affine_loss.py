@@ -319,7 +319,13 @@ class AffinePairwiseGeometryLoss:
                 # Step10 pair loss（obs 域双向一致性）
                 e_i2j = torch.linalg.norm(proj_i2j - anchor_j_obs, dim=-1)
                 e_j2i = torch.linalg.norm(proj_j2i - anchor_i_obs, dim=-1)
-                loss_pair = 0.5 * e_i2j.mean() + 0.5 * e_j2i.mean()
+                ref_b = int(ref_idx[bi].item())
+                w_i2j = 0.0 if i == ref_b else 1.0  # i 作为源视图；若源是参考视图则截断其梯度
+                w_j2i = 0.0 if j == ref_b else 1.0  # j 作为源视图；若源是参考视图则截断其梯度
+                w_sum = w_i2j + w_j2i
+                if w_sum <= 0.0:
+                    continue
+                loss_pair = (w_i2j * e_i2j.mean() + w_j2i * e_j2i.mean()) / w_sum
 
                 pair_losses.append(loss_pair)
                 pair_errors.append(torch.cat([e_i2j, e_j2i], dim=-1))

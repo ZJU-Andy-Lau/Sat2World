@@ -61,6 +61,7 @@ class RPCSceneDataset(Dataset):
         max_view_num: Optional[int] = None,
         samples_per_scene: int = 1,
         min_views: int = 2,
+        min_view_num: int = 1,
         apply_perturbation: bool = True,
         synthetic_perturbation_in_eval: bool = False,
         perturb_cfg: Optional[PerturbationConfig | Mapping[str, Any]] = None,
@@ -83,6 +84,9 @@ class RPCSceneDataset(Dataset):
         self.max_view_num = max_view_num if max_view_num is not None else num_views
         self.samples_per_scene = int(samples_per_scene)
         self.min_views = int(min_views)
+        self.min_view_num = int(min_view_num)
+        if self.min_view_num <= 0:
+            raise ValueError("min_view_num must be > 0")
         self.apply_perturbation = bool(apply_perturbation)
         self.synthetic_perturbation_in_eval = bool(synthetic_perturbation_in_eval)
         if perturb_cfg is None:
@@ -417,6 +421,7 @@ class RPCSceneDataset(Dataset):
             "view_ids": torch.tensor([v.view_id for v in selected_views], dtype=torch.long),
             "image_paths": [v.image_path for v in selected_views],
             "max_view_num": int(self.max_view_num) if self.max_view_num is not None else int(len(selected_views)),
+            "min_view_num": int(self.min_view_num),
             # 附加调试字段（不影响下游主接口）
             "crop_tops": torch.tensor(crop_tops, dtype=torch.long),
             "crop_lefts": torch.tensor(crop_lefts, dtype=torch.long),
@@ -457,7 +462,9 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     if k_upper <= 0:
         raise RuntimeError("effective view upper bound must be > 0 for collate")
 
-    k = int(torch.randint(low=1, high=k_upper + 1, size=(1,)).item())
+    k_lower = int(min(max(int(x.get("min_view_num", 1)), 1) for x in batch))
+    k_lower = min(k_lower, k_upper)
+    k = int(torch.randint(low=k_lower, high=k_upper + 1, size=(1,)).item())
 
     def _pick_indices(v: int) -> torch.Tensor:
         if k == 1:

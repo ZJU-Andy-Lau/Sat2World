@@ -19,6 +19,7 @@ data:
   train:
     root: train_data
     max_view_num: 4
+    min_view_num: 2
     samples_per_scene: 10
     min_views: 2
     apply_perturbation: true
@@ -39,6 +40,7 @@ data:
   val:
     root: test_data
     max_view_num: 4
+    min_view_num: 2
     samples_per_scene: 1
     min_views: 2
     apply_perturbation: false
