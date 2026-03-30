@@ -15,6 +15,7 @@ from typing import Optional, Sequence
 import torch
 
 from geometry.rpc import RPCModelParameterTorch
+from geometry.scene_geometry import make_image_grid
 
 
 class RPCGeometryOps:
