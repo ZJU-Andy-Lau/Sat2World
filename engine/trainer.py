@@ -298,6 +298,7 @@ class Trainer:
                 "system/gpu_mem_allocated_mb": mem["allocated_mb"],
             }
         )
+        scalar = all_reduce_mean(scalar)
 
         # 日志/可视化
         if is_main_process() and self.monitor is not None:

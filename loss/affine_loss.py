@@ -97,7 +97,8 @@ class AffineGridLoss:
                 ref = ref.expand(b)
             view_mask[torch.arange(b, device=err.device), ref, 0] = 0.0
 
-        loss = (err * view_mask).sum() / view_mask.sum().clamp_min(1.0)
+        view_mask_exp = view_mask.expand_as(err)
+        loss = (err * view_mask_exp).sum() / view_mask_exp.sum().clamp_min(1.0)
 
         ref_err_mean = torch.zeros((), device=err.device, dtype=err.dtype)
         if ref_view_idx is not None:
@@ -192,7 +193,7 @@ class AffinePairwiseGeometryLoss:
         num_pairs_used = 0
 
         for bi in range(b):
-            pairs = [(i, j) for (i, j) in pairwise_view_pairs(v, self.cfg.max_pairs) if i != int(ref_idx[bi]) and j != int(ref_idx[bi])]
+            pairs = pairwise_view_pairs(v, self.cfg.max_pairs)
             for i, j in pairs:
                 if "anchor_line_samp_true" in batch and "anchor_height_true" in batch:
                     anchors_i_true = batch["anchor_line_samp_true"][bi : bi + 1, i].to(device=affine_pred.device, dtype=affine_pred.dtype)
@@ -235,6 +236,7 @@ class AffinePairwiseGeometryLoss:
                     scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
                 )
                 anchors_j_true = torch.stack([line_j_true.view(1, -1), samp_j_true.view(1, -1)], dim=-1)
+                anchors_j_true = anchors_j_true.to(device=affine_pred.device, dtype=affine_pred.dtype)
 
                 # Step5: 过滤有效点
                 _, in_j_img = sample_map_bilinear(height_gt[bi : bi + 1, j], anchors_j_true)
@@ -309,6 +311,8 @@ class AffinePairwiseGeometryLoss:
                 )
                 proj_i2j = torch.stack([l_i2j.view(1, -1), s_i2j.view(1, -1)], dim=-1)
                 proj_j2i = torch.stack([l_j2i.view(1, -1), s_j2i.view(1, -1)], dim=-1)
+                proj_i2j = proj_i2j.to(device=affine_pred.device, dtype=affine_pred.dtype)
+                proj_j2i = proj_j2i.to(device=affine_pred.device, dtype=affine_pred.dtype)
 
                 # Step11 pair loss
                 e_i2j = torch.linalg.norm(proj_i2j - anchor_j_corr, dim=-1)

@@ -173,6 +173,12 @@ def apply_affine_to_points(points: torch.Tensor, affine_2x3: torch.Tensor) -> to
     while affine_2x3.ndim > points.ndim and affine_2x3.shape[-3] == 1:
         affine_2x3 = affine_2x3.squeeze(-3)
 
+    target_dtype = torch.promote_types(points.dtype, affine_2x3.dtype)
+    if points.dtype != target_dtype:
+        points = points.to(dtype=target_dtype)
+    if affine_2x3.dtype != target_dtype:
+        affine_2x3 = affine_2x3.to(dtype=target_dtype)
+
     ones = torch.ones_like(points[..., :1])
     homo = torch.cat([points, ones], dim=-1)
     out = torch.matmul(homo, affine_2x3.transpose(-1, -2))
@@ -251,6 +257,10 @@ def sample_map_bilinear(
     b, _, h, w = map_tensor.shape
     if line_samp.shape[0] != b:
         raise ValueError("batch size mismatch between map_tensor and line_samp")
+    if line_samp.device != map_tensor.device:
+        line_samp = line_samp.to(device=map_tensor.device)
+    if line_samp.dtype != map_tensor.dtype:
+        line_samp = line_samp.to(dtype=map_tensor.dtype)
 
     line = line_samp[..., 0]
     samp = line_samp[..., 1]
