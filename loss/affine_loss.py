@@ -386,7 +386,7 @@ class AffinePairwiseGeometryLoss:
             "affine_pair_error_px_rmse": safe_rmse(all_err_sq).detach(),
             "pairwise_valid_anchor_ratio": torch.stack(valid_anchor_ratios).mean().detach(),
             "pairwise_num_pairs_used": torch.tensor(float(num_pairs_used), device=loss.device),
-            "pairwise_world_xyz_consistency_mean": zero,#torch.stack(world_consistency).mean().detach() if len(world_consistency) > 0 else torch.zeros_like(loss),
+            "pairwise_world_xyz_consistency_mean": torch.zeros((), device=affine_pred.device, dtype=affine_pred.dtype),#torch.stack(world_consistency).mean().detach() if len(world_consistency) > 0 else torch.zeros_like(loss),
         }
         aux = {"num_pairs_used": num_pairs_used}
         return loss, probe, aux
