@@ -14,7 +14,7 @@ from __future__ import annotations
 import copy
 import hashlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -37,6 +37,29 @@ class PerturbationConfig:
     ty_range: tuple[float, float] = (-2.0, 2.0)
     scale_range: tuple[float, float] = (-1e-4, 1e-4)
     shear_range: tuple[float, float] = (-1e-4, 1e-4)
+
+    @classmethod
+    def from_mapping(cls, cfg: Mapping[str, Any] | None) -> "PerturbationConfig":
+        """从 dict/yaml 映射安全构建配置，兼容 list/tuple 输入。"""
+        if cfg is None:
+            return cls()
+
+        def _pair(key: str, default: tuple[float, float]) -> tuple[float, float]:
+            raw = cfg.get(key, default)
+            if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+                raise ValueError(f"perturb_cfg.{key} must be a length-2 list/tuple, got: {raw!r}")
+            lo = float(raw[0])
+            hi = float(raw[1])
+            if lo > hi:
+                raise ValueError(f"perturb_cfg.{key} must satisfy min<=max, got: ({lo}, {hi})")
+            return (lo, hi)
+
+        return cls(
+            tx_range=_pair("tx_range", cls.tx_range),
+            ty_range=_pair("ty_range", cls.ty_range),
+            scale_range=_pair("scale_range", cls.scale_range),
+            shear_range=_pair("shear_range", cls.shear_range),
+        )
 
 
 def affine_2x3_to_3x3(affine: torch.Tensor) -> torch.Tensor:

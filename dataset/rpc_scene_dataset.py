@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 
 import torch
 from torch.utils.data import Dataset
@@ -63,7 +63,7 @@ class RPCSceneDataset(Dataset):
         min_views: int = 2,
         apply_perturbation: bool = True,
         synthetic_perturbation_in_eval: bool = False,
-        perturb_cfg: Optional[PerturbationConfig] = None,
+        perturb_cfg: Optional[PerturbationConfig | Mapping[str, Any]] = None,
         cache_rpc: bool = True,
         cache_image: bool = False,
         cache_height: bool = False,
@@ -84,7 +84,17 @@ class RPCSceneDataset(Dataset):
         self.min_views = int(min_views)
         self.apply_perturbation = bool(apply_perturbation)
         self.synthetic_perturbation_in_eval = bool(synthetic_perturbation_in_eval)
-        self.perturb_cfg = perturb_cfg or PerturbationConfig()
+        if perturb_cfg is None:
+            self.perturb_cfg = PerturbationConfig()
+        elif isinstance(perturb_cfg, PerturbationConfig):
+            self.perturb_cfg = perturb_cfg
+        elif isinstance(perturb_cfg, Mapping):
+            self.perturb_cfg = PerturbationConfig.from_mapping(perturb_cfg)
+        else:
+            raise TypeError(
+                "perturb_cfg must be PerturbationConfig | mapping | None, "
+                f"got {type(perturb_cfg).__name__}"
+            )
 
         self.cache_rpc = bool(cache_rpc)
         self.cache_image = bool(cache_image)
