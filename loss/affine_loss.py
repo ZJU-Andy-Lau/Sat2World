@@ -361,9 +361,9 @@ class AffinePairwiseGeometryLoss:
                 valid_num = float(anchor_i_obs.shape[1] + anchor_j_obs.shape[1])
                 valid_anchor_ratios.append(torch.tensor(valid_num / float(n_i_base + n_j_base), device=loss_pair.device))
 
-                p_i = torch.stack([xs_i_pred.view(-1), ys_i_pred.view(-1), h_i_pred.view(-1)], dim=-1)
-                p_j = torch.stack([xs_j_pred.view(-1), ys_j_pred.view(-1), h_j_pred.view(-1)], dim=-1)
-                world_consistency.append(torch.linalg.norm(p_i - p_j, dim=-1).mean())
+                # p_i = torch.stack([xs_i_pred.view(-1), ys_i_pred.view(-1), h_i_pred.view(-1)], dim=-1)
+                # p_j = torch.stack([xs_j_pred.view(-1), ys_j_pred.view(-1), h_j_pred.view(-1)], dim=-1)
+                # world_consistency.append(torch.linalg.norm(p_i - p_j, dim=-1).mean())
                 num_pairs_used += 1
 
         if len(pair_losses) == 0:
@@ -386,7 +386,7 @@ class AffinePairwiseGeometryLoss:
             "affine_pair_error_px_rmse": safe_rmse(all_err_sq).detach(),
             "pairwise_valid_anchor_ratio": torch.stack(valid_anchor_ratios).mean().detach(),
             "pairwise_num_pairs_used": torch.tensor(float(num_pairs_used), device=loss.device),
-            "pairwise_world_xyz_consistency_mean": torch.stack(world_consistency).mean().detach() if len(world_consistency) > 0 else torch.zeros_like(loss),
+            "pairwise_world_xyz_consistency_mean": zero,#torch.stack(world_consistency).mean().detach() if len(world_consistency) > 0 else torch.zeros_like(loss),
         }
         aux = {"num_pairs_used": num_pairs_used}
         return loss, probe, aux
