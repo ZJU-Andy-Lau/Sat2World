@@ -84,6 +84,10 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
     scfg.point_bin_size_z = float(m.get("point_bin_size_z", scfg.point_bin_size_z))
     scfg.point_fine_range_xy = float(m.get("point_fine_range_xy", scfg.point_fine_range_xy))
     scfg.point_fine_range_z = float(m.get("point_fine_range_z", scfg.point_fine_range_z))
+    if "center_downsample_stage_steps" in m:
+        scfg.center_downsample_stage_steps = tuple(int(x) for x in m.get("center_downsample_stage_steps", scfg.center_downsample_stage_steps))
+    if "center_downsample_factors" in m:
+        scfg.center_downsample_factors = tuple(int(x) for x in m.get("center_downsample_factors", scfg.center_downsample_factors))
     return Sat2World(scfg)
 
 
@@ -114,6 +118,8 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
     scheduler = LossWeightScheduler(
         warmup_steps_geom_only=int(lcfg.get("warmup_steps_geom_only", 1000)),
         render_ramp_steps=int(lcfg.get("render_ramp_steps", 2000)),
+        stage1_steps=int(lcfg.get("stage1_steps", 5000)),
+        stage2_steps=int(lcfg.get("stage2_steps", 20000)),
         base_weights={
             "lambda_affine_grid": float(lcfg.get("lambda_affine_grid", 1.0)),
             "lambda_affine_pair": float(lcfg.get("lambda_affine_pair", 1.0)),

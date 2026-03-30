@@ -194,21 +194,26 @@ class AffinePairwiseGeometryLoss:
         for bi in range(b):
             pairs = [(i, j) for (i, j) in pairwise_view_pairs(v, self.cfg.max_pairs) if i != int(ref_idx[bi]) and j != int(ref_idx[bi])]
             for i, j in pairs:
-                anchors_i_true = self._get_anchor_points(h, w, self.cfg.anchors_per_pair, affine_pred.device, affine_pred.dtype).unsqueeze(0)
+                if "anchor_line_samp_true" in batch and "anchor_height_true" in batch:
+                    anchors_i_true = batch["anchor_line_samp_true"][bi : bi + 1, i].to(device=affine_pred.device, dtype=affine_pred.dtype)
+                    h_i_gt = batch["anchor_height_true"][bi : bi + 1, i].to(device=affine_pred.device, dtype=affine_pred.dtype)
+                    in_i = torch.ones((1, anchors_i_true.shape[1]), dtype=torch.bool, device=affine_pred.device)
+                else:
+                    anchors_i_true = self._get_anchor_points(h, w, self.cfg.anchors_per_pair, affine_pred.device, affine_pred.dtype).unsqueeze(0)
 
-                # 可选：从有效区域二次过滤（不逐点循环）
-                if self.cfg.sample_from_valid_only:
-                    mask_i = height_valid_mask[bi : bi + 1, i]
-                    _, valid_i = sample_map_bilinear(mask_i, anchors_i_true)
-                    keep = valid_i & (sample_map_bilinear(mask_i, anchors_i_true)[0][:, 0] > 0.5)
-                    if keep.sum() > 0:
-                        anchors_i_true = anchors_i_true[:, keep[0]]
+                    # 可选：从有效区域二次过滤（不逐点循环）
+                    if self.cfg.sample_from_valid_only:
+                        mask_i = height_valid_mask[bi : bi + 1, i]
+                        _, valid_i = sample_map_bilinear(mask_i, anchors_i_true)
+                        keep = valid_i & (sample_map_bilinear(mask_i, anchors_i_true)[0][:, 0] > 0.5)
+                        if keep.sum() > 0:
+                            anchors_i_true = anchors_i_true[:, keep[0]]
 
-                if anchors_i_true.shape[1] == 0:
-                    continue
+                    if anchors_i_true.shape[1] == 0:
+                        continue
 
-                h_i_gt, in_i = sample_map_bilinear(height_gt[bi : bi + 1, i], anchors_i_true)
-                h_i_gt = h_i_gt[:, 0]
+                    h_i_gt, in_i = sample_map_bilinear(height_gt[bi : bi + 1, i], anchors_i_true)
+                    h_i_gt = h_i_gt[:, 0]
 
                 # Step3: i true -> world
                 xs_i, ys_i = self.geometry_ops.linesamp_to_xy_batch(

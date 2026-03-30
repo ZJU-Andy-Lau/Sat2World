@@ -62,6 +62,8 @@ class Sat2WorldCfg:
     height_fine_range: float = 0.5
     point_fine_range_xy: float = 1.0
     point_fine_range_z: float = 0.5
+    center_downsample_stage_steps: tuple[int, ...] = (0, 20000, 60000)
+    center_downsample_factors: tuple[int, ...] = (4, 2, 1)
 
 
 class Sat2World(nn.Module):
@@ -112,6 +114,28 @@ class Sat2World(nn.Module):
         )
 
         self.rpc_ops = RPCGeometryOps(rpc_dtype=torch.double, net_dtype=torch.float32)
+        self.runtime_global_step: int = 0
+        self.runtime_mode: str = "train"
+
+    def set_runtime_context(self, *, global_step: int, mode: str) -> None:
+        self.runtime_global_step = int(global_step)
+        self.runtime_mode = str(mode)
+
+    def _current_center_downsample(self) -> int:
+        steps = tuple(int(x) for x in self.cfg.center_downsample_stage_steps)
+        factors = tuple(int(x) for x in self.cfg.center_downsample_factors)
+        if len(steps) == 0 or len(factors) == 0:
+            return 1
+        idx = 0
+        for si, st in enumerate(steps):
+            if self.runtime_global_step >= st:
+                idx = si
+            else:
+                break
+        idx = min(idx, len(factors) - 1)
+        if self.runtime_mode != "train":
+            return 1
+        return max(1, factors[idx])
 
     def _prepare_height_ref(self, batch: dict[str, Any], rpc_init: list[list[Any]], device: torch.device) -> torch.Tensor:
         """准备 [B,V] 的 height_ref；优先读取 batch，缺失则从 RPC 推断。"""
@@ -256,6 +280,7 @@ class Sat2World(nn.Module):
             height_abs=height_abs,
             scene_xy_center=scene_xy_center,
             scene_xy_scale=scene_xy_scale,
+            downsample_factor=self._current_center_downsample(),
         )
         centers_point = point_abs
 

@@ -67,6 +67,8 @@ class LossWeightScheduler:
         }
     )
     ramp_mode: str = "linear"
+    stage1_steps: int = 5000
+    stage2_steps: int = 20000
 
     def _render_multiplier(self, global_step: int) -> float:
         """计算 render 权重乘子。"""
@@ -90,7 +92,27 @@ class LossWeightScheduler:
         mul = self._render_multiplier(global_step)
         w["lambda_render_rpc"] = w["lambda_render_rpc"] * mul
         w["lambda_render_point"] = w["lambda_render_point"] * mul
-        return w, {"schedule_render_multiplier": mul}
+        st1 = int(self.stage1_steps)
+        st2 = int(self.stage2_steps)
+        if global_step < st1:
+            w["lambda_point"] = 0.0
+            w["lambda_center"] = 0.0
+            w["lambda_opacity_reg"] = 0.0
+            w["lambda_scale_reg"] = 0.0
+            w["lambda_render_rpc"] = 0.0
+            w["lambda_render_point"] = 0.0
+            stage_mul = 0.0
+        elif global_step < st2:
+            stage_mul = 0.35
+            w["lambda_point"] = w["lambda_point"] * stage_mul
+            w["lambda_center"] = w["lambda_center"] * stage_mul
+            w["lambda_opacity_reg"] = w["lambda_opacity_reg"] * stage_mul
+            w["lambda_scale_reg"] = w["lambda_scale_reg"] * stage_mul
+            w["lambda_render_rpc"] = w["lambda_render_rpc"] * stage_mul
+            w["lambda_render_point"] = w["lambda_render_point"] * stage_mul
+        else:
+            stage_mul = 1.0
+        return w, {"schedule_render_multiplier": mul, "schedule_detail_stage_multiplier": stage_mul}
 
 
 class RPCAnySplatTrainingObjective:
@@ -361,6 +383,7 @@ class RPCAnySplatTrainingObjective:
             "probe_point_y_fine_abs_mean": p_coder.get("point_y_fine_abs_mean", zero),
             "probe_point_z_fine_abs_mean": p_coder.get("point_z_fine_abs_mean", zero),
             "schedule_render_multiplier": schedule_probe["schedule_render_multiplier"],
+            "schedule_detail_stage_multiplier": schedule_probe.get("schedule_detail_stage_multiplier", 1.0),
             "weight_affine_grid": weights["lambda_affine_grid"],
             "weight_affine_pair": weights["lambda_affine_pair"],
             "weight_affine_reg": weights["lambda_affine_reg"],
