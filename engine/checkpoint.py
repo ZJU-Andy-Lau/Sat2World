@@ -13,8 +13,10 @@ from __future__ import annotations
 import os
 import random
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
+import errno
 
 import numpy as np
 import torch
@@ -73,6 +75,23 @@ def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: to
                     state[k] = v.to(device=device)
 
 
+def _safe_unlink(path: Path, retries: int = 5, base_sleep_sec: float = 0.1) -> None:
+    """尽力删除临时文件；NFS 上 EBUSY 时重试并降级为告警。"""
+    for i in range(max(int(retries), 1)):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            if e.errno not in (errno.EBUSY, errno.EPERM, errno.EACCES):
+                raise
+            if i >= retries - 1:
+                print(f"[checkpoint] warning: unable to unlink temp file {path}: {e}")
+                return
+            time.sleep(base_sleep_sec * (2**i))
+
+
 def save_checkpoint(
     path: str | os.PathLike,
     *,
@@ -114,7 +133,7 @@ def save_checkpoint(
         os.replace(tmp_path, path)
     finally:
         if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+            _safe_unlink(tmp_path)
 
 
 def load_checkpoint(
