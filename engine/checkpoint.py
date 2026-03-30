@@ -13,8 +13,10 @@ from __future__ import annotations
 import os
 import random
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
+import errno
 
 import numpy as np
 import torch
@@ -53,6 +55,41 @@ def _state_dict_or_none(obj: Any) -> Any:
     if obj is None:
         return None
     return obj.state_dict()
+
+
+def _infer_model_device(model: torch.nn.Module) -> torch.device:
+    base = unwrap_model(model)
+    for p in base.parameters():
+        return p.device
+    for _, b in base.named_buffers():
+        return b.device
+    return torch.device("cpu")
+
+
+def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    """把 optimizer.state 中的 tensor 迁移到目标 device。"""
+    for state in optimizer.state.values():
+        if isinstance(state, dict):
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(device=device)
+
+
+def _safe_unlink(path: Path, retries: int = 5, base_sleep_sec: float = 0.1) -> None:
+    """尽力删除临时文件；NFS 上 EBUSY 时重试并降级为告警。"""
+    for i in range(max(int(retries), 1)):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            if e.errno not in (errno.EBUSY, errno.EPERM, errno.EACCES):
+                raise
+            if i >= retries - 1:
+                print(f"[checkpoint] warning: unable to unlink temp file {path}: {e}")
+                return
+            time.sleep(base_sleep_sec * (2**i))
 
 
 def save_checkpoint(
@@ -96,7 +133,7 @@ def save_checkpoint(
         os.replace(tmp_path, path)
     finally:
         if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+            _safe_unlink(tmp_path)
 
 
 def load_checkpoint(
@@ -109,11 +146,12 @@ def load_checkpoint(
     map_location: str = "cpu",
 ) -> dict[str, Any]:
     """加载 checkpoint 并恢复对象状态。"""
-    ckpt = torch.load(path, map_location=map_location)
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
     unwrap_model(model).load_state_dict(ckpt["model"], strict=False)
 
     if optimizer is not None and ckpt.get("optimizer", None) is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
+        _move_optimizer_state_to_device(optimizer, _infer_model_device(model))
     if scheduler is not None and ckpt.get("scheduler", None) is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
     if scaler is not None and ckpt.get("scaler", None) is not None:

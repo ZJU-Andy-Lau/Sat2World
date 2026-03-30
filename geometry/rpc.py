@@ -453,45 +453,48 @@ class RPCModelParameterTorch:
         Returns:
             features: (N, 20), torch.double
         """
-        coords = self.convert_tensor(Coords, self.device)
-        if coords.ndim != 2 or coords.shape[1] != 2:
-            raise ValueError(f"Coords must have shape (N, 2), got {tuple(coords.shape)}")
+        # 注意：本函数依赖 autograd.grad 计算一/二阶导数。
+        # 即使在外层 no_grad()（如 validate）环境下，也必须局部启用梯度。
+        with torch.enable_grad():
+            coords = self.convert_tensor(Coords, self.device)
+            if coords.ndim != 2 or coords.shape[1] != 2:
+                raise ValueError(f"Coords must have shape (N, 2), got {tuple(coords.shape)}")
 
-        n = coords.shape[0]
-        if dem is None:
-            h = torch.zeros(n, dtype=torch.double, device=self.device)
-        else:
-            h = self.convert_tensor(dem, self.device).reshape(-1)
-            if h.shape[0] != n:
-                raise ValueError(f"dem must have shape (N,), got {tuple(h.shape)} for N={n}")
+            n = coords.shape[0]
+            if dem is None:
+                h = torch.zeros(n, dtype=torch.double, device=self.device)
+            else:
+                h = self.convert_tensor(dem, self.device).reshape(-1)
+                if h.shape[0] != n:
+                    raise ValueError(f"dem must have shape (N,), got {tuple(h.shape)} for N={n}")
 
-        # external observed pixel coordinates
-        line = coords[:, 0].clone().detach().requires_grad_(True)
-        samp = coords[:, 1].clone().detach().requires_grad_(True)
-        h = h.clone().detach().requires_grad_(True)
+            # external observed pixel coordinates
+            line = coords[:, 0].clone().detach().requires_grad_(True)
+            samp = coords[:, 1].clone().detach().requires_grad_(True)
+            h = h.clone().detach().requires_grad_(True)
 
-        A = self.adjust_params.clone().detach().to(dtype=torch.double, device=self.device)
+            A = self.adjust_params.clone().detach().to(dtype=torch.double, device=self.device)
 
-        # ------------------------------------------------------------------
-        # Full observed path: (line, samp, h) --A--> (line_orig, samp_orig) --RPC--> (X, Y)
-        # ------------------------------------------------------------------
-        x, y = self._linesamp2xy_with_adjust(line, samp, h, A, xy_center=xy_center, xy_scale=xy_scale)
+            # ------------------------------------------------------------------
+            # Full observed path: (line, samp, h) --A--> (line_orig, samp_orig) --RPC--> (X, Y)
+            # ------------------------------------------------------------------
+            x, y = self._linesamp2xy_with_adjust(line, samp, h, A, xy_center=xy_center, xy_scale=xy_scale)
 
-        ones_x = torch.ones_like(x)
-        ones_y = torch.ones_like(y)
+            ones_x = torch.ones_like(x)
+            ones_y = torch.ones_like(y)
 
-        # 1) h derivatives
-        dx_dh = torch.autograd.grad(x, h, grad_outputs=ones_x, create_graph=True, retain_graph=True)[0]
-        dy_dh = torch.autograd.grad(y, h, grad_outputs=ones_y, create_graph=True, retain_graph=True)[0]
+            # 1) h derivatives
+            dx_dh = torch.autograd.grad(x, h, grad_outputs=ones_x, create_graph=True, retain_graph=True)[0]
+            dy_dh = torch.autograd.grad(y, h, grad_outputs=ones_y, create_graph=True, retain_graph=True)[0]
 
-        d2x_dh2 = torch.autograd.grad(dx_dh, h, grad_outputs=torch.ones_like(dx_dh), create_graph=False, retain_graph=True)[0]
-        d2y_dh2 = torch.autograd.grad(dy_dh, h, grad_outputs=torch.ones_like(dy_dh), create_graph=False, retain_graph=True)[0]
+            d2x_dh2 = torch.autograd.grad(dx_dh, h, grad_outputs=torch.ones_like(dx_dh), create_graph=False, retain_graph=True)[0]
+            d2y_dh2 = torch.autograd.grad(dy_dh, h, grad_outputs=torch.ones_like(dy_dh), create_graph=False, retain_graph=True)[0]
 
-        # 2) derivatives wrt observed line/samp
-        dx_dline = torch.autograd.grad(x, line, grad_outputs=ones_x, create_graph=False, retain_graph=True)[0]
-        dx_dsamp = torch.autograd.grad(x, samp, grad_outputs=ones_x, create_graph=False, retain_graph=True)[0]
-        dy_dline = torch.autograd.grad(y, line, grad_outputs=ones_y, create_graph=False, retain_graph=True)[0]
-        dy_dsamp = torch.autograd.grad(y, samp, grad_outputs=ones_y, create_graph=False, retain_graph=True)[0]
+            # 2) derivatives wrt observed line/samp
+            dx_dline = torch.autograd.grad(x, line, grad_outputs=ones_x, create_graph=False, retain_graph=True)[0]
+            dx_dsamp = torch.autograd.grad(x, samp, grad_outputs=ones_x, create_graph=False, retain_graph=True)[0]
+            dy_dline = torch.autograd.grad(y, line, grad_outputs=ones_y, create_graph=False, retain_graph=True)[0]
+            dy_dsamp = torch.autograd.grad(y, samp, grad_outputs=ones_y, create_graph=False, retain_graph=True)[0]
 
         # ------------------------------------------------------------------
         # 3) affine derivatives (corrected implementation)
@@ -512,54 +515,54 @@ class RPCModelParameterTorch:
         #   dX/dA12 = dX/dsamp_orig
         # and same for Y.
         # ------------------------------------------------------------------
-        line_const = line.detach()
-        samp_const = samp.detach()
-        h_const = h.detach()
+            line_const = line.detach()
+            samp_const = samp.detach()
+            h_const = h.detach()
 
-        line_orig = (A[0, 0] * line_const + A[0, 1] * samp_const + A[0, 2]).clone().detach().requires_grad_(True)
-        samp_orig = (A[1, 0] * line_const + A[1, 1] * samp_const + A[1, 2]).clone().detach().requires_grad_(True)
+            line_orig = (A[0, 0] * line_const + A[0, 1] * samp_const + A[0, 2]).clone().detach().requires_grad_(True)
+            samp_orig = (A[1, 0] * line_const + A[1, 1] * samp_const + A[1, 2]).clone().detach().requires_grad_(True)
 
-        x_orig, y_orig = self._linesamp2xy_from_origcoords(
-            line_orig, samp_orig, h_const, xy_center=xy_center, xy_scale=xy_scale
-        )
+            x_orig, y_orig = self._linesamp2xy_from_origcoords(
+                line_orig, samp_orig, h_const, xy_center=xy_center, xy_scale=xy_scale
+            )
 
-        dx_dline_orig = torch.autograd.grad(x_orig, line_orig, grad_outputs=torch.ones_like(x_orig), create_graph=False, retain_graph=True)[0]
-        dx_dsamp_orig = torch.autograd.grad(x_orig, samp_orig, grad_outputs=torch.ones_like(x_orig), create_graph=False, retain_graph=True)[0]
-        dy_dline_orig = torch.autograd.grad(y_orig, line_orig, grad_outputs=torch.ones_like(y_orig), create_graph=False, retain_graph=True)[0]
-        dy_dsamp_orig = torch.autograd.grad(y_orig, samp_orig, grad_outputs=torch.ones_like(y_orig), create_graph=False, retain_graph=True)[0]
+            dx_dline_orig = torch.autograd.grad(x_orig, line_orig, grad_outputs=torch.ones_like(x_orig), create_graph=False, retain_graph=True)[0]
+            dx_dsamp_orig = torch.autograd.grad(x_orig, samp_orig, grad_outputs=torch.ones_like(x_orig), create_graph=False, retain_graph=True)[0]
+            dy_dline_orig = torch.autograd.grad(y_orig, line_orig, grad_outputs=torch.ones_like(y_orig), create_graph=False, retain_graph=True)[0]
+            dy_dsamp_orig = torch.autograd.grad(y_orig, samp_orig, grad_outputs=torch.ones_like(y_orig), create_graph=False, retain_graph=True)[0]
 
-        # X wrt A
-        dX_dA00 = dx_dline_orig * line_const
-        dX_dA01 = dx_dline_orig * samp_const
-        dX_dA02 = dx_dline_orig
-        dX_dA10 = dx_dsamp_orig * line_const
-        dX_dA11 = dx_dsamp_orig * samp_const
-        dX_dA12 = dx_dsamp_orig
+            # X wrt A
+            dX_dA00 = dx_dline_orig * line_const
+            dX_dA01 = dx_dline_orig * samp_const
+            dX_dA02 = dx_dline_orig
+            dX_dA10 = dx_dsamp_orig * line_const
+            dX_dA11 = dx_dsamp_orig * samp_const
+            dX_dA12 = dx_dsamp_orig
 
-        # Y wrt A
-        dY_dA00 = dy_dline_orig * line_const
-        dY_dA01 = dy_dline_orig * samp_const
-        dY_dA02 = dy_dline_orig
-        dY_dA10 = dy_dsamp_orig * line_const
-        dY_dA11 = dy_dsamp_orig * samp_const
-        dY_dA12 = dy_dsamp_orig
+            # Y wrt A
+            dY_dA00 = dy_dline_orig * line_const
+            dY_dA01 = dy_dline_orig * samp_const
+            dY_dA02 = dy_dline_orig
+            dY_dA10 = dy_dsamp_orig * line_const
+            dY_dA11 = dy_dsamp_orig * samp_const
+            dY_dA12 = dy_dsamp_orig
 
-        features = torch.stack([
-            dx_dh,
-            d2x_dh2,
-            dy_dh,
-            d2y_dh2,
+            features = torch.stack([
+                dx_dh,
+                d2x_dh2,
+                dy_dh,
+                d2y_dh2,
 
-            dX_dA00, dX_dA01, dX_dA02, dX_dA10, dX_dA11, dX_dA12,
-            dY_dA00, dY_dA01, dY_dA02, dY_dA10, dY_dA11, dY_dA12,
+                dX_dA00, dX_dA01, dX_dA02, dX_dA10, dX_dA11, dX_dA12,
+                dY_dA00, dY_dA01, dY_dA02, dY_dA10, dY_dA11, dY_dA12,
 
-            dx_dline,
-            dx_dsamp,
-            dy_dline,
-            dy_dsamp,
-        ], dim=-1)
+                dx_dline,
+                dx_dsamp,
+                dy_dline,
+                dy_dsamp,
+            ], dim=-1)
 
-        return features
+            return features
 
     # ============================================================
     # Public RPC interfaces
