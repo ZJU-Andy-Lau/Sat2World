@@ -447,11 +447,17 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         if hi != h0 or wi != w0:
             raise RuntimeError(f"Batch has inconsistent HW: sample0=({h0},{w0}), sample{i}=({hi},{wi})")
 
-    max_view_num = int(min(x.get("max_view_num", x["images"].shape[0]) for x in batch))
-    if max_view_num <= 0:
-        raise RuntimeError("max_view_num must be > 0 for collate")
+    # k 的上限必须受“样本真实视图数”约束，避免 k > v 导致后续字段维度错配。
+    k_upper = int(
+        min(
+            min(int(x["images"].shape[0]), int(x.get("max_view_num", x["images"].shape[0])))
+            for x in batch
+        )
+    )
+    if k_upper <= 0:
+        raise RuntimeError("effective view upper bound must be > 0 for collate")
 
-    k = int(torch.randint(low=1, high=max_view_num + 1, size=(1,)).item())
+    k = int(torch.randint(low=1, high=k_upper + 1, size=(1,)).item())
 
     def _pick_indices(v: int) -> torch.Tensor:
         if k == 1:
@@ -475,6 +481,7 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     scene_center_b, scene_scale_b, ref_idx_b, scene_id_b = [], [], [], []
     crop_tops_b, crop_lefts_b = [], []
     crop_anchor_xy_b, crop_anchor_h_b, max_center_dist_b = [], [], []
+    anchor_ls_b, anchor_h_b = [], []
 
     for sample in batch:
         v = sample["images"].shape[0]
@@ -507,6 +514,10 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
             crop_anchor_h_b.append(sample["crop_anchor_height"])
         if "max_center_distance_m" in sample:
             max_center_dist_b.append(sample["max_center_distance_m"])
+        if "anchor_line_samp_true" in sample:
+            anchor_ls_b.append(sample["anchor_line_samp_true"][idx])
+        if "anchor_height_true" in sample:
+            anchor_h_b.append(sample["anchor_height_true"][idx])
 
     out = {
         "images": torch.stack(images_b, dim=0).to(torch.float32),
@@ -534,10 +545,20 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         out["crop_anchor_height"] = torch.stack(crop_anchor_h_b, dim=0).to(torch.float32)
     if len(max_center_dist_b) > 0:
         out["max_center_distance_m"] = torch.stack(max_center_dist_b, dim=0).to(torch.float32)
-    if "anchor_line_samp_true" in batch[0]:
-        out["anchor_line_samp_true"] = torch.stack([x["anchor_line_samp_true"] for x in batch], dim=0).to(torch.float32)
-    if "anchor_height_true" in batch[0]:
-        out["anchor_height_true"] = torch.stack([x["anchor_height_true"] for x in batch], dim=0).to(torch.float32)
+    if len(anchor_ls_b) > 0:
+        out["anchor_line_samp_true"] = torch.stack(anchor_ls_b, dim=0).to(torch.float32)
+    if len(anchor_h_b) > 0:
+        out["anchor_height_true"] = torch.stack(anchor_h_b, dim=0).to(torch.float32)
+
+    v_out = int(out["images"].shape[1])
+    if int(out["affine_gt_forward"].shape[1]) != v_out:
+        raise RuntimeError(
+            f"collate view mismatch: images V={v_out}, affine_gt_forward V={int(out['affine_gt_forward'].shape[1])}"
+        )
+    if "anchor_line_samp_true" in out and int(out["anchor_line_samp_true"].shape[1]) != v_out:
+        raise RuntimeError(
+            f"collate view mismatch: images V={v_out}, anchor_line_samp_true V={int(out['anchor_line_samp_true'].shape[1])}"
+        )
     return out
 
 

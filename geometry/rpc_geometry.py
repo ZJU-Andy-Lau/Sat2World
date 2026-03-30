@@ -332,7 +332,15 @@ class RPCGeometryOps:
                 mode="bilinear",
                 align_corners=False,
             ).view(b, v, 1, h_ds, w_ds)
-            pixel_grid_work = make_image_grid(h_ds, w_ds, device=height_abs.device, dtype=height_abs.dtype)
+            # 关键：下采样后仍需保持“原图坐标系”的 line/samp 射线。
+            # 不能重建 0..h_ds-1 / 0..w_ds-1 的局部网格，否则会把射线压缩到左上角。
+            pixel_grid_full = pixel_grid.to(device=height_abs.device, dtype=height_abs.dtype)
+            pixel_grid_work = torch.nn.functional.interpolate(
+                pixel_grid_full.permute(2, 0, 1).unsqueeze(0),  # [1,2,H,W]
+                size=(h_ds, w_ds),
+                mode="bilinear",
+                align_corners=False,
+            )[0].permute(1, 2, 0).contiguous()  # [h_ds,w_ds,2]
         else:
             h_ds, w_ds = h, w
             height_abs_work = height_abs
