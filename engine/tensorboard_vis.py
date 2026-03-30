@@ -20,7 +20,7 @@ try:
 except Exception:  # pragma: no cover
     SummaryWriter = None
 
-from loss.common import apply_affine_to_points, make_uniform_grid_points
+from loss.common import apply_affine_to_points, make_uniform_grid_points, sample_map_bilinear
 
 
 class TensorBoardMonitor:
@@ -138,6 +138,114 @@ class TensorBoardMonitor:
         grid = torch.stack([x, y], dim=-1)
         out = F.grid_sample(img, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
         return out[0].clamp(0, 1)
+
+    def _make_checkerboard_blend(self, image_a_chw: torch.Tensor, image_b_chw: torch.Tensor, tile_size: int = 32) -> torch.Tensor:
+        """构造棋盘格融合图。"""
+        if image_a_chw.shape != image_b_chw.shape:
+            raise ValueError("image_a_chw and image_b_chw must share shape")
+        if image_a_chw.ndim != 3 or image_a_chw.shape[0] != 3:
+            raise ValueError("image_a_chw must be [3,H,W]")
+        if tile_size <= 0:
+            raise ValueError("tile_size must be > 0")
+        h, w = int(image_a_chw.shape[-2]), int(image_a_chw.shape[-1])
+        yy = torch.arange(h, device=image_a_chw.device).view(h, 1).expand(h, w)
+        xx = torch.arange(w, device=image_a_chw.device).view(1, w).expand(h, w)
+        mask = ((yy // tile_size + xx // tile_size) % 2).to(dtype=image_a_chw.dtype)
+        mask = mask.unsqueeze(0)
+        return (image_a_chw * (1.0 - mask) + image_b_chw * mask).clamp(0, 1)
+
+    def _make_pairwise_affine_rpc_checkerboard(
+        self,
+        batch: dict[str, Any],
+        outputs: dict[str, Any],
+        *,
+        global_step: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, int]] | None:
+        """随机抽取一对视图，构造“j图 vs i投影到j”的棋盘格可视化。
+
+        返回:
+            (checker, image_j_corrected, image_i_projected_to_j, (i,j)) 或 None。
+        """
+        need_keys_batch = {"images", "rpc_gt", "height_gt", "affine_gt_forward"}
+        need_keys_outputs = {"affine_pred"}
+        if any(k not in batch for k in need_keys_batch) or any(k not in outputs for k in need_keys_outputs):
+            return None
+
+        images = batch["images"]  # [B,V,3,H,W]
+        aff_gt_forward = batch["affine_gt_forward"]
+        aff_pred = outputs["affine_pred"]
+        if images.ndim != 5 or aff_gt_forward.ndim != 4 or aff_pred.ndim != 4:
+            return None
+
+        b, v, _, h, w = images.shape
+        if b <= 0 or v < 2:
+            return None
+
+        bi = 0
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(int(global_step) + 20260330)
+        perm = torch.randperm(v, generator=gen)
+        i = int(perm[0].item())
+        j = int(perm[1].item())
+
+        image_i_true = images[bi, i].detach().float()
+        image_j_true = images[bi, j].detach().float()
+
+        # Step2: GT forward 扰动到 observed 域
+        image_i_obs = self._warp_crop_by_affine_forward(image_i_true, aff_gt_forward[bi, i].detach().float())
+        image_j_obs = self._warp_crop_by_affine_forward(image_j_true, aff_gt_forward[bi, j].detach().float())
+
+        # Step3: 用预测仿射做纠正（obs -> true）
+        image_i_corr = self._warp_crop_by_affine_forward(image_i_obs, aff_pred[bi, i].detach().float())
+        image_j_corr = self._warp_crop_by_affine_forward(image_j_obs, aff_pred[bi, j].detach().float())
+
+        # Step4: 在 j 像空间把 i 采样投影到 j（使用 h_j_gt + rpc_j_gt/rpc_i_gt）
+        rpc_j = batch["rpc_gt"][bi][j]
+        rpc_i = batch["rpc_gt"][bi][i]
+
+        # [N] 的 j 像素坐标 (line,samp)
+        line = torch.arange(h, device=image_j_corr.device, dtype=torch.float32)
+        samp = torch.arange(w, device=image_j_corr.device, dtype=torch.float32)
+        yy, xx = torch.meshgrid(line, samp, indexing="ij")
+        line_flat = yy.reshape(-1)
+        samp_flat = xx.reshape(-1)
+
+        h_j_map = batch["height_gt"][bi, j]
+        if h_j_map.ndim == 3 and h_j_map.shape[0] == 1:
+            h_j_map = h_j_map[0]
+        h_j_flat = h_j_map.detach().to(device=image_j_corr.device, dtype=torch.float32).reshape(-1)
+
+        scene_xy_center = batch.get("scene_xy_center", None)
+        scene_xy_scale = batch.get("scene_xy_scale", None)
+        xy_center_j = None if scene_xy_center is None else scene_xy_center[bi]
+        xy_scale_j = None if scene_xy_scale is None else scene_xy_scale[bi]
+
+        x_world, y_world = rpc_j.RPC_LINESAMP2XY(
+            line_in=line_flat,
+            samp_in=samp_flat,
+            h_in=h_j_flat,
+            output_type="tensor",
+            xy_center=xy_center_j,
+            xy_scale=xy_scale_j,
+        )
+        line_i_proj, samp_i_proj = rpc_i.RPC_XY2LINESAMP(
+            x_in=x_world,
+            y_in=y_world,
+            h_in=h_j_flat,
+            output_type="tensor",
+            xy_center=xy_center_j,
+            xy_scale=xy_scale_j,
+        )
+        line_i_proj = line_i_proj.to(device=image_i_corr.device, dtype=image_i_corr.dtype)
+        samp_i_proj = samp_i_proj.to(device=image_i_corr.device, dtype=image_i_corr.dtype)
+        proj_points_i = torch.stack([line_i_proj, samp_i_proj], dim=-1).unsqueeze(0)  # [1,N,2]
+
+        sampled_i_to_j, _ = sample_map_bilinear(image_i_corr.unsqueeze(0), proj_points_i)
+        image_i_to_j = sampled_i_to_j.view(1, 3, h, w)[0].clamp(0, 1)
+
+        # Step5: 与 j 构造棋盘格
+        checker = self._make_checkerboard_blend(image_j_corr, image_i_to_j, tile_size=32)
+        return checker, image_j_corr.clamp(0, 1), image_i_to_j, (i, j)
 
     def _overlay_points_on_image(
         self,
@@ -312,6 +420,14 @@ class TensorBoardMonitor:
             h, w = images.shape[-2:]
             hm = self.make_affine_residual_heatmap(batch["affine_gt_forward"][0, 0], outputs["affine_pred"][0, 0], h, w)
             self.writer.add_image(f"vis/{split}/affine_residual", hm, global_step)
+
+            checker_pack = self._make_pairwise_affine_rpc_checkerboard(batch, outputs, global_step=global_step)
+            if checker_pack is not None:
+                checker, image_j_corr, image_i_to_j, (i, j) = checker_pack
+                self.writer.add_image(f"vis/{split}/pair_rpc_j_corr", image_j_corr, global_step)
+                self.writer.add_image(f"vis/{split}/pair_rpc_i_to_j", image_i_to_j, global_step)
+                self.writer.add_image(f"vis/{split}/pair_rpc_checker", checker, global_step)
+                self.writer.add_text(f"vis/{split}/pair_rpc_meta", f"pair(i,j)=({i},{j})", global_step)
 
         pairwise = self.make_pairwise_error_matrix(aux, v=int(images.shape[0]))
         if pairwise is not None:

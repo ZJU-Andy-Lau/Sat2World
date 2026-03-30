@@ -204,9 +204,11 @@ class AffinePairwiseGeometryLoss:
                 if use_precomputed_anchors:
                     anchors_i_true = batch["anchor_line_samp_true"][bi : bi + 1, i].to(device=affine_pred.device, dtype=affine_pred.dtype)
                     h_i_gt = batch["anchor_height_true"][bi : bi + 1, i].to(device=affine_pred.device, dtype=affine_pred.dtype)
-                    in_i = torch.ones((1, anchors_i_true.shape[1]), dtype=torch.bool, device=affine_pred.device)
+                    anchors_j_true = batch["anchor_line_samp_true"][bi : bi + 1, j].to(device=affine_pred.device, dtype=affine_pred.dtype)
+                    h_j_gt = batch["anchor_height_true"][bi : bi + 1, j].to(device=affine_pred.device, dtype=affine_pred.dtype)
                 else:
                     anchors_i_true = self._get_anchor_points(h, w, self.cfg.anchors_per_pair, affine_pred.device, affine_pred.dtype).unsqueeze(0)
+                    anchors_j_true = self._get_anchor_points(h, w, self.cfg.anchors_per_pair, affine_pred.device, affine_pred.dtype).unsqueeze(0)
 
                     # 可选：从有效区域二次过滤（不逐点循环）
                     if self.cfg.sample_from_valid_only:
@@ -215,14 +217,37 @@ class AffinePairwiseGeometryLoss:
                         keep = valid_i & (sample_map_bilinear(mask_i, anchors_i_true)[0][:, 0] > 0.5)
                         if keep.sum() > 0:
                             anchors_i_true = anchors_i_true[:, keep[0]]
+                        mask_j = height_valid_mask[bi : bi + 1, j]
+                        _, valid_j = sample_map_bilinear(mask_j, anchors_j_true)
+                        keep_j = valid_j & (sample_map_bilinear(mask_j, anchors_j_true)[0][:, 0] > 0.5)
+                        if keep_j.sum() > 0:
+                            anchors_j_true = anchors_j_true[:, keep_j[0]]
 
-                    if anchors_i_true.shape[1] == 0:
+                    if anchors_i_true.shape[1] == 0 or anchors_j_true.shape[1] == 0:
                         continue
 
-                    h_i_gt, in_i = sample_map_bilinear(height_gt[bi : bi + 1, i], anchors_i_true)
+                    h_i_gt, _ = sample_map_bilinear(height_gt[bi : bi + 1, i], anchors_i_true)
+                    h_j_gt, _ = sample_map_bilinear(height_gt[bi : bi + 1, j], anchors_j_true)
                     h_i_gt = h_i_gt[:, 0]
+                    h_j_gt = h_j_gt[:, 0]
 
-                # Step3: i true -> world
+                n_i_base = max(int(anchors_i_true.shape[1]), 1)
+                n_j_base = max(int(anchors_j_true.shape[1]), 1)
+
+                # Step3: 过滤每个视图自身有效点
+                m_i, in_i = sample_map_bilinear(height_valid_mask[bi : bi + 1, i], anchors_i_true)
+                m_j, in_j = sample_map_bilinear(height_valid_mask[bi : bi + 1, j], anchors_j_true)
+                valid_i = in_i & (m_i[:, 0] > 0.5)
+                valid_j = in_j & (m_j[:, 0] > 0.5)
+                if valid_i.sum() == 0 or valid_j.sum() == 0:
+                    continue
+
+                anchors_i_true = anchors_i_true[:, valid_i[0]]
+                anchors_j_true = anchors_j_true[:, valid_j[0]]
+                h_i_gt = h_i_gt[:, valid_i[0]]
+                h_j_gt = h_j_gt[:, valid_j[0]]
+
+                # Step4: anchor_i / anchor_j 分别用 rpc_gt 反投影到物方
                 xs_i, ys_i = self.geometry_ops.linesamp_to_xy_batch(
                     rpc_batch=[[rpc_gt[bi][i]]],
                     lines=anchors_i_true[..., 0].view(1, 1, -1),
@@ -231,9 +256,17 @@ class AffinePairwiseGeometryLoss:
                     scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
                     scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
                 )
+                xs_j, ys_j = self.geometry_ops.linesamp_to_xy_batch(
+                    rpc_batch=[[rpc_gt[bi][j]]],
+                    lines=anchors_j_true[..., 0].view(1, 1, -1),
+                    samps=anchors_j_true[..., 1].view(1, 1, -1),
+                    heights=h_j_gt.view(1, 1, -1),
+                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
+                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
+                )
 
-                # Step4: world -> j true
-                line_j_true, samp_j_true = self.geometry_ops.xy_to_linesamp_batch(
+                # Step5: 交叉用 rpc_gt 投影到对侧像方（GT 目标）
+                l_i2j_gt, s_i2j_gt = self.geometry_ops.xy_to_linesamp_batch(
                     rpc_batch=[[rpc_gt[bi][j]]],
                     xs=xs_i,
                     ys=ys_i,
@@ -241,40 +274,36 @@ class AffinePairwiseGeometryLoss:
                     scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
                     scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
                 )
-                anchors_j_true = torch.stack([line_j_true.view(1, -1), samp_j_true.view(1, -1)], dim=-1)
-                anchors_j_true = anchors_j_true.to(device=affine_pred.device, dtype=affine_pred.dtype)
-
-                # Step5: 过滤有效点
-                _, in_j_img = sample_map_bilinear(height_gt[bi : bi + 1, j], anchors_j_true)
-                h_j_gt, _ = sample_map_bilinear(height_gt[bi : bi + 1, j], anchors_j_true)
-                m_j, _ = sample_map_bilinear(height_valid_mask[bi : bi + 1, j], anchors_j_true)
-                m_i = in_i & (sample_map_bilinear(height_valid_mask[bi : bi + 1, i], anchors_i_true)[0][:, 0] > 0.5)
-                valid = m_i & in_j_img & (m_j[:, 0] > 0.5)
-
-                if valid.sum() == 0:
-                    continue
-
-                anchors_i_true = anchors_i_true[:, valid[0]]
-                anchors_j_true = anchors_j_true[:, valid[0]]
+                l_j2i_gt, s_j2i_gt = self.geometry_ops.xy_to_linesamp_batch(
+                    rpc_batch=[[rpc_gt[bi][i]]],
+                    xs=xs_j,
+                    ys=ys_j,
+                    heights=h_j_gt.view(1, 1, -1),
+                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
+                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
+                )
+                anchor_i2j_gt = torch.stack([l_i2j_gt.view(1, -1), s_i2j_gt.view(1, -1)], dim=-1).to(device=affine_pred.device, dtype=affine_pred.dtype)
+                anchor_j2i_gt = torch.stack([l_j2i_gt.view(1, -1), s_j2i_gt.view(1, -1)], dim=-1).to(device=affine_pred.device, dtype=affine_pred.dtype)
 
                 # Step6 true->obs
                 anchor_i_obs = apply_affine_to_points(anchors_i_true, affine_gt_forward[bi : bi + 1, i])
                 anchor_j_obs = apply_affine_to_points(anchors_j_true, affine_gt_forward[bi : bi + 1, j])
 
-                # Step7 在 obs 域采样预测高程（避免对点与 RPC 的双重 correction）
+                # Step7 在 obs 域采样预测高程
                 h_i_pred, in_i_pred = sample_map_bilinear(height_abs[bi : bi + 1, i], anchor_i_obs)
                 h_j_pred, in_j_pred = sample_map_bilinear(height_abs[bi : bi + 1, j], anchor_j_obs)
                 h_i_pred = h_i_pred[:, 0]
                 h_j_pred = h_j_pred[:, 0]
 
-                valid_pred = in_i_pred & in_j_pred
-                if valid_pred.sum() == 0:
+                if in_i_pred.sum() == 0 or in_j_pred.sum() == 0:
                     continue
 
-                anchor_i_obs = anchor_i_obs[:, valid_pred[0]]
-                anchor_j_obs = anchor_j_obs[:, valid_pred[0]]
-                h_i_pred = h_i_pred[:, valid_pred[0]]
-                h_j_pred = h_j_pred[:, valid_pred[0]]
+                anchor_i_obs = anchor_i_obs[:, in_i_pred[0]]
+                anchor_j_obs = anchor_j_obs[:, in_j_pred[0]]
+                h_i_pred = h_i_pred[:, in_i_pred[0]]
+                h_j_pred = h_j_pred[:, in_j_pred[0]]
+                anchor_i2j_gt = anchor_i2j_gt[:, in_i_pred[0]]
+                anchor_j2i_gt = anchor_j2i_gt[:, in_j_pred[0]]
 
                 # Step8 反投影得到 world（输入保持 obs 域坐标）
                 xs_i_pred, ys_i_pred = self.geometry_ops.linesamp_to_xy_batch(
@@ -316,9 +345,9 @@ class AffinePairwiseGeometryLoss:
                 proj_i2j = proj_i2j.to(device=affine_pred.device, dtype=affine_pred.dtype)
                 proj_j2i = proj_j2i.to(device=affine_pred.device, dtype=affine_pred.dtype)
 
-                # Step10 pair loss（obs 域双向一致性）
-                e_i2j = torch.linalg.norm(proj_i2j - anchor_j_obs, dim=-1)
-                e_j2i = torch.linalg.norm(proj_j2i - anchor_i_obs, dim=-1)
+                # Step10 pair loss（pred vs gt 交叉投影）
+                e_i2j = torch.linalg.norm(proj_i2j - anchor_i2j_gt, dim=-1)
+                e_j2i = torch.linalg.norm(proj_j2i - anchor_j2i_gt, dim=-1)
                 ref_b = int(ref_idx[bi].item())
                 w_i2j = 0.0 if i == ref_b else 1.0  # i 作为源视图；若源是参考视图则截断其梯度
                 w_j2i = 0.0 if j == ref_b else 1.0  # j 作为源视图；若源是参考视图则截断其梯度
@@ -329,7 +358,8 @@ class AffinePairwiseGeometryLoss:
 
                 pair_losses.append(loss_pair)
                 pair_errors.append(torch.cat([e_i2j, e_j2i], dim=-1))
-                valid_anchor_ratios.append(torch.tensor(float(valid_pred.sum().item()) / float(self.cfg.anchors_per_pair), device=loss_pair.device))
+                valid_num = float(anchor_i_obs.shape[1] + anchor_j_obs.shape[1])
+                valid_anchor_ratios.append(torch.tensor(valid_num / float(n_i_base + n_j_base), device=loss_pair.device))
 
                 p_i = torch.stack([xs_i_pred.view(-1), ys_i_pred.view(-1), h_i_pred.view(-1)], dim=-1)
                 p_j = torch.stack([xs_j_pred.view(-1), ys_j_pred.view(-1), h_j_pred.view(-1)], dim=-1)
