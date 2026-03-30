@@ -169,9 +169,18 @@ def apply_affine_to_points(points: torch.Tensor, affine_2x3: torch.Tensor) -> to
     if affine_2x3.shape[-2:] != (2, 3):
         raise ValueError("affine_2x3 last dims must be [2,3]")
 
+    # 兼容常见误传形状：例如 [B,1,2,3] + [B,N,2]，自动压掉多余 singleton 维。
+    while affine_2x3.ndim > points.ndim and affine_2x3.shape[-3] == 1:
+        affine_2x3 = affine_2x3.squeeze(-3)
+
     ones = torch.ones_like(points[..., :1])
     homo = torch.cat([points, ones], dim=-1)
     out = torch.matmul(homo, affine_2x3.transpose(-1, -2))
+    if out.shape[-1] != 2 or out.ndim != points.ndim:
+        raise ValueError(
+            "apply_affine_to_points produced unexpected shape. "
+            f"points={tuple(points.shape)}, affine={tuple(affine_2x3.shape)}, out={tuple(out.shape)}"
+        )
     return out
 
 

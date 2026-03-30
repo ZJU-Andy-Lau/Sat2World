@@ -245,12 +245,12 @@ class AffinePairwiseGeometryLoss:
                 anchors_j_true = anchors_j_true[:, valid[0]]
 
                 # Step6 true->obs
-                anchor_i_obs = apply_affine_to_points(anchors_i_true, affine_gt_forward[bi : bi + 1, i : i + 1])
-                anchor_j_obs = apply_affine_to_points(anchors_j_true, affine_gt_forward[bi : bi + 1, j : j + 1])
+                anchor_i_obs = apply_affine_to_points(anchors_i_true, affine_gt_forward[bi : bi + 1, i])
+                anchor_j_obs = apply_affine_to_points(anchors_j_true, affine_gt_forward[bi : bi + 1, j])
 
                 # Step7 obs->true (pred correction)
-                anchor_i_corr = apply_affine_to_points(anchor_i_obs, affine_pred[bi : bi + 1, i : i + 1])
-                anchor_j_corr = apply_affine_to_points(anchor_j_obs, affine_pred[bi : bi + 1, j : j + 1])
+                anchor_i_corr = apply_affine_to_points(anchor_i_obs, affine_pred[bi : bi + 1, i])
+                anchor_j_corr = apply_affine_to_points(anchor_j_obs, affine_pred[bi : bi + 1, j])
 
                 # Step8 采样预测高程
                 h_i_pred, in_i_pred = sample_map_bilinear(height_abs[bi : bi + 1, i], anchor_i_corr)

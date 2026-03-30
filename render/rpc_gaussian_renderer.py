@@ -329,9 +329,11 @@ def rasterize_projected_gaussians(
             d1 = gx - mean_2d[g, 1]
             d = torch.stack([d0, d1], dim=-1)  # [ph,pw,2]
 
-            inv_cov = torch.inverse(cov_2d[g] + 1e-8 * eye)
-            m = torch.einsum("...i,ij,...j->...", d, inv_cov, d)
-            w = torch.exp(-0.5 * m)
+            # 低精度（fp16/bf16）下 torch.linalg.inv 不受支持，且数值稳定性也更差。
+            # 这里局部提升到 fp32 做 2x2 逆与 Mahalanobis 计算，再回落到渲染 dtype。
+            inv_cov32 = torch.linalg.inv((cov_2d[g].to(torch.float32) + 1e-8 * eye.to(torch.float32)))
+            m = torch.einsum("...i,ij,...j->...", d.to(torch.float32), inv_cov32, d.to(torch.float32))
+            w = torch.exp(-0.5 * m).to(dtype=dtype)
 
             alpha = torch.clamp(opacity[g] * w, 0.0, alpha_clamp_max).unsqueeze(0)
             trans_patch = trans[:, l0 : l1 + 1, s0 : s1 + 1].clone()
