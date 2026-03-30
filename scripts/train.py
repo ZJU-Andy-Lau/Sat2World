@@ -203,6 +203,8 @@ def build_dataloaders(cfg: dict[str, Any], distributed: bool):
     persistent_workers = bool(loader_cfg.get("persistent_workers", num_workers > 0))
     prefetch_factor = loader_cfg.get("prefetch_factor", None)
     if num_workers <= 0:
+        # DataLoader 约束：num_workers==0 时 persistent_workers 必须为 False。
+        persistent_workers = False
         prefetch_factor = None
 
     train_loader = DataLoader(
