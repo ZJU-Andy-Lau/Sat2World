@@ -22,6 +22,7 @@ from loss.affine_loss import (
     AffineLinearRegularization,
     AffinePairwiseGeometryLoss,
     AffinePairwiseGeometryLossCfg,
+    RefAffineIdentityLoss,
 )
 from loss.height_loss import HeightHuberLoss
 from loss.point_loss import PointMapLoss
@@ -51,6 +52,7 @@ class LossWeightScheduler:
             "lambda_affine_grid": 1.0,
             "lambda_affine_pair": 1.0,
             "lambda_affine_reg": 0.1,
+            "lambda_affine_ref": 0.1,
             "lambda_height": 1.0,
             "lambda_point": 1.0,
             "lambda_center": 0.2,
@@ -136,6 +138,7 @@ class RPCAnySplatTrainingObjective:
         self.affine_grid = AffineGridLoss(affine_grid_cfg)
         self.affine_pair = AffinePairwiseGeometryLoss(geometry_ops, affine_pair_cfg)
         self.affine_reg = AffineLinearRegularization()
+        self.affine_ref = RefAffineIdentityLoss()
 
         self.height_loss = HeightHuberLoss(beta=height_beta)
         self.point_loss = PointMapLoss(geometry_ops=geometry_ops, beta=point_beta)
@@ -174,6 +177,21 @@ class RPCAnySplatTrainingObjective:
                 out[k] = float(v.detach().cpu().item())
             else:
                 out[k] = v
+        return out
+
+    def _replace_ref_affine_with_identity(self, affine_pred: torch.Tensor, ref_view_idx: torch.Tensor | None) -> torch.Tensor:
+        """在 loss 计算阶段把参考视图 affine 替换为单位阵。"""
+        b, v = affine_pred.shape[:2]
+        out = affine_pred.clone()
+        eye = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=out.dtype, device=out.device)
+        if ref_view_idx is None:
+            out[:, 0] = eye
+            return out
+        ref = ref_view_idx.long().view(-1).to(device=out.device)
+        if ref.numel() == 1:
+            ref = ref.expand(b)
+        ref = ref.clamp(0, v - 1)
+        out[torch.arange(b, device=out.device), ref] = eye
         return out
 
     def forward(
@@ -232,15 +250,18 @@ class RPCAnySplatTrainingObjective:
         weights, schedule_probe = self.scheduler(global_step=global_step, epoch=epoch)
         image_hw = (int(outputs["height_abs"].shape[-2]), int(outputs["height_abs"].shape[-1]))
         ref_idx = batch.get("ref_view_idx", None)
+        affine_pred = outputs["affine_pred"]
+        affine_pred_for_loss = self._replace_ref_affine_with_identity(affine_pred, ref_idx)
 
         l_aff_grid, p_aff_grid = self.affine_grid(
-            affine_pred=outputs["affine_pred"],
-            affine_gt_forward=batch["affine_gt_forward"].to(device=outputs["affine_pred"].device, dtype=outputs["affine_pred"].dtype),
+            affine_pred=affine_pred_for_loss,
+            affine_gt_forward=batch["affine_gt_forward"].to(device=affine_pred.device, dtype=affine_pred.dtype),
             image_hw=image_hw,
             ref_view_idx=ref_idx,
         )
         l_aff_pair, p_aff_pair, aux_pair = self.affine_pair(outputs, batch)
-        l_aff_reg, p_aff_reg = self.affine_reg(outputs["affine_pred"], ref_view_idx=ref_idx)
+        l_aff_reg, p_aff_reg = self.affine_reg(affine_pred_for_loss, ref_view_idx=ref_idx)
+        l_aff_ref, p_aff_ref = self.affine_ref(affine_pred, ref_view_idx=ref_idx)
 
         l_h, p_h = self.height_loss(
             outputs["height_abs"],
@@ -292,6 +313,7 @@ class RPCAnySplatTrainingObjective:
             weights["lambda_affine_grid"] * l_aff_grid
             + weights["lambda_affine_pair"] * l_aff_pair
             + weights["lambda_affine_reg"] * l_aff_reg
+            + weights.get("lambda_affine_ref", 1.0) * l_aff_ref
             + weights["lambda_height"] * l_h
             + weights["lambda_point"] * l_p
             + weights["lambda_center"] * l_center
@@ -306,6 +328,7 @@ class RPCAnySplatTrainingObjective:
             "loss_affine_grid": l_aff_grid,
             "loss_affine_pair": l_aff_pair,
             "loss_affine_reg": l_aff_reg,
+            "loss_affine_ref": l_aff_ref,
             "loss_height": l_h,
             "loss_point": l_p,
             "loss_center_consistency": l_center,
@@ -315,6 +338,7 @@ class RPCAnySplatTrainingObjective:
             "loss_render_point": l_render_point,
             "metric_affine_grid_error_px_mean": p_aff_grid.get("affine_grid_error_px_mean", zero),
             "metric_affine_pair_error_px_mean": p_aff_pair.get("affine_pair_error_px_mean", zero),
+            "metric_ref_affine_identity_l2": p_aff_ref.get("ref_affine_identity_l2", zero),
             "metric_height_rmse": p_h.get("height_rmse", zero),
             "metric_height_mae": p_h.get("height_mae", zero),
             "metric_point_xyz_rmse": p_p.get("point_xyz_rmse", zero),
@@ -340,6 +364,7 @@ class RPCAnySplatTrainingObjective:
             "weight_affine_grid": weights["lambda_affine_grid"],
             "weight_affine_pair": weights["lambda_affine_pair"],
             "weight_affine_reg": weights["lambda_affine_reg"],
+            "weight_affine_ref": weights.get("lambda_affine_ref", 1.0),
             "weight_height": weights["lambda_height"],
             "weight_point": weights["lambda_point"],
             "weight_center": weights["lambda_center"],

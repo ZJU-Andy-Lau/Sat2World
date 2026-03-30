@@ -118,6 +118,7 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
             "lambda_affine_grid": float(lcfg.get("lambda_affine_grid", 1.0)),
             "lambda_affine_pair": float(lcfg.get("lambda_affine_pair", 1.0)),
             "lambda_affine_reg": float(lcfg.get("lambda_affine_reg", 0.1)),
+            "lambda_affine_ref": float(lcfg.get("lambda_affine_ref", 0.1)),
             "lambda_height": float(lcfg.get("lambda_height", 1.0)),
             "lambda_point": float(lcfg.get("lambda_point", 1.0)),
             "lambda_center": float(lcfg.get("lambda_center", 0.2)),
@@ -193,8 +194,10 @@ def build_dataloaders(cfg: dict[str, Any], distributed: bool):
 
     num_workers = int(loader_cfg.get("num_workers", 4))
     pin_memory = bool(loader_cfg.get("pin_memory", True))
-    persistent_workers = bool(loader_cfg.get("persistent_workers", False))
+    persistent_workers = bool(loader_cfg.get("persistent_workers", num_workers > 0))
     prefetch_factor = loader_cfg.get("prefetch_factor", None)
+    if num_workers <= 0:
+        prefetch_factor = None
 
     train_loader = DataLoader(
         train_dataset,

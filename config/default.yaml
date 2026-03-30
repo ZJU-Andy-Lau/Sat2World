@@ -129,6 +129,7 @@ loss:
   lambda_affine_grid: 1.0
   lambda_affine_pair: 1.0
   lambda_affine_reg: 0.1
+  lambda_affine_ref: 0.1
   lambda_height: 1.0
   lambda_point: 1.0
   lambda_center: 0.2
@@ -184,6 +185,8 @@ train:
   best_mode: min
   max_train_steps_per_epoch: -1
   max_val_steps: -1
+  device_sanity_check: false
+  enable_fixed_monitor_cache: true
 
 logging:
   tensorboard:
