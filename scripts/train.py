@@ -194,8 +194,10 @@ def build_dataloaders(cfg: dict[str, Any], distributed: bool):
 
     num_workers = int(loader_cfg.get("num_workers", 4))
     pin_memory = bool(loader_cfg.get("pin_memory", True))
-    persistent_workers = bool(loader_cfg.get("persistent_workers", False))
+    persistent_workers = bool(loader_cfg.get("persistent_workers", num_workers > 0))
     prefetch_factor = loader_cfg.get("prefetch_factor", None)
+    if num_workers <= 0:
+        prefetch_factor = None
 
     train_loader = DataLoader(
         train_dataset,

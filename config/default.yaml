@@ -186,6 +186,7 @@ train:
   max_train_steps_per_epoch: -1
   max_val_steps: -1
   device_sanity_check: false
+  enable_fixed_monitor_cache: true
 
 logging:
   tensorboard:

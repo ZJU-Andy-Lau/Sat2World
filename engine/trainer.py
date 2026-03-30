@@ -93,6 +93,7 @@ class Trainer:
         self.max_train_steps_per_epoch = int(cfg.get("max_train_steps_per_epoch", -1))
         self.max_val_steps = int(cfg.get("max_val_steps", -1))
         self.device_sanity_check = bool(cfg.get("device_sanity_check", False))
+        self.enable_fixed_monitor_cache = bool(cfg.get("enable_fixed_monitor_cache", True))
 
         self.epoch = 0
         self.global_step = 0
@@ -110,7 +111,6 @@ class Trainer:
 
         self.fixed_train_monitor_batch = None
         self.fixed_val_monitor_batch = None
-        self._prepare_fixed_monitor_batches()
 
     def _clone_batch_cpu(self, batch: dict[str, Any], keep_samples: int = 1) -> dict[str, Any]:
         """把 batch 截取并拷贝到 CPU，作为固定监控样本。"""
@@ -123,19 +123,6 @@ class Trainer:
             else:
                 out[k] = copy.deepcopy(v)
         return out
-
-    def _prepare_fixed_monitor_batches(self) -> None:
-        """缓存固定 train/val 监控样本。"""
-        try:
-            train_first = next(iter(self.train_loader))
-            self.fixed_train_monitor_batch = self._clone_batch_cpu(train_first, keep_samples=1)
-        except Exception:
-            self.fixed_train_monitor_batch = None
-        try:
-            val_first = next(iter(self.val_loader))
-            self.fixed_val_monitor_batch = self._clone_batch_cpu(val_first, keep_samples=1)
-        except Exception:
-            self.fixed_val_monitor_batch = None
 
     def _set_epoch_for_samplers(self, epoch: int) -> None:
         """同步 sampler 与 dataset epoch。"""
@@ -385,6 +372,8 @@ class Trainer:
         for step_idx, batch in enumerate(self.train_loader):
             if self.max_train_steps_per_epoch > 0 and step_idx >= self.max_train_steps_per_epoch:
                 break
+            if self.enable_fixed_monitor_cache and self.fixed_train_monitor_batch is None:
+                self.fixed_train_monitor_batch = self._clone_batch_cpu(batch, keep_samples=1)
             if self.skip_steps_in_current_epoch > 0 and step_idx < self.skip_steps_in_current_epoch:
                 continue
             if self.skip_steps_in_current_epoch > 0 and step_idx >= self.skip_steps_in_current_epoch:
@@ -419,6 +408,8 @@ class Trainer:
             for step_idx, batch in enumerate(self.val_loader):
                 if self.max_val_steps > 0 and step_idx >= self.max_val_steps:
                     break
+                if self.enable_fixed_monitor_cache and self.fixed_val_monitor_batch is None:
+                    self.fixed_val_monitor_batch = self._clone_batch_cpu(batch, keep_samples=1)
                 batch_dev = move_batch_to_device(batch, self.device)
                 with self._autocast_context():
                     _, _, _, scalar, _ = self._forward_batch(batch_dev, mode="val")

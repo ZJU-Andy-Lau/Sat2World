@@ -53,8 +53,12 @@ def init_distributed(backend: str = "nccl") -> dict[str, Any]:
 def destroy_distributed() -> None:
     """安全销毁进程组。"""
     if dist.is_available() and dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
+        try:
+            dist.barrier()
+        except Exception:
+            pass
+        finally:
+            dist.destroy_process_group()
 
 
 def is_distributed() -> bool:
