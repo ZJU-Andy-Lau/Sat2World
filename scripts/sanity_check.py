@@ -112,6 +112,19 @@ def main() -> None:
 
         batch = build_synthetic_batch(device)
         outputs = model(batch)
+        if "affine_coarse" in outputs:
+            raise RuntimeError("Single-stage model should not output affine_coarse.")
+        required_keys = [
+            "affine_pred",
+            "rpc_corrected",
+            "height_abs",
+            "point_abs",
+            "gaussian_centers_rpc",
+            "gaussian_centers_point",
+        ]
+        missing = [k for k in required_keys if k not in outputs]
+        if missing:
+            raise RuntimeError(f"Missing required single-stage outputs: {missing}")
         render_outputs = renderer.render_paths(outputs, batch, mode="train")
         total_loss, scalar_dict, aux_dict = objective(outputs, batch, global_step=0, epoch=0, render_outputs=render_outputs, mode="train")
 

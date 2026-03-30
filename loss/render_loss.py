@@ -61,6 +61,11 @@ class RenderPathLoss:
         if rendered_rgb is None or rendered_alpha is None or target_rgb is None:
             raise ValueError("path_result must contain rendered_rgb, rendered_alpha, target_rgb")
 
+        # 渲染分支在 AMP 下可能输出 half，而 target 常为 float32；统一到 float32 规避类型冲突。
+        rendered_rgb = rendered_rgb.to(torch.float32)
+        rendered_alpha = rendered_alpha.to(torch.float32)
+        target_rgb = target_rgb.to(torch.float32)
+
         m = int(rendered_rgb.shape[0])
         if m == 0:
             zero = torch.zeros((), device=rendered_rgb.device, dtype=rendered_rgb.dtype)
@@ -81,6 +86,12 @@ class RenderPathLoss:
         rendered_height = path_result.get("rendered_height", None)
         target_height = path_result.get("target_height", None)
         target_valid_mask = path_result.get("target_valid_mask", None)
+        if rendered_height is not None:
+            rendered_height = rendered_height.to(torch.float32)
+        if target_height is not None:
+            target_height = target_height.to(torch.float32)
+        if target_valid_mask is not None:
+            target_valid_mask = target_valid_mask.to(torch.float32)
 
         if rendered_height is not None and target_height is not None:
             l_height = masked_huber_loss(
