@@ -120,17 +120,24 @@ def main() -> None:
 
     data_cfg = cfg.get("data", {})
     loader_cfg = data_cfg.get("loader", {})
+    num_workers = int(loader_cfg.get("num_workers", 4))
+    persistent_workers = bool(loader_cfg.get("persistent_workers", num_workers > 0))
+    prefetch_factor = loader_cfg.get("prefetch_factor", None)
+    if num_workers <= 0:
+        prefetch_factor = None
     val_dataset = build_dataset(mode="val", **data_cfg.get("val", {}))
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if dist_state["distributed"] else None
     val_loader = DataLoader(
         val_dataset,
         batch_size=int(loader_cfg.get("val_batch_size", 1)),
-        num_workers=int(loader_cfg.get("num_workers", 4)),
+        num_workers=num_workers,
         sampler=val_sampler,
         shuffle=False,
         collate_fn=rpc_scene_collate_fn,
         pin_memory=bool(loader_cfg.get("pin_memory", True)),
         drop_last=False,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
 
     model = build_model(cfg).to(device)

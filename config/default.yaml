@@ -98,19 +98,19 @@ model:
   output_raw_logits: true
 
 renderer:
-  train_num_target_views: 2
-  val_num_target_views: 2
+  train_num_target_views: 1
+  val_num_target_views: 1
   use_all_targets_in_val: false
   exclude_self_source: true
   allow_self_source_if_single_view: true
-  source_stride: 2
-  confidence_threshold: 0.05
-  topk_per_target: 20000
+  source_stride: 4
+  confidence_threshold: 0.1
+  topk_per_target: 4000
   enable_voxelization: false
   voxel_xy: 2.0
   voxel_z: 1.0
-  render_downsample_factor_train: 2
-  render_downsample_factor_val: 1
+  render_downsample_factor_train: 4
+  render_downsample_factor_val: 2
   nsigma: 2.5
   alpha_clamp_max: 0.98
   eps_xy_fd: 0.01
@@ -120,6 +120,7 @@ renderer:
   depth_sort_descending: false
   chunk_size: 512
   alpha_cov_thresh: 0.05
+  render_compute_dtype: fp16
   deterministic_target_selection: true
 
 loss:
@@ -129,6 +130,7 @@ loss:
   lambda_affine_grid: 1.0
   lambda_affine_pair: 1.0
   lambda_affine_reg: 0.1
+  lambda_affine_ref: 0.1
   lambda_height: 1.0
   lambda_point: 1.0
   lambda_center: 0.2
@@ -184,6 +186,8 @@ train:
   best_mode: min
   max_train_steps_per_epoch: -1
   max_val_steps: -1
+  device_sanity_check: false
+  enable_fixed_monitor_cache: true
 
 logging:
   tensorboard:

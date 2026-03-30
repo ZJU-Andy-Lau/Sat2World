@@ -245,12 +245,12 @@ class AffinePairwiseGeometryLoss:
                 anchors_j_true = anchors_j_true[:, valid[0]]
 
                 # Step6 true->obs
-                anchor_i_obs = apply_affine_to_points(anchors_i_true, affine_gt_forward[bi : bi + 1, i : i + 1])
-                anchor_j_obs = apply_affine_to_points(anchors_j_true, affine_gt_forward[bi : bi + 1, j : j + 1])
+                anchor_i_obs = apply_affine_to_points(anchors_i_true, affine_gt_forward[bi : bi + 1, i])
+                anchor_j_obs = apply_affine_to_points(anchors_j_true, affine_gt_forward[bi : bi + 1, j])
 
                 # Step7 obs->true (pred correction)
-                anchor_i_corr = apply_affine_to_points(anchor_i_obs, affine_pred[bi : bi + 1, i : i + 1])
-                anchor_j_corr = apply_affine_to_points(anchor_j_obs, affine_pred[bi : bi + 1, j : j + 1])
+                anchor_i_corr = apply_affine_to_points(anchor_i_obs, affine_pred[bi : bi + 1, i])
+                anchor_j_corr = apply_affine_to_points(anchor_j_obs, affine_pred[bi : bi + 1, j])
 
                 # Step8 采样预测高程
                 h_i_pred, in_i_pred = sample_map_bilinear(height_abs[bi : bi + 1, i], anchor_i_corr)
@@ -382,5 +382,39 @@ class AffineLinearRegularization:
         probe = {
             "affine_linear_frob_mean": torch.sqrt((frob_sq * mask).sum() / denom).detach(),
             "affine_translation_abs_mean": (trans.abs().sum(dim=-1) * mask).sum().detach() / denom,
+        }
+        return loss, probe
+
+
+class RefAffineIdentityLoss:
+    """参考视图仿射约束。
+
+    功能:
+        仅对 ref_view_idx 位置施加约束，推动其 affine_pred 接近单位阵。
+    """
+
+    def __call__(self, affine_pred: torch.Tensor, ref_view_idx: torch.Tensor | None = None) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """计算参考视图仿射约束。"""
+        b, v = affine_pred.shape[:2]
+        if ref_view_idx is None:
+            ref = torch.zeros((b,), dtype=torch.long, device=affine_pred.device)
+        else:
+            ref = ref_view_idx.long().view(-1).to(device=affine_pred.device)
+            if ref.numel() == 1:
+                ref = ref.expand(b)
+        ref = ref.clamp(0, v - 1)
+
+        pred_ref = affine_pred[torch.arange(b, device=affine_pred.device), ref]  # [B,2,3]
+        eye = torch.tensor(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            device=pred_ref.device,
+            dtype=pred_ref.dtype,
+        ).view(1, 2, 3).expand_as(pred_ref)
+        diff = pred_ref - eye
+        loss = diff.square().mean()
+        probe = {
+            "ref_affine_identity_l2": loss.detach(),
+            "ref_affine_translation_abs_mean": pred_ref[..., 2].abs().mean().detach(),
+            "ref_affine_linear_abs_mean": (pred_ref[..., :2] - eye[..., :2]).abs().mean().detach(),
         }
         return loss, probe
