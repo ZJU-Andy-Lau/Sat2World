@@ -8,6 +8,7 @@ from engine.checkpoint import (
 )
 from engine.distributed import (
     all_reduce_mean,
+    assert_tensor_tree_device,
     barrier,
     configure_cuda_runtime,
     destroy_distributed,
@@ -30,6 +31,7 @@ __all__ = [
     "get_world_size",
     "barrier",
     "all_reduce_mean",
+    "assert_tensor_tree_device",
     "move_batch_to_device",
     "seed_everything",
     "configure_cuda_runtime",
