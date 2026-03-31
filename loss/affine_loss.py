@@ -97,7 +97,8 @@ class AffineGridLoss:
                 ref = ref.expand(b)
             view_mask[torch.arange(b, device=err.device), ref, 0] = 0.0
 
-        loss = (err * view_mask).sum() / view_mask.sum().clamp_min(1.0)
+        view_mask_exp = view_mask.expand_as(err)
+        loss = (err * view_mask_exp).sum() / view_mask_exp.sum().clamp_min(1.0)
 
         ref_err_mean = torch.zeros((), device=err.device, dtype=err.dtype)
         if ref_view_idx is not None:
@@ -190,27 +191,63 @@ class AffinePairwiseGeometryLoss:
         valid_anchor_ratios: list[torch.Tensor] = []
         world_consistency: list[torch.Tensor] = []
         num_pairs_used = 0
+        use_precomputed_anchors = ("anchor_line_samp_true" in batch and "anchor_height_true" in batch)
+        if use_precomputed_anchors:
+            anchor_v = int(batch["anchor_line_samp_true"].shape[1])
+            anchor_h_v = int(batch["anchor_height_true"].shape[1])
+            if anchor_v != v or anchor_h_v != v:
+                use_precomputed_anchors = False
 
         for bi in range(b):
-            pairs = [(i, j) for (i, j) in pairwise_view_pairs(v, self.cfg.max_pairs) if i != int(ref_idx[bi]) and j != int(ref_idx[bi])]
+            pairs = pairwise_view_pairs(v, self.cfg.max_pairs)
             for i, j in pairs:
-                anchors_i_true = self._get_anchor_points(h, w, self.cfg.anchors_per_pair, affine_pred.device, affine_pred.dtype).unsqueeze(0)
+                if use_precomputed_anchors:
+                    anchors_i_true = batch["anchor_line_samp_true"][bi : bi + 1, i].to(device=affine_pred.device, dtype=affine_pred.dtype)
+                    h_i_gt = batch["anchor_height_true"][bi : bi + 1, i].to(device=affine_pred.device, dtype=affine_pred.dtype)
+                    anchors_j_true = batch["anchor_line_samp_true"][bi : bi + 1, j].to(device=affine_pred.device, dtype=affine_pred.dtype)
+                    h_j_gt = batch["anchor_height_true"][bi : bi + 1, j].to(device=affine_pred.device, dtype=affine_pred.dtype)
+                else:
+                    anchors_i_true = self._get_anchor_points(h, w, self.cfg.anchors_per_pair, affine_pred.device, affine_pred.dtype).unsqueeze(0)
+                    anchors_j_true = self._get_anchor_points(h, w, self.cfg.anchors_per_pair, affine_pred.device, affine_pred.dtype).unsqueeze(0)
 
-                # 可选：从有效区域二次过滤（不逐点循环）
-                if self.cfg.sample_from_valid_only:
-                    mask_i = height_valid_mask[bi : bi + 1, i]
-                    _, valid_i = sample_map_bilinear(mask_i, anchors_i_true)
-                    keep = valid_i & (sample_map_bilinear(mask_i, anchors_i_true)[0][:, 0] > 0.5)
-                    if keep.sum() > 0:
-                        anchors_i_true = anchors_i_true[:, keep[0]]
+                    # 可选：从有效区域二次过滤（不逐点循环）
+                    if self.cfg.sample_from_valid_only:
+                        mask_i = height_valid_mask[bi : bi + 1, i]
+                        _, valid_i = sample_map_bilinear(mask_i, anchors_i_true)
+                        keep = valid_i & (sample_map_bilinear(mask_i, anchors_i_true)[0][:, 0] > 0.5)
+                        if keep.sum() > 0:
+                            anchors_i_true = anchors_i_true[:, keep[0]]
+                        mask_j = height_valid_mask[bi : bi + 1, j]
+                        _, valid_j = sample_map_bilinear(mask_j, anchors_j_true)
+                        keep_j = valid_j & (sample_map_bilinear(mask_j, anchors_j_true)[0][:, 0] > 0.5)
+                        if keep_j.sum() > 0:
+                            anchors_j_true = anchors_j_true[:, keep_j[0]]
 
-                if anchors_i_true.shape[1] == 0:
+                    if anchors_i_true.shape[1] == 0 or anchors_j_true.shape[1] == 0:
+                        continue
+
+                    h_i_gt, _ = sample_map_bilinear(height_gt[bi : bi + 1, i], anchors_i_true)
+                    h_j_gt, _ = sample_map_bilinear(height_gt[bi : bi + 1, j], anchors_j_true)
+                    h_i_gt = h_i_gt[:, 0]
+                    h_j_gt = h_j_gt[:, 0]
+
+                n_i_base = max(int(anchors_i_true.shape[1]), 1)
+                n_j_base = max(int(anchors_j_true.shape[1]), 1)
+
+                # Step3: 过滤每个视图自身有效点
+                m_i, in_i = sample_map_bilinear(height_valid_mask[bi : bi + 1, i], anchors_i_true)
+                m_j, in_j = sample_map_bilinear(height_valid_mask[bi : bi + 1, j], anchors_j_true)
+                valid_i = in_i & (m_i[:, 0] > 0.5)
+                valid_j = in_j & (m_j[:, 0] > 0.5)
+                if valid_i.sum() == 0 or valid_j.sum() == 0:
                     continue
 
-                h_i_gt, in_i = sample_map_bilinear(height_gt[bi : bi + 1, i], anchors_i_true)
-                h_i_gt = h_i_gt[:, 0]
+                anchors_i_true = anchors_i_true[:, valid_i[0]]
+                anchors_j_true = anchors_j_true[:, valid_j[0]]
+                h_i_gt = h_i_gt[:, valid_i[0]]
+                h_j_gt = h_j_gt[:, valid_j[0]]
 
-                # Step3: i true -> world
+                # Step4: anchor_i / anchor_j 分别用 rpc_gt 反投影到物方
                 xs_i, ys_i = self.geometry_ops.linesamp_to_xy_batch(
                     rpc_batch=[[rpc_gt[bi][i]]],
                     lines=anchors_i_true[..., 0].view(1, 1, -1),
@@ -219,9 +256,17 @@ class AffinePairwiseGeometryLoss:
                     scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
                     scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
                 )
+                xs_j, ys_j = self.geometry_ops.linesamp_to_xy_batch(
+                    rpc_batch=[[rpc_gt[bi][j]]],
+                    lines=anchors_j_true[..., 0].view(1, 1, -1),
+                    samps=anchors_j_true[..., 1].view(1, 1, -1),
+                    heights=h_j_gt.view(1, 1, -1),
+                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
+                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
+                )
 
-                # Step4: world -> j true
-                line_j_true, samp_j_true = self.geometry_ops.xy_to_linesamp_batch(
+                # Step5: 交叉用 rpc_gt 投影到对侧像方（GT 目标）
+                l_i2j_gt, s_i2j_gt = self.geometry_ops.xy_to_linesamp_batch(
                     rpc_batch=[[rpc_gt[bi][j]]],
                     xs=xs_i,
                     ys=ys_i,
@@ -229,63 +274,40 @@ class AffinePairwiseGeometryLoss:
                     scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
                     scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
                 )
-                anchors_j_true = torch.stack([line_j_true.view(1, -1), samp_j_true.view(1, -1)], dim=-1)
+                l_j2i_gt, s_j2i_gt = self.geometry_ops.xy_to_linesamp_batch(
+                    rpc_batch=[[rpc_gt[bi][i]]],
+                    xs=xs_j,
+                    ys=ys_j,
+                    heights=h_j_gt.view(1, 1, -1),
+                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
+                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
+                )
+                anchor_i2j_gt = torch.stack([l_i2j_gt.view(1, -1), s_i2j_gt.view(1, -1)], dim=-1).to(device=affine_pred.device, dtype=affine_pred.dtype)
+                anchor_j2i_gt = torch.stack([l_j2i_gt.view(1, -1), s_j2i_gt.view(1, -1)], dim=-1).to(device=affine_pred.device, dtype=affine_pred.dtype)
 
-                # Step5: 过滤有效点
-                _, in_j_img = sample_map_bilinear(height_gt[bi : bi + 1, j], anchors_j_true)
-                h_j_gt, _ = sample_map_bilinear(height_gt[bi : bi + 1, j], anchors_j_true)
-                m_j, _ = sample_map_bilinear(height_valid_mask[bi : bi + 1, j], anchors_j_true)
-                m_i = in_i & (sample_map_bilinear(height_valid_mask[bi : bi + 1, i], anchors_i_true)[0][:, 0] > 0.5)
-                valid = m_i & in_j_img & (m_j[:, 0] > 0.5)
+                # Step6: 高程使用 h_gt（true 域 anchor 采样），不再走 anchor_obs
+                h_i_pred = h_i_gt
+                h_j_pred = h_j_gt
 
-                if valid.sum() == 0:
-                    continue
-
-                anchors_i_true = anchors_i_true[:, valid[0]]
-                anchors_j_true = anchors_j_true[:, valid[0]]
-
-                # Step6 true->obs
-                anchor_i_obs = apply_affine_to_points(anchors_i_true, affine_gt_forward[bi : bi + 1, i : i + 1])
-                anchor_j_obs = apply_affine_to_points(anchors_j_true, affine_gt_forward[bi : bi + 1, j : j + 1])
-
-                # Step7 obs->true (pred correction)
-                anchor_i_corr = apply_affine_to_points(anchor_i_obs, affine_pred[bi : bi + 1, i : i + 1])
-                anchor_j_corr = apply_affine_to_points(anchor_j_obs, affine_pred[bi : bi + 1, j : j + 1])
-
-                # Step8 采样预测高程
-                h_i_pred, in_i_pred = sample_map_bilinear(height_abs[bi : bi + 1, i], anchor_i_corr)
-                h_j_pred, in_j_pred = sample_map_bilinear(height_abs[bi : bi + 1, j], anchor_j_corr)
-                h_i_pred = h_i_pred[:, 0]
-                h_j_pred = h_j_pred[:, 0]
-
-                valid_pred = in_i_pred & in_j_pred
-                if valid_pred.sum() == 0:
-                    continue
-
-                anchor_i_corr = anchor_i_corr[:, valid_pred[0]]
-                anchor_j_corr = anchor_j_corr[:, valid_pred[0]]
-                h_i_pred = h_i_pred[:, valid_pred[0]]
-                h_j_pred = h_j_pred[:, valid_pred[0]]
-
-                # Step9 反投影得到 world
+                # Step7 反投影得到 world（输入为 true 域 anchor）
                 xs_i_pred, ys_i_pred = self.geometry_ops.linesamp_to_xy_batch(
                     rpc_batch=[[rpc_corrected[bi][i]]],
-                    lines=anchor_i_corr[..., 0].view(1, 1, -1),
-                    samps=anchor_i_corr[..., 1].view(1, 1, -1),
+                    lines=anchors_i_true[..., 0].view(1, 1, -1),
+                    samps=anchors_i_true[..., 1].view(1, 1, -1),
                     heights=h_i_pred.view(1, 1, -1),
                     scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
                     scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
                 )
                 xs_j_pred, ys_j_pred = self.geometry_ops.linesamp_to_xy_batch(
                     rpc_batch=[[rpc_corrected[bi][j]]],
-                    lines=anchor_j_corr[..., 0].view(1, 1, -1),
-                    samps=anchor_j_corr[..., 1].view(1, 1, -1),
+                    lines=anchors_j_true[..., 0].view(1, 1, -1),
+                    samps=anchors_j_true[..., 1].view(1, 1, -1),
                     heights=h_j_pred.view(1, 1, -1),
                     scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
                     scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
                 )
 
-                # Step10 交叉投影
+                # Step8 交叉投影（输出为 true 域像素）
                 l_i2j, s_i2j = self.geometry_ops.xy_to_linesamp_batch(
                     rpc_batch=[[rpc_corrected[bi][j]]],
                     xs=xs_i_pred,
@@ -304,15 +326,24 @@ class AffinePairwiseGeometryLoss:
                 )
                 proj_i2j = torch.stack([l_i2j.view(1, -1), s_i2j.view(1, -1)], dim=-1)
                 proj_j2i = torch.stack([l_j2i.view(1, -1), s_j2i.view(1, -1)], dim=-1)
+                proj_i2j = proj_i2j.to(device=affine_pred.device, dtype=affine_pred.dtype)
+                proj_j2i = proj_j2i.to(device=affine_pred.device, dtype=affine_pred.dtype)
 
-                # Step11 pair loss
-                e_i2j = torch.linalg.norm(proj_i2j - anchor_j_corr, dim=-1)
-                e_j2i = torch.linalg.norm(proj_j2i - anchor_i_corr, dim=-1)
-                loss_pair = 0.5 * e_i2j.mean() + 0.5 * e_j2i.mean()
+                # Step10 pair loss（pred vs gt 交叉投影）
+                e_i2j = torch.linalg.norm(proj_i2j - anchor_i2j_gt, dim=-1)
+                e_j2i = torch.linalg.norm(proj_j2i - anchor_j2i_gt, dim=-1)
+                ref_b = int(ref_idx[bi].item())
+                w_i2j = 0.0 if i == ref_b else 1.0  # i 作为源视图；若源是参考视图则截断其梯度
+                w_j2i = 0.0 if j == ref_b else 1.0  # j 作为源视图；若源是参考视图则截断其梯度
+                w_sum = w_i2j + w_j2i
+                if w_sum <= 0.0:
+                    continue
+                loss_pair = (w_i2j * e_i2j.mean() + w_j2i * e_j2i.mean()) / w_sum
 
                 pair_losses.append(loss_pair)
                 pair_errors.append(torch.cat([e_i2j, e_j2i], dim=-1))
-                valid_anchor_ratios.append(torch.tensor(float(valid_pred.sum().item()) / float(self.cfg.anchors_per_pair), device=loss_pair.device))
+                valid_num = float(anchors_i_true.shape[1] + anchors_j_true.shape[1])
+                valid_anchor_ratios.append(torch.tensor(valid_num / float(n_i_base + n_j_base), device=loss_pair.device))
 
                 p_i = torch.stack([xs_i_pred.view(-1), ys_i_pred.view(-1), h_i_pred.view(-1)], dim=-1)
                 p_j = torch.stack([xs_j_pred.view(-1), ys_j_pred.view(-1), h_j_pred.view(-1)], dim=-1)
@@ -382,5 +413,39 @@ class AffineLinearRegularization:
         probe = {
             "affine_linear_frob_mean": torch.sqrt((frob_sq * mask).sum() / denom).detach(),
             "affine_translation_abs_mean": (trans.abs().sum(dim=-1) * mask).sum().detach() / denom,
+        }
+        return loss, probe
+
+
+class RefAffineIdentityLoss:
+    """参考视图仿射约束。
+
+    功能:
+        仅对 ref_view_idx 位置施加约束，推动其 affine_pred 接近单位阵。
+    """
+
+    def __call__(self, affine_pred: torch.Tensor, ref_view_idx: torch.Tensor | None = None) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """计算参考视图仿射约束。"""
+        b, v = affine_pred.shape[:2]
+        if ref_view_idx is None:
+            ref = torch.zeros((b,), dtype=torch.long, device=affine_pred.device)
+        else:
+            ref = ref_view_idx.long().view(-1).to(device=affine_pred.device)
+            if ref.numel() == 1:
+                ref = ref.expand(b)
+        ref = ref.clamp(0, v - 1)
+
+        pred_ref = affine_pred[torch.arange(b, device=affine_pred.device), ref]  # [B,2,3]
+        eye = torch.tensor(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            device=pred_ref.device,
+            dtype=pred_ref.dtype,
+        ).view(1, 2, 3).expand_as(pred_ref)
+        diff = pred_ref - eye
+        loss = diff.square().mean()
+        probe = {
+            "ref_affine_identity_l2": loss.detach(),
+            "ref_affine_translation_abs_mean": pred_ref[..., 2].abs().mean().detach(),
+            "ref_affine_linear_abs_mean": (pred_ref[..., :2] - eye[..., :2]).abs().mean().detach(),
         }
         return loss, probe

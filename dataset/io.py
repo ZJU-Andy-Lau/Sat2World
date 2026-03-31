@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 if TYPE_CHECKING:
     from geometry.rpc import RPCModelParameterTorch
@@ -146,6 +148,125 @@ def scan_dataset_root(root_dir: str | os.PathLike[str]) -> list[SceneRecord]:
         scenes.append(SceneRecord(scene_id=scene_id, views=views))
 
     return scenes
+
+
+def _manifest_path(root_dir: str | os.PathLike[str], manifest_name: str = "manifest.json") -> Path:
+    return Path(root_dir) / manifest_name
+
+
+def _scenes_to_manifest_dict(root_dir: str | os.PathLike[str], scenes: Sequence[SceneRecord], version: int = 1) -> dict:
+    root = Path(root_dir).resolve()
+    out_scenes = []
+    for s in scenes:
+        out_views = []
+        for v in s.views:
+            img_rel = str(Path(v.image_path).resolve().relative_to(root))
+            hgt_rel = str(Path(v.height_path).resolve().relative_to(root))
+            rpc_rel = str(Path(v.rpc_path).resolve().relative_to(root))
+            out_views.append(
+                {
+                    "scene_id": int(v.scene_id),
+                    "view_id": int(v.view_id),
+                    "image_path": img_rel,
+                    "height_path": hgt_rel,
+                    "rpc_path": rpc_rel,
+                    "full_hw": [int(v.full_hw[0]), int(v.full_hw[1])],
+                }
+            )
+        out_scenes.append({"scene_id": int(s.scene_id), "views": out_views})
+    return {
+        "manifest_version": int(version),
+        "root": str(root),
+        "scenes": out_scenes,
+    }
+
+
+def _manifest_dict_to_scenes(root_dir: str | os.PathLike[str], obj: dict) -> list[SceneRecord]:
+    if int(obj.get("manifest_version", -1)) != 1:
+        raise ValueError(f"Unsupported manifest_version={obj.get('manifest_version')}")
+    root = Path(root_dir).resolve()
+    scene_objs = obj.get("scenes", None)
+    if not isinstance(scene_objs, list):
+        raise ValueError("Manifest 'scenes' must be a list")
+
+    scenes: list[SceneRecord] = []
+    for s in scene_objs:
+        sid = int(s["scene_id"])
+        views_raw = s.get("views", None)
+        if not isinstance(views_raw, list) or len(views_raw) == 0:
+            raise ValueError(f"Scene {sid} has empty/invalid views")
+        views: list[ViewRecord] = []
+        for v in views_raw:
+            full_hw = v.get("full_hw", None)
+            if not isinstance(full_hw, (list, tuple)) or len(full_hw) != 2:
+                raise ValueError(f"Invalid full_hw for scene={sid}, view={v.get('view_id')}")
+            image_path = str((root / str(v["image_path"])).resolve())
+            height_path = str((root / str(v["height_path"])).resolve())
+            rpc_path = str((root / str(v["rpc_path"])).resolve())
+            views.append(
+                ViewRecord(
+                    scene_id=int(v["scene_id"]),
+                    view_id=int(v["view_id"]),
+                    image_path=image_path,
+                    height_path=height_path,
+                    rpc_path=rpc_path,
+                    full_hw=(int(full_hw[0]), int(full_hw[1])),
+                )
+            )
+        views.sort(key=lambda x: x.view_id)
+        scenes.append(SceneRecord(scene_id=sid, views=views))
+    scenes.sort(key=lambda x: x.scene_id)
+    return scenes
+
+
+def _read_manifest(root_dir: str | os.PathLike[str], manifest_name: str = "manifest.json") -> list[SceneRecord]:
+    p = _manifest_path(root_dir, manifest_name=manifest_name)
+    with p.open("r", encoding="utf-8") as f:
+        obj = json.load(f)
+    return _manifest_dict_to_scenes(root_dir, obj)
+
+
+def _write_manifest(root_dir: str | os.PathLike[str], scenes: Sequence[SceneRecord], manifest_name: str = "manifest.json") -> None:
+    p = _manifest_path(root_dir, manifest_name=manifest_name)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    obj = _scenes_to_manifest_dict(root_dir, scenes, version=1)
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, p)
+
+
+def load_or_scan_dataset_root(root_dir: str | os.PathLike[str], manifest_name: str = "manifest.json") -> list[SceneRecord]:
+    """优先读 manifest；若缺失/损坏则扫描；分布式下仅 rank0 读写并广播结果。"""
+    is_dist = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    if not is_dist:
+        try:
+            return _read_manifest(root_dir, manifest_name=manifest_name)
+        except Exception:
+            scenes = scan_dataset_root(root_dir)
+            try:
+                _write_manifest(root_dir, scenes, manifest_name=manifest_name)
+            except Exception:
+                pass
+            return scenes
+
+    rank = dist.get_rank()
+    obj_list: list[dict | None] = [None]
+    if rank == 0:
+        try:
+            scenes = _read_manifest(root_dir, manifest_name=manifest_name)
+        except Exception:
+            scenes = scan_dataset_root(root_dir)
+            try:
+                _write_manifest(root_dir, scenes, manifest_name=manifest_name)
+            except Exception:
+                pass
+        obj_list[0] = _scenes_to_manifest_dict(root_dir, scenes, version=1)
+
+    dist.broadcast_object_list(obj_list, src=0)
+    payload = obj_list[0]
+    if payload is None:
+        raise RuntimeError("Distributed manifest broadcast failed: received None payload")
+    return _manifest_dict_to_scenes(root_dir, payload)
 
 
 def _read_tif_with_rasterio(path: str) -> tuple[np.ndarray, Optional[float]]:
@@ -383,15 +504,15 @@ def estimate_scene_xy_center_scale(
     selected_image_shapes: Sequence[tuple[int, int]],
     selected_height_ref: Sequence[float] | torch.Tensor,
     *,
+    ref_view_idx: int = 0,
     safety_factor: float = 1.05,
     min_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """估计当前 sample 的统一 scene_xy_center 与 scene_xy_scale（顺序 y,x）。
+    """基于参考视图估计当前 sample 的 scene_xy_center 与 scene_xy_scale（顺序 y,x）。
 
     算法:
-    - 对每个视图采样 5 个像素点：中心 + 4角；
-    - 在该视图 h_ref 高度上，调用 RPC_LINESAMP2XY 得到 x,y；
-    - 统一转为 y,x 后聚合；
+    - 仅对参考视图采样 5 个像素点：中心 + 4角；
+    - 在参考视图 h_ref 高度上，调用 RPC_LINESAMP2XY 得到 x,y；
     - center = 均值；
     - scale = 相对 center 的最大绝对偏移 * safety_factor，并下限到 min_scale。
 
@@ -417,29 +538,31 @@ def estimate_scene_xy_center_scale(
     if len(h_refs) != len(selected_views_rpc_gt):
         raise ValueError("selected_height_ref length mismatch")
 
-    all_yx: list[torch.Tensor] = []
-    for rpc_obj, (h, w), h_ref in zip(selected_views_rpc_gt, selected_image_shapes, h_refs):
-        # line,samp: center + 4 corners
-        pts = torch.tensor(
-            [
-                [0.5 * (h - 1), 0.5 * (w - 1)],
-                [0.0, 0.0],
-                [0.0, float(w - 1)],
-                [float(h - 1), 0.0],
-                [float(h - 1), float(w - 1)],
-            ],
-            dtype=torch.double,
-            device=rpc_obj.device,
-        )
-        line = pts[:, 0]
-        samp = pts[:, 1]
-        h_tensor = torch.full((pts.shape[0],), float(h_ref), dtype=torch.double, device=rpc_obj.device)
+    if not (0 <= int(ref_view_idx) < len(selected_views_rpc_gt)):
+        raise ValueError(f"Invalid ref_view_idx={ref_view_idx} for V={len(selected_views_rpc_gt)}")
 
-        x, y = rpc_obj.RPC_LINESAMP2XY(line_in=line, samp_in=samp, h_in=h_tensor, output_type="tensor")
-        yx = torch.stack([y, x], dim=-1).to(torch.float32).cpu()
-        all_yx.append(yx)
+    rpc_obj = selected_views_rpc_gt[int(ref_view_idx)]
+    h, w = selected_image_shapes[int(ref_view_idx)]
+    h_ref = h_refs[int(ref_view_idx)]
 
-    yx_all = torch.cat(all_yx, dim=0)  # [M,2]
+    pts = torch.tensor(
+        [
+            [0.5 * (h - 1), 0.5 * (w - 1)],
+            [0.0, 0.0],
+            [0.0, float(w - 1)],
+            [float(h - 1), 0.0],
+            [float(h - 1), float(w - 1)],
+        ],
+        dtype=torch.double,
+        device=rpc_obj.device,
+    )
+    line = pts[:, 0]
+    samp = pts[:, 1]
+    h_tensor = torch.full((pts.shape[0],), float(h_ref), dtype=torch.double, device=rpc_obj.device)
+
+    x, y = rpc_obj.RPC_LINESAMP2XY(line_in=line, samp_in=samp, h_in=h_tensor, output_type="tensor")
+    yx_all = torch.stack([y, x], dim=-1).to(torch.float32).cpu()  # [5,2]
+
     center = yx_all.mean(dim=0)
     offset = (yx_all - center[None, :]).abs().amax(dim=0)
     scale = torch.clamp(offset * float(safety_factor), min=float(min_scale))

@@ -21,6 +21,7 @@ from torch import nn
 from engine.checkpoint import save_checkpoint
 from engine.distributed import (
     all_reduce_mean,
+    assert_tensor_tree_device,
     barrier,
     get_cuda_memory_stats,
     is_main_process,
@@ -91,6 +92,9 @@ class Trainer:
         self.skip_nan_batch = bool(cfg.get("skip_nan_batch", True))
         self.max_train_steps_per_epoch = int(cfg.get("max_train_steps_per_epoch", -1))
         self.max_val_steps = int(cfg.get("max_val_steps", -1))
+        self.device_sanity_check = bool(cfg.get("device_sanity_check", False))
+        self.enable_fixed_monitor_cache = bool(cfg.get("enable_fixed_monitor_cache", True))
+        self.monitor_use_current_batch = bool(cfg.get("monitor_use_current_batch", True))
 
         self.epoch = 0
         self.global_step = 0
@@ -108,32 +112,19 @@ class Trainer:
 
         self.fixed_train_monitor_batch = None
         self.fixed_val_monitor_batch = None
-        self._prepare_fixed_monitor_batches()
 
-    def _clone_batch_cpu(self, batch: dict[str, Any], keep_samples: int = 1) -> dict[str, Any]:
+    def _clone_batch_cpu(self, batch: dict[str, Any], keep_samples: int | None = 1) -> dict[str, Any]:
         """把 batch 截取并拷贝到 CPU，作为固定监控样本。"""
         out: dict[str, Any] = {}
+        full_batch = keep_samples is None or int(keep_samples) <= 0
         for k, v in batch.items():
             if torch.is_tensor(v):
-                out[k] = v[:keep_samples].detach().cpu().clone()
+                out[k] = (v.detach().cpu().clone() if full_batch else v[:keep_samples].detach().cpu().clone())
             elif isinstance(v, list):
-                out[k] = copy.deepcopy(v[:keep_samples])
+                out[k] = copy.deepcopy(v if full_batch else v[:keep_samples])
             else:
                 out[k] = copy.deepcopy(v)
         return out
-
-    def _prepare_fixed_monitor_batches(self) -> None:
-        """缓存固定 train/val 监控样本。"""
-        try:
-            train_first = next(iter(self.train_loader))
-            self.fixed_train_monitor_batch = self._clone_batch_cpu(train_first, keep_samples=1)
-        except Exception:
-            self.fixed_train_monitor_batch = None
-        try:
-            val_first = next(iter(self.val_loader))
-            self.fixed_val_monitor_batch = self._clone_batch_cpu(val_first, keep_samples=1)
-        except Exception:
-            self.fixed_val_monitor_batch = None
 
     def _set_epoch_for_samplers(self, epoch: int) -> None:
         """同步 sampler 与 dataset epoch。"""
@@ -155,12 +146,30 @@ class Trainer:
             return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
         return torch.autocast(device_type="cuda", enabled=False)
 
+    def _format_hhmmss(self, sec: float) -> str:
+        sec_i = max(0, int(sec))
+        h = sec_i // 3600
+        m = (sec_i % 3600) // 60
+        s = sec_i % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
     def _forward_batch(self, batch_dev: dict[str, Any], mode: str):
         """统一前向：model -> renderer(optional) -> objective。"""
+        if self.device_sanity_check:
+            assert_tensor_tree_device(batch_dev, self.device, prefix="batch")
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        if hasattr(model_ref, "set_runtime_context"):
+            model_ref.set_runtime_context(global_step=self.global_step, mode=mode)
         outputs = self.model(batch_dev)
+        if self.device_sanity_check:
+            assert_tensor_tree_device(outputs, self.device, prefix="outputs")
         use_render = (mode == "train" and self.enable_render_train) or (mode != "train" and self.enable_render_val)
         render_outputs = self.renderer.render_paths(outputs, batch_dev, mode=mode) if (self.renderer is not None and use_render) else None
+        if self.device_sanity_check and render_outputs is not None:
+            assert_tensor_tree_device(render_outputs, self.device, prefix="render_outputs")
         total_loss, scalar_dict, aux_dict = self.objective(outputs, batch_dev, self.global_step, self.epoch, render_outputs, mode)
+        if self.device_sanity_check and torch.is_tensor(total_loss) and total_loss.device != self.device:
+            raise RuntimeError(f"total_loss device mismatch: got {total_loss.device}, expect {self.device}")
         return outputs, render_outputs, total_loss, scalar_dict, aux_dict
 
     def _sanity_probe(self, outputs: dict[str, Any], batch_dev: dict[str, Any]) -> dict[str, float]:
@@ -177,6 +186,13 @@ class Trainer:
                     rid = int(ref[bi].item()) if torch.is_tensor(ref) else int(ref)
                     errs.append((a[bi, rid] - eye).abs().mean())
                 p["probe_reference_affine_identity_error"] = float(torch.stack(errs).mean().detach().item())
+            a = outputs["affine_pred"]
+            tx_ty_abs = a[..., :, 2].abs().mean()
+            linear = a[..., :, :2]
+            eye2 = torch.eye(2, dtype=linear.dtype, device=linear.device).view(1, 1, 2, 2)
+            linear_dev = (linear - eye2).abs().mean()
+            p["probe_affine_pred_translation_abs_mean"] = float(tx_ty_abs.detach().item())
+            p["probe_affine_pred_linear_deviation_mean"] = float(linear_dev.detach().item())
         for name, key in [
             ("probe_nan_ratio_height", "height_abs"),
             ("probe_nan_ratio_point", "point_abs"),
@@ -291,6 +307,7 @@ class Trainer:
                 "system/gpu_mem_allocated_mb": mem["allocated_mb"],
             }
         )
+        scalar = all_reduce_mean(scalar)
 
         # 日志/可视化
         if is_main_process() and self.monitor is not None:
@@ -299,16 +316,19 @@ class Trainer:
             if self.global_step % self.hist_interval == 0 and is_update_step:
                 self.monitor.log_histograms(self._build_hist_dict(outputs), self.global_step)
             if self.global_step % self.vis_interval == 0 and is_update_step:
-                self._run_monitor_visual(split="train")
+                self._run_monitor_visual(split="train", batch_override=batch)
                 self._run_monitor_visual(split="val")
 
         return {k: float(v) if isinstance(v, (int, float)) else v for k, v in scalar.items()}
 
-    def _run_monitor_visual(self, split: str) -> None:
+    def _run_monitor_visual(self, split: str, batch_override: dict[str, Any] | None = None) -> None:
         """在固定监控样本上执行可视化推理。"""
         if self.monitor is None:
             return
-        fixed = self.fixed_train_monitor_batch if split == "train" else self.fixed_val_monitor_batch
+        if split == "train" and self.monitor_use_current_batch and batch_override is not None:
+            fixed = self._clone_batch_cpu(batch_override, keep_samples=None)
+        else:
+            fixed = self.fixed_train_monitor_batch if split == "train" else self.fixed_val_monitor_batch
         if fixed is None:
             return
         self.model.eval()
@@ -364,10 +384,23 @@ class Trainer:
     def _run_train_epoch(self) -> None:
         """执行一个训练 epoch。"""
         self.model.train()
+        epoch_t0 = time.time()
+        steps_target = len(self.train_loader)
+        if self.max_train_steps_per_epoch > 0:
+            steps_target = min(steps_target, self.max_train_steps_per_epoch)
         prev_time = time.time()
+        loss_sums = {
+            "loss_total": 0.0,
+            "loss_affine_grid": 0.0,
+            "loss_affine_pair": 0.0,
+            "loss_affine_height": 0.0,
+        }
+        n_loss_steps = 0
         for step_idx, batch in enumerate(self.train_loader):
             if self.max_train_steps_per_epoch > 0 and step_idx >= self.max_train_steps_per_epoch:
                 break
+            if self.enable_fixed_monitor_cache and self.fixed_train_monitor_batch is None:
+                self.fixed_train_monitor_batch = self._clone_batch_cpu(batch, keep_samples=1)
             if self.skip_steps_in_current_epoch > 0 and step_idx < self.skip_steps_in_current_epoch:
                 continue
             if self.skip_steps_in_current_epoch > 0 and step_idx >= self.skip_steps_in_current_epoch:
@@ -378,10 +411,33 @@ class Trainer:
             self.step_in_epoch = step_idx + 1
             prev_time = time.time()
 
-            if is_main_process() and (step_idx % self.log_interval == 0):
-                lt = logs.get("loss_total", None)
-                lr = logs.get("optim/lr", None)
-                print(f"[train] epoch={self.epoch} step={step_idx} gstep={self.global_step} loss={lt} lr={lr}")
+            lt = logs.get("loss_total", None)
+            lag = logs.get("loss_affine_grid", None)
+            lap = logs.get("loss_affine_pair", None)
+            lh = logs.get("loss_height", None)
+            if lt is not None and lag is not None and lap is not None and lh is not None:
+                loss_sums["loss_total"] += float(lt)
+                loss_sums["loss_affine_grid"] += float(lag)
+                loss_sums["loss_affine_pair"] += float(lap)
+                loss_sums["loss_affine_height"] += float(lh)
+                n_loss_steps += 1
+
+            if is_main_process():
+                lr = float(logs.get("optim/lr", 0.0))
+                elapsed = time.time() - epoch_t0
+                done = max(step_idx + 1, 1)
+                eta = (elapsed / done) * max(steps_target - done, 0)
+                print(
+                    "[train] "
+                    f"epoch={self.epoch} step={step_idx} gstep={self.global_step} "
+                    f"loss_total={float(lt) if lt is not None else float('nan'):.6f} "
+                    f"loss_affine_grid={float(lag) if lag is not None else float('nan'):.6f} "
+                    f"loss_affine_pair={float(lap) if lap is not None else float('nan'):.6f} "
+                    f"loss_affine_height={float(lh) if lh is not None else float('nan'):.6f} "
+                    f"lr={lr:.2e} "
+                    f"time={self._format_hhmmss(elapsed)} "
+                    f"eta={self._format_hhmmss(eta)}"
+                )
 
             if self.global_step > 0 and self.global_step % self.ckpt_interval == 0:
                 self._save_last_checkpoint(step_in_epoch=step_idx + 1)
@@ -391,6 +447,19 @@ class Trainer:
                 self.model.train()
 
         self.step_in_epoch = 0
+        if is_main_process() and n_loss_steps > 0:
+            avg_total = loss_sums["loss_total"] / n_loss_steps
+            avg_ag = loss_sums["loss_affine_grid"] / n_loss_steps
+            avg_ap = loss_sums["loss_affine_pair"] / n_loss_steps
+            avg_ah = loss_sums["loss_affine_height"] / n_loss_steps
+            print(
+                "[train][epoch_summary] "
+                f"epoch={self.epoch} "
+                f"avg_total_loss={avg_total:.6f} "
+                f"avg_loss_affine_grid={avg_ag:.6f} "
+                f"avg_loss_affine_pair={avg_ap:.6f} "
+                f"avg_loss_affine_height={avg_ah:.6f}"
+            )
 
     def validate(self) -> dict[str, float]:
         """执行完整验证流程。"""
@@ -402,6 +471,8 @@ class Trainer:
             for step_idx, batch in enumerate(self.val_loader):
                 if self.max_val_steps > 0 and step_idx >= self.max_val_steps:
                     break
+                if self.enable_fixed_monitor_cache and self.fixed_val_monitor_batch is None:
+                    self.fixed_val_monitor_batch = self._clone_batch_cpu(batch, keep_samples=1)
                 batch_dev = move_batch_to_device(batch, self.device)
                 with self._autocast_context():
                     _, _, _, scalar, _ = self._forward_batch(batch_dev, mode="val")
