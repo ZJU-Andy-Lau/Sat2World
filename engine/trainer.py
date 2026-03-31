@@ -71,7 +71,8 @@ class Trainer:
         self.scaler = scaler
         self.distributed_state = distributed_state
         self.work_dir = Path(work_dir)
-        self.ckpt_dir = self.work_dir / "checkpoints"
+        ckpt_dir_cfg = str(cfg.get("checkpoints_dir", "")).strip()
+        self.ckpt_dir = Path(ckpt_dir_cfg) if ckpt_dir_cfg else (self.work_dir / "checkpoints")
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         self.max_epochs = int(cfg.get("max_epochs", 1))

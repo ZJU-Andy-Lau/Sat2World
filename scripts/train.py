@@ -273,6 +273,9 @@ def main() -> None:
     system_cfg = cfg.get("system", {})
     work_dir = Path(system_cfg.get("work_dir", "work_dirs/default"))
     work_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_cfg = cfg.get("checkpoint", {})
+    checkpoints_dir = Path(checkpoint_cfg.get("checkpoints_dir", str(work_dir / "checkpoints")))
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     dist_state = init_distributed(backend=str(system_cfg.get("ddp_backend", "nccl")))
     device = dist_state["device"]
@@ -328,7 +331,15 @@ def main() -> None:
     elif args.resume:
         resume_path = args.resume
     elif resume_path == "" and auto_resume:
-        resume_path = auto_resume_latest(str(work_dir)) or ""
+        # 统一 checkpoint 配置入口：优先从 checkpoint.checkpoints_dir 自动恢复。
+        last_ckpt = checkpoints_dir / "last.pt"
+        if last_ckpt.exists():
+            resume_path = str(last_ckpt)
+        else:
+            cands = sorted(checkpoints_dir.glob("epoch_*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+            resume_path = str(cands[0]) if cands else ""
+            if resume_path == "":
+                resume_path = auto_resume_latest(str(work_dir)) or ""
 
     if resume_path:
         resume_state = resume_from_checkpoint(
@@ -343,8 +354,9 @@ def main() -> None:
             monitor.log_text("events/resume", f"resume from {resume_path}", 0)
 
     trainer_cfg = dict(cfg.get("train", {}))
-    trainer_cfg["best_metric"] = cfg.get("checkpoint", {}).get("best_metric_name", trainer_cfg.get("best_metric", "loss_total"))
-    trainer_cfg["best_mode"] = cfg.get("checkpoint", {}).get("best_metric_mode", trainer_cfg.get("best_mode", "min"))
+    trainer_cfg["best_metric"] = checkpoint_cfg.get("best_metric_name", trainer_cfg.get("best_metric", "loss_total"))
+    trainer_cfg["best_mode"] = checkpoint_cfg.get("best_metric_mode", trainer_cfg.get("best_mode", "min"))
+    trainer_cfg["checkpoints_dir"] = str(checkpoints_dir)
 
     trainer = Trainer(
         cfg=trainer_cfg,
