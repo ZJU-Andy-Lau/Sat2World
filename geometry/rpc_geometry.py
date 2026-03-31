@@ -246,7 +246,7 @@ class RPCGeometryOps:
         scene_xy_center: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
         scene_xy_scale: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
     ) -> torch.Tensor:
-        """批量计算 patch 级 20 维几何特征。
+        """批量计算 patch 级 22 维几何特征。
 
         参数:
             rpc_batch: [B][V] RPC 列表。
@@ -255,7 +255,7 @@ class RPCGeometryOps:
             scene_xy_center/scene_xy_scale: [B,2] 或等价 list。
 
         返回:
-            geom_feat: [B,V,N,20]，float32。
+            geom_feat: [B,V,N,22]，float32。
 
         说明:
             本函数默认不对 affine 保梯度，内部使用 no_grad 调用几何特征接口，
@@ -278,7 +278,7 @@ class RPCGeometryOps:
         else:
             raise ValueError(f"Unsupported patch_centers shape: {tuple(patch_centers.shape)}")
 
-        out = torch.empty((b, v, n, 20), device=height_ref.device, dtype=self.net_dtype)
+        out = torch.empty((b, v, n, 22), device=height_ref.device, dtype=self.net_dtype)
 
         for bi in range(b):
             for vi in range(v):
@@ -292,7 +292,17 @@ class RPCGeometryOps:
                     xy_center=self._to_rpc_param(centers[bi], rpc_obj.device),
                     xy_scale=self._to_rpc_param(scales[bi], rpc_obj.device),
                 )
-                out[bi, vi] = feat.detach().to(dtype=self.net_dtype, device=height_ref.device)
+                x_norm, y_norm = rpc_obj.RPC_LINESAMP2XY(
+                    line_in=coords[:, 0],
+                    samp_in=coords[:, 1],
+                    h_in=dem,
+                    output_type="tensor",
+                    xy_center=self._to_rpc_param(centers[bi], rpc_obj.device),
+                    xy_scale=self._to_rpc_param(scales[bi], rpc_obj.device),
+                )
+                xy_norm_feat = torch.stack([x_norm, y_norm], dim=-1)  # [N,2]
+                feat22 = torch.cat([feat, xy_norm_feat], dim=-1)
+                out[bi, vi] = feat22.detach().to(dtype=self.net_dtype, device=height_ref.device)
 
         return out
 

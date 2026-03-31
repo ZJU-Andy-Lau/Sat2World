@@ -84,7 +84,7 @@ class Sat2World(nn.Module):
         self.cfg = cfg
 
         self.backbone = DINOv3Backbone(cfg.backbone)
-        self.geom_mlp = GeometryTokenMLP(in_dim=20, hidden_dim=256, out_dim=256)
+        self.geom_mlp = GeometryTokenMLP(in_dim=22, hidden_dim=256, out_dim=256)
         self.fuser = VisualGeometryFuser(visual_dim=self.backbone.embed_dim, geom_dim=256, out_dim=self.backbone.embed_dim)
 
         encoder_cfg = cfg.encoder

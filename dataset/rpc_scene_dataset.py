@@ -26,12 +26,12 @@ from .io import (
     ViewRecord,
     compute_valid_crop_anchor_bbox,
     estimate_scene_xy_center_scale,
+    load_or_scan_dataset_root,
     linesamp_to_raw_xy,
     raw_xy_to_linesamp,
     read_height_tif,
     read_image_tif,
     read_rpc_file,
-    scan_dataset_root,
 )
 from .perturbation import (
     PerturbationConfig,
@@ -118,7 +118,7 @@ class RPCSceneDataset(Dataset):
             raise ValueError("crop_size must be > 0")
         self.anchors_per_view_per_sample = int(anchors_per_view_per_sample)
 
-        all_scenes = scan_dataset_root(root)
+        all_scenes = load_or_scan_dataset_root(root)
         scenes = [s for s in all_scenes if len(s.views) >= self.min_views]
         if len(scenes) == 0:
             raise RuntimeError(
@@ -376,15 +376,7 @@ class RPCSceneDataset(Dataset):
         height_gt_t = torch.stack(heights, dim=0).to(torch.float32)  # [V,1,512,512]
         height_mask_t = torch.stack(height_masks, dim=0).to(torch.float32)  # [V,1,512,512]
 
-        # 4) 后续流程全部基于 crop 后 rpc / crop 尺寸
-        height_ref = self._infer_height_ref(rpc_gt_views)
-        image_shapes_crop = [(self.crop_size, self.crop_size) for _ in selected_views]
-        scene_xy_center, scene_xy_scale = estimate_scene_xy_center_scale(
-            selected_views_rpc_gt=rpc_gt_views,
-            selected_image_shapes=image_shapes_crop,
-            selected_height_ref=height_ref,
-        )
-
+        # 4) 先构造 rpc_init；scene_xy_center/scale 将按“参考视图 + rpc_init”估计
         do_perturb = (self.mode == "train" and self.apply_perturbation) or (
             self.mode in {"val", "test"} and self.synthetic_perturbation_in_eval
         )
@@ -404,6 +396,16 @@ class RPCSceneDataset(Dataset):
             v = len(rpc_gt_views)
             aff_fwd = eye.unsqueeze(0).repeat(v, 1, 1)
             aff_corr = eye.unsqueeze(0).repeat(v, 1, 1)
+
+        # 5) 统一按参考视图（ref_view_idx）在 rpc_init 上估计 scene_xy_center/scale
+        height_ref = self._infer_height_ref(rpc_init_views)
+        image_shapes_crop = [(self.crop_size, self.crop_size) for _ in selected_views]
+        scene_xy_center, scene_xy_scale = estimate_scene_xy_center_scale(
+            selected_views_rpc_gt=rpc_init_views,
+            selected_image_shapes=image_shapes_crop,
+            selected_height_ref=height_ref,
+            ref_view_idx=ref_view_idx,
+        )
 
         sample = {
             "images": images_t,
