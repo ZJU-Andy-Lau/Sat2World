@@ -19,6 +19,7 @@ data:
   train:
     root: train_data
     max_view_num: 4
+    min_view_num: 2
     samples_per_scene: 10
     min_views: 2
     apply_perturbation: true
@@ -30,6 +31,7 @@ data:
     reference_policy: first
     strict_same_hw: true
     crop_size: 512
+    anchors_per_view_per_sample: 128
     perturb_cfg:
       tx_range: [ -2.0, 2.0 ]
       ty_range: [ -2.0, 2.0 ]
@@ -38,6 +40,7 @@ data:
   val:
     root: test_data
     max_view_num: 4
+    min_view_num: 2
     samples_per_scene: 1
     min_views: 2
     apply_perturbation: false
@@ -49,6 +52,7 @@ data:
     reference_policy: first
     strict_same_hw: true
     crop_size: 512
+    anchors_per_view_per_sample: 128
     perturb_cfg:
       tx_range: [ -2.0, 2.0 ]
       ty_range: [ -2.0, 2.0 ]
@@ -93,24 +97,26 @@ model:
   point_bin_size_z: 1.0
   point_fine_range_xy: 1.0
   point_fine_range_z: 0.5
+  center_downsample_stage_steps: [0, 20000, 60000]
+  center_downsample_factors: [4, 2, 1]
   sh_dim: 48
   gaussian_scale_epsilon: 1.0e-4
   output_raw_logits: true
 
 renderer:
-  train_num_target_views: 2
-  val_num_target_views: 2
+  train_num_target_views: 1
+  val_num_target_views: 1
   use_all_targets_in_val: false
   exclude_self_source: true
   allow_self_source_if_single_view: true
-  source_stride: 2
-  confidence_threshold: 0.05
-  topk_per_target: 20000
+  source_stride: 4
+  confidence_threshold: 0.1
+  topk_per_target: 4000
   enable_voxelization: false
   voxel_xy: 2.0
   voxel_z: 1.0
-  render_downsample_factor_train: 2
-  render_downsample_factor_val: 1
+  render_downsample_factor_train: 4
+  render_downsample_factor_val: 2
   nsigma: 2.5
   alpha_clamp_max: 0.98
   eps_xy_fd: 0.01
@@ -120,15 +126,19 @@ renderer:
   depth_sort_descending: false
   chunk_size: 512
   alpha_cov_thresh: 0.05
+  render_compute_dtype: fp16
   deterministic_target_selection: true
 
 loss:
   warmup_steps_geom_only: 1000
   render_ramp_steps: 2000
+  stage1_steps: 5000
+  stage2_steps: 20000
   ramp_mode: linear
   lambda_affine_grid: 1.0
   lambda_affine_pair: 1.0
   lambda_affine_reg: 0.1
+  lambda_affine_ref: 0.1
   lambda_height: 1.0
   lambda_point: 1.0
   lambda_center: 0.2
@@ -184,6 +194,8 @@ train:
   best_mode: min
   max_train_steps_per_epoch: -1
   max_val_steps: -1
+  device_sanity_check: false
+  enable_fixed_monitor_cache: true
 
 logging:
   tensorboard:

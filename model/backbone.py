@@ -158,13 +158,13 @@ class DINOv3Backbone(nn.Module):
 
 
 class GeometryTokenMLP(nn.Module):
-    """几何 token 编码器：20D -> 256D。
+    """几何 token 编码器：22D -> 256D。
 
     结构:
-        Linear(20->hidden) + GELU + LayerNorm + Linear(hidden->256) + LayerNorm。
+        Linear(22->hidden) + GELU + LayerNorm + Linear(hidden->256) + LayerNorm。
     """
 
-    def __init__(self, in_dim: int = 20, hidden_dim: int = 256, out_dim: int = 256) -> None:
+    def __init__(self, in_dim: int = 22, hidden_dim: int = 256, out_dim: int = 256) -> None:
         """初始化几何特征 MLP。"""
         super().__init__()
         self.net = nn.Sequential(
@@ -179,7 +179,7 @@ class GeometryTokenMLP(nn.Module):
         """编码几何特征。
 
         参数:
-            geom_feat: [B,V,N,20]。
+            geom_feat: [B,V,N,22]。
 
         返回:
             geom_token: [B,V,N,256]。

@@ -408,7 +408,7 @@ python scripts/validate.py \
 
 `Sat2World.forward()` 返回（节选）：
 
-- 几何校正：`affine_coarse`, `affine_pred`, `rpc_corrected`
+- 几何校正：`affine_pred`, `rpc_corrected`
 - 高程：`height_abs`, `height_coarse`, `height_fine`, `height_logits`
 - 点云：`point_anchor`, `point_abs`, `point_delta_coarse`, `point_delta_fine`
 - Gaussian 属性：`gaussian_opacity`, `gaussian_scale`, `gaussian_rotation`, `gaussian_sh`
@@ -566,4 +566,3 @@ python scripts/validate.py \
 ## 15. 许可证
 
 仓库根目录当前未提供统一 LICENSE 文件时，请以各子模块（尤其 `third_party/`）内的许可证与上游协议为准；在对外发布或商用前请先完成许可证合规核查。
-
