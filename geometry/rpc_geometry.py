@@ -245,7 +245,7 @@ class RPCGeometryOps:
         scene_xy_center: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
         scene_xy_scale: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
     ) -> torch.Tensor:
-        """批量计算 patch 级 20 维几何特征。
+        """批量计算 patch 级 43 维几何特征。
 
         参数:
             rpc_batch: [B][V] RPC 列表。
@@ -254,7 +254,7 @@ class RPCGeometryOps:
             scene_xy_center/scene_xy_scale: [B,2] 或等价 list。
 
         返回:
-            geom_feat: [B,V,N,20]，float32。
+            geom_feat: [B,V,N,43]，float32。
 
         说明:
             本函数默认不对 affine 保梯度，内部使用 no_grad 调用几何特征接口，
@@ -277,23 +277,68 @@ class RPCGeometryOps:
         else:
             raise ValueError(f"Unsupported patch_centers shape: {tuple(patch_centers.shape)}")
 
-        out = torch.empty((b, v, n, 20), device=height_ref.device, dtype=self.net_dtype)
+        out = torch.empty((b, v, n, 43), device=height_ref.device, dtype=self.net_dtype)
+        h_offsets = torch.tensor([-50.0, -10.0, -5.0, -1.0, 0.0, 1.0, 5.0, 10.0, 50.0], dtype=self.rpc_dtype)
 
         for bi in range(b):
             for vi in range(v):
                 rpc_obj = rpc_batch[bi][vi]
                 coords = centers_bv[bi, vi].to(dtype=self.rpc_dtype, device=rpc_obj.device)
-                dem = torch.full((n,), float(height_ref[bi, vi].item()), dtype=self.rpc_dtype, device=rpc_obj.device)
+                h_ref_scalar = float(height_ref[bi, vi].item())
+                dem = torch.full((n,), h_ref_scalar, dtype=self.rpc_dtype, device=rpc_obj.device)
+                xy_center = self._to_rpc_param(centers[bi], rpc_obj.device)
+                xy_scale = self._to_rpc_param(scales[bi], rpc_obj.device)
 
                 feat = rpc_obj.compute_geometry_features(
                     Coords=coords,
                     dem=dem,
-                    xy_center=self._to_rpc_param(centers[bi], rpc_obj.device),
-                    xy_scale=self._to_rpc_param(scales[bi], rpc_obj.device),
+                    xy_center=xy_center,
+                    xy_scale=xy_scale,
                 )
-                out[bi, vi] = feat.detach().to(dtype=self.net_dtype, device=height_ref.device)
+                h_ref_digits = self._encode_height_ref_digits(h_ref_scalar, device=rpc_obj.device)
+                h_ref_digits_n = h_ref_digits.unsqueeze(0).expand(n, -1)  # [N,5]
+
+                h_anchors = dem.unsqueeze(1) + h_offsets.to(device=rpc_obj.device).unsqueeze(0)  # [N,9]
+                line_rep = coords[:, 0].unsqueeze(1).expand(-1, 9).reshape(-1)
+                samp_rep = coords[:, 1].unsqueeze(1).expand(-1, 9).reshape(-1)
+                h_rep = h_anchors.reshape(-1)
+                x_norm_rep, y_norm_rep = rpc_obj.RPC_LINESAMP2XY(
+                    line_in=line_rep,
+                    samp_in=samp_rep,
+                    h_in=h_rep,
+                    output_type="tensor",
+                    xy_center=xy_center,
+                    xy_scale=xy_scale,
+                )
+                xy_anchors = torch.stack([x_norm_rep, y_norm_rep], dim=-1).view(n, 9, 2).reshape(n, 18)  # [N,18]
+
+                feat43 = torch.cat([feat, h_ref_digits_n, xy_anchors], dim=-1)
+                out[bi, vi] = feat43.detach().to(dtype=self.net_dtype, device=height_ref.device)
 
         return out
+
+    def _encode_height_ref_digits(self, h_ref: float, *, device: torch.device) -> torch.Tensor:
+        """将 h_ref 编码为 5 维：[千位, 百位, 十位, 个位, 小数]，并归一化到 [0,1]。"""
+        h_abs = abs(float(h_ref))
+        int_part = int(h_abs)
+        frac_part = h_abs - float(int_part)
+
+        thousands = (int_part // 1000) % 10
+        hundreds = (int_part // 100) % 10
+        tens = (int_part // 10) % 10
+        ones = int_part % 10
+
+        return torch.tensor(
+            [
+                float(thousands) / 9.0,
+                float(hundreds) / 9.0,
+                float(tens) / 9.0,
+                float(ones) / 9.0,
+                float(frac_part),
+            ],
+            dtype=self.rpc_dtype,
+            device=device,
+        )
 
     def centers_from_rpc_and_height_batch(
         self,
@@ -303,6 +348,7 @@ class RPCGeometryOps:
         *,
         scene_xy_center: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
         scene_xy_scale: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
+        downsample_factor: int = 1,
     ) -> torch.Tensor:
         """由 corrected RPC + 绝对高程图生成三维中心。
 
@@ -320,17 +366,41 @@ class RPCGeometryOps:
             raise ValueError("height_abs must be [B,V,1,H,W]")
 
         b, v, _, h, w = height_abs.shape
+        ds = max(int(downsample_factor), 1)
+        if ds > 1:
+            h_ds = max(h // ds, 1)
+            w_ds = max(w // ds, 1)
+            height_abs_work = torch.nn.functional.interpolate(
+                height_abs.view(b * v, 1, h, w),
+                size=(h_ds, w_ds),
+                mode="bilinear",
+                align_corners=False,
+            ).view(b, v, 1, h_ds, w_ds)
+            # 关键：下采样后仍需保持“原图坐标系”的 line/samp 射线。
+            # 不能重建 0..h_ds-1 / 0..w_ds-1 的局部网格，否则会把射线压缩到左上角。
+            pixel_grid_full = pixel_grid.to(device=height_abs.device, dtype=height_abs.dtype)
+            pixel_grid_work = torch.nn.functional.interpolate(
+                pixel_grid_full.permute(2, 0, 1).unsqueeze(0),  # [1,2,H,W]
+                size=(h_ds, w_ds),
+                mode="bilinear",
+                align_corners=False,
+            )[0].permute(1, 2, 0).contiguous()  # [h_ds,w_ds,2]
+        else:
+            h_ds, w_ds = h, w
+            height_abs_work = height_abs
+            pixel_grid_work = pixel_grid
+
         centers, scales = self._normalize_scene_xy(scene_xy_center, scene_xy_scale, b, height_abs.device)
 
-        line = pixel_grid[..., 0].reshape(-1).to(device=height_abs.device)
-        samp = pixel_grid[..., 1].reshape(-1).to(device=height_abs.device)
+        line = pixel_grid_work[..., 0].reshape(-1).to(device=height_abs.device)
+        samp = pixel_grid_work[..., 1].reshape(-1).to(device=height_abs.device)
 
-        out = torch.empty((b, v, 3, h, w), device=height_abs.device, dtype=self.net_dtype)
+        out = torch.empty((b, v, 3, h_ds, w_ds), device=height_abs.device, dtype=self.net_dtype)
 
         for bi in range(b):
             for vi in range(v):
                 rpc_obj = corrected_rpc_batch[bi][vi]
-                h_flat = height_abs[bi, vi, 0].reshape(-1)
+                h_flat = height_abs_work[bi, vi, 0].reshape(-1)
 
                 x, y = self.linesamp_to_xy(
                     rpc_obj,
@@ -340,10 +410,18 @@ class RPCGeometryOps:
                     xy_center=centers[bi],
                     xy_scale=scales[bi],
                 )
-                x = x.reshape(h, w).to(dtype=self.net_dtype, device=height_abs.device)
-                y = y.reshape(h, w).to(dtype=self.net_dtype, device=height_abs.device)
-                z = height_abs[bi, vi, 0].to(dtype=self.net_dtype)
+                x = x.reshape(h_ds, w_ds).to(dtype=self.net_dtype, device=height_abs.device)
+                y = y.reshape(h_ds, w_ds).to(dtype=self.net_dtype, device=height_abs.device)
+                z = height_abs_work[bi, vi, 0].to(dtype=self.net_dtype)
                 out[bi, vi] = torch.stack([x, y, z], dim=0)
+
+        if ds > 1:
+            out = torch.nn.functional.interpolate(
+                out.view(b * v, 3, h_ds, w_ds),
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            ).view(b, v, 3, h, w)
 
         return out
 

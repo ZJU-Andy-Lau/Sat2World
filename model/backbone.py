@@ -2,7 +2,7 @@
 
 本文件包含三类核心模块：
 1) DINOv3Backbone: 负责视觉 patch token 提取与 padding/掩码管理；
-2) GeometryTokenMLP: 把 20D patch 几何特征编码到 256D；
+2) GeometryTokenMLP: 把 43D patch 几何特征编码到 256D；
 3) VisualGeometryFuser: 融合视觉 token 与几何 token，再压缩回 1024D。
 """
 
@@ -158,13 +158,13 @@ class DINOv3Backbone(nn.Module):
 
 
 class GeometryTokenMLP(nn.Module):
-    """几何 token 编码器：20D -> 256D。
+    """几何 token 编码器：43D -> 256D。
 
     结构:
-        Linear(20->hidden) + GELU + LayerNorm + Linear(hidden->256) + LayerNorm。
+        Linear(43->hidden) + GELU + LayerNorm + Linear(hidden->256) + LayerNorm。
     """
 
-    def __init__(self, in_dim: int = 20, hidden_dim: int = 256, out_dim: int = 256) -> None:
+    def __init__(self, in_dim: int = 43, hidden_dim: int = 256, out_dim: int = 256) -> None:
         """初始化几何特征 MLP。"""
         super().__init__()
         self.net = nn.Sequential(
@@ -179,7 +179,7 @@ class GeometryTokenMLP(nn.Module):
         """编码几何特征。
 
         参数:
-            geom_feat: [B,V,N,20]。
+            geom_feat: [B,V,N,43]。
 
         返回:
             geom_token: [B,V,N,256]。

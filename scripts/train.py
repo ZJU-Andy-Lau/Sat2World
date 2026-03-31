@@ -84,6 +84,10 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
     scfg.point_bin_size_z = float(m.get("point_bin_size_z", scfg.point_bin_size_z))
     scfg.point_fine_range_xy = float(m.get("point_fine_range_xy", scfg.point_fine_range_xy))
     scfg.point_fine_range_z = float(m.get("point_fine_range_z", scfg.point_fine_range_z))
+    if "center_downsample_stage_steps" in m:
+        scfg.center_downsample_stage_steps = tuple(int(x) for x in m.get("center_downsample_stage_steps", scfg.center_downsample_stage_steps))
+    if "center_downsample_factors" in m:
+        scfg.center_downsample_factors = tuple(int(x) for x in m.get("center_downsample_factors", scfg.center_downsample_factors))
     return Sat2World(scfg)
 
 
@@ -114,10 +118,13 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
     scheduler = LossWeightScheduler(
         warmup_steps_geom_only=int(lcfg.get("warmup_steps_geom_only", 1000)),
         render_ramp_steps=int(lcfg.get("render_ramp_steps", 2000)),
+        stage1_steps=int(lcfg.get("stage1_steps", 5000)),
+        stage2_steps=int(lcfg.get("stage2_steps", 20000)),
         base_weights={
             "lambda_affine_grid": float(lcfg.get("lambda_affine_grid", 1.0)),
             "lambda_affine_pair": float(lcfg.get("lambda_affine_pair", 1.0)),
             "lambda_affine_reg": float(lcfg.get("lambda_affine_reg", 0.1)),
+            "lambda_affine_ref": float(lcfg.get("lambda_affine_ref", 0.1)),
             "lambda_height": float(lcfg.get("lambda_height", 1.0)),
             "lambda_point": float(lcfg.get("lambda_point", 1.0)),
             "lambda_center": float(lcfg.get("lambda_center", 0.2)),
@@ -193,8 +200,12 @@ def build_dataloaders(cfg: dict[str, Any], distributed: bool):
 
     num_workers = int(loader_cfg.get("num_workers", 4))
     pin_memory = bool(loader_cfg.get("pin_memory", True))
-    persistent_workers = bool(loader_cfg.get("persistent_workers", False))
+    persistent_workers = bool(loader_cfg.get("persistent_workers", num_workers > 0))
     prefetch_factor = loader_cfg.get("prefetch_factor", None)
+    if num_workers <= 0:
+        # DataLoader 约束：num_workers==0 时 persistent_workers 必须为 False。
+        persistent_workers = False
+        prefetch_factor = None
 
     train_loader = DataLoader(
         train_dataset,
@@ -262,6 +273,9 @@ def main() -> None:
     system_cfg = cfg.get("system", {})
     work_dir = Path(system_cfg.get("work_dir", "work_dirs/default"))
     work_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_cfg = cfg.get("checkpoint", {})
+    checkpoints_dir = Path(checkpoint_cfg.get("checkpoints_dir", str(work_dir / "checkpoints")))
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     dist_state = init_distributed(backend=str(system_cfg.get("ddp_backend", "nccl")))
     device = dist_state["device"]
@@ -317,7 +331,15 @@ def main() -> None:
     elif args.resume:
         resume_path = args.resume
     elif resume_path == "" and auto_resume:
-        resume_path = auto_resume_latest(str(work_dir)) or ""
+        # 统一 checkpoint 配置入口：优先从 checkpoint.checkpoints_dir 自动恢复。
+        last_ckpt = checkpoints_dir / "last.pt"
+        if last_ckpt.exists():
+            resume_path = str(last_ckpt)
+        else:
+            cands = sorted(checkpoints_dir.glob("epoch_*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+            resume_path = str(cands[0]) if cands else ""
+            if resume_path == "":
+                resume_path = auto_resume_latest(str(work_dir)) or ""
 
     if resume_path:
         resume_state = resume_from_checkpoint(
@@ -332,8 +354,9 @@ def main() -> None:
             monitor.log_text("events/resume", f"resume from {resume_path}", 0)
 
     trainer_cfg = dict(cfg.get("train", {}))
-    trainer_cfg["best_metric"] = cfg.get("checkpoint", {}).get("best_metric_name", trainer_cfg.get("best_metric", "loss_total"))
-    trainer_cfg["best_mode"] = cfg.get("checkpoint", {}).get("best_metric_mode", trainer_cfg.get("best_mode", "min"))
+    trainer_cfg["best_metric"] = checkpoint_cfg.get("best_metric_name", trainer_cfg.get("best_metric", "loss_total"))
+    trainer_cfg["best_mode"] = checkpoint_cfg.get("best_metric_mode", trainer_cfg.get("best_mode", "min"))
+    trainer_cfg["checkpoints_dir"] = str(checkpoints_dir)
 
     trainer = Trainer(
         cfg=trainer_cfg,

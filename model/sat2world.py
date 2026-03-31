@@ -2,12 +2,13 @@
 
 Sat2World 主模型入口：Sat2World。
 
-前向主流程（两次 refinement）：
+前向主流程（单阶段）：
 1) 提取视觉 patch token；
-2) 第一次几何融合编码 -> affine_coarse；
-3) 用 affine_coarse 校正 RPC，再做第二次几何融合编码；
-4) 输出 affine_pred / height_abs / point_abs / gaussian attributes；
-5) 构造两条高斯中心路径：
+2) 计算一次几何特征并与视觉 token 融合；
+3) 单次编码后直接输出 affine_pred；
+4) 用 affine_pred 校正 rpc_init，得到 rpc_corrected；
+5) 输出 height_abs / point_abs / gaussian attributes；
+6) 构造两条高斯中心路径：
    - centers_rpc = corrected RPC + height_abs
    - centers_point = point_abs
 """
@@ -61,6 +62,8 @@ class Sat2WorldCfg:
     height_fine_range: float = 0.5
     point_fine_range_xy: float = 1.0
     point_fine_range_z: float = 0.5
+    center_downsample_stage_steps: tuple[int, ...] = (0, 20000, 60000)
+    center_downsample_factors: tuple[int, ...] = (4, 2, 1)
 
 
 class Sat2World(nn.Module):
@@ -69,7 +72,7 @@ class Sat2World(nn.Module):
     成员模块:
         - backbone: DINOv3 patch token 提取；
         - geom_mlp/fuser: 几何-视觉融合；
-        - encoder: 共享权重交替编码器（前向中调用两次）；
+        - encoder: 共享权重交替编码器（前向中调用一次）；
         - affine/height/point/gaussian heads;
         - height/point coders;
         - rpc_ops: RPC 工程接口。
@@ -81,7 +84,7 @@ class Sat2World(nn.Module):
         self.cfg = cfg
 
         self.backbone = DINOv3Backbone(cfg.backbone)
-        self.geom_mlp = GeometryTokenMLP(in_dim=20, hidden_dim=256, out_dim=256)
+        self.geom_mlp = GeometryTokenMLP(in_dim=43, hidden_dim=256, out_dim=256)
         self.fuser = VisualGeometryFuser(visual_dim=self.backbone.embed_dim, geom_dim=256, out_dim=self.backbone.embed_dim)
 
         encoder_cfg = cfg.encoder
@@ -111,6 +114,28 @@ class Sat2World(nn.Module):
         )
 
         self.rpc_ops = RPCGeometryOps(rpc_dtype=torch.double, net_dtype=torch.float32)
+        self.runtime_global_step: int = 0
+        self.runtime_mode: str = "train"
+
+    def set_runtime_context(self, *, global_step: int, mode: str) -> None:
+        self.runtime_global_step = int(global_step)
+        self.runtime_mode = str(mode)
+
+    def _current_center_downsample(self) -> int:
+        steps = tuple(int(x) for x in self.cfg.center_downsample_stage_steps)
+        factors = tuple(int(x) for x in self.cfg.center_downsample_factors)
+        if len(steps) == 0 or len(factors) == 0:
+            return 1
+        idx = 0
+        for si, st in enumerate(steps):
+            if self.runtime_global_step >= st:
+                idx = si
+            else:
+                break
+        idx = min(idx, len(factors) - 1)
+        if self.runtime_mode != "train":
+            return 1
+        return max(1, factors[idx])
 
     def _prepare_height_ref(self, batch: dict[str, Any], rpc_init: list[list[Any]], device: torch.device) -> torch.Tensor:
         """准备 [B,V] 的 height_ref；优先读取 batch，缺失则从 RPC 推断。"""
@@ -174,49 +199,34 @@ class Sat2World(nn.Module):
         # 2) height_ref
         height_ref = self._prepare_height_ref(batch, rpc_init, device=device)
 
-        # 3) 第一次几何特征 + 编码
-        geom_feat_1 = self.rpc_ops.compute_patch_geometry_features_batch(
+        # 3) 单次几何特征 + 编码
+        geom_feat = self.rpc_ops.compute_patch_geometry_features_batch(
             rpc_batch=rpc_init,
             patch_centers=patch_centers,
             height_ref=height_ref,
             scene_xy_center=scene_xy_center,
             scene_xy_scale=scene_xy_scale,
         )
-        geom_tok_1 = self.geom_mlp(geom_feat_1)
-        fused_tok_1 = self.fuser(patch_tokens_vis, geom_tok_1)
+        geom_tok = self.geom_mlp(geom_feat)
+        fused_tok = self.fuser(patch_tokens_vis, geom_tok)
 
-        enc_out_1 = self.encoder(fused_tok_1, patch_valid_mask, ref_view_idx=ref_view_idx)
-        affine_coarse = self.affine_head(enc_out_1["view_tokens"])
+        enc_out = self.encoder(fused_tok, patch_valid_mask, ref_view_idx=ref_view_idx)
+        patch_tokens_final = enc_out["patch_tokens"]
+        view_tokens_final = enc_out["view_tokens"]
+        scene_token_final = enc_out["scene_token"]
 
-        # 4) 粗仿射修正 RPC
-        corrected_rpc_coarse = self.rpc_ops.apply_affine_correction_batch(rpc_init, affine_coarse)
-
-        # 5) 第二次几何特征 + 同一编码器再次 refinement
-        geom_feat_2 = self.rpc_ops.compute_patch_geometry_features_batch(
-            rpc_batch=corrected_rpc_coarse,
-            patch_centers=patch_centers,
-            height_ref=height_ref,
-            scene_xy_center=scene_xy_center,
-            scene_xy_scale=scene_xy_scale,
-        )
-        geom_tok_2 = self.geom_mlp(geom_feat_2)
-        fused_tok_2 = self.fuser(patch_tokens_vis, geom_tok_2)
-
-        enc_out_2 = self.encoder(fused_tok_2, patch_valid_mask, ref_view_idx=ref_view_idx)
-        patch_tokens_final = enc_out_2["patch_tokens"]
-        view_tokens_final = enc_out_2["view_tokens"]
-        scene_token_final = enc_out_2["scene_token"]
-
-        # 6) 最终仿射
+        # 4) 单阶段仿射预测（参考视图约束在 loss 阶段处理）
         affine_pred = self.affine_head(view_tokens_final)
-        corrected_rpc_final = self.rpc_ops.apply_affine_correction_batch(rpc_init, affine_pred)
 
-        # 7) patch -> dense
+        # 5) affine_pred 修正 rpc_init
+        rpc_corrected = self.rpc_ops.apply_affine_correction_batch(rpc_init, affine_pred)
+
+        # 6) patch -> dense
         patch_map_final = self.encoder.patch_tokens_to_map(patch_tokens_final, (gh, gw))
         patch_map_final_bv = patch_map_final.view(b * v, self.backbone.embed_dim, gh, gw)
         dense_feat = self.dense_decoder(patch_map_final_bv, images_bv)
 
-        # 8) 高程分支
+        # 7) 高程分支
         height_pred = self.height_head(dense_feat)
         h_logits = self._reshape_logits_to_bv(height_pred["logits"], b, v)
         h_fine = self._reshape_logits_to_bv(height_pred["fine"], b, v)
@@ -225,7 +235,7 @@ class Sat2World(nn.Module):
         height_decoded = self.height_coder(h_logits, h_fine, h_ref_map)
         height_abs = height_decoded["h_abs"]
 
-        # 9) 点云分支（独立 anchor）
+        # 8) 点云分支（独立 anchor）
         image_grid = make_image_grid(h, w, device=device, dtype=torch.float32)
         point_anchor = self.rpc_ops.build_point_anchor_map_batch(
             rpc_init_batch=rpc_init,
@@ -254,7 +264,7 @@ class Sat2World(nn.Module):
         )
         point_abs = point_decoded["point_abs"]
 
-        # 10) 高斯属性分支
+        # 9) 高斯属性分支
         gauss_pred = self.gaussian_head(dense_feat)
         gaussian_opacity = self._reshape_logits_to_bv(gauss_pred["opacity"], b, v)
         gaussian_scale = self._reshape_logits_to_bv(gauss_pred["scale"], b, v)
@@ -263,20 +273,20 @@ class Sat2World(nn.Module):
         gaussian_conf_rpc = self._reshape_logits_to_bv(gauss_pred["confidence_rpc"], b, v)
         gaussian_conf_point = self._reshape_logits_to_bv(gauss_pred["confidence_point"], b, v)
 
-        # 11) 双路径中心
+        # 10) 双路径中心
         centers_rpc = self.rpc_ops.centers_from_rpc_and_height_batch(
-            corrected_rpc_batch=corrected_rpc_final,
+            corrected_rpc_batch=rpc_corrected,
             pixel_grid=image_grid,
             height_abs=height_abs,
             scene_xy_center=scene_xy_center,
             scene_xy_scale=scene_xy_scale,
+            downsample_factor=self._current_center_downsample(),
         )
         centers_point = point_abs
 
         return {
-            "affine_coarse": affine_coarse,
             "affine_pred": affine_pred,
-            "rpc_corrected": corrected_rpc_final,
+            "rpc_corrected": rpc_corrected,
             "height_ref": height_ref,
             "height_abs": height_abs,
             "height_coarse": height_decoded["delta_h_coarse"],
