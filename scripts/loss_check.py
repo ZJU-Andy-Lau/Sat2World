@@ -152,14 +152,12 @@ def _affine_pair_truth(
     max_pairs: int | None,
 ) -> torch.Tensor:
     rpc_gt = batch_dev["rpc_gt"]
-    h_gt = batch_dev["height_gt"].to(device=height_abs.device, dtype=height_abs.dtype)
     h_mask = batch_dev["height_valid_mask"].to(device=height_abs.device, dtype=height_abs.dtype)
     scene_xy_center = batch_dev.get("scene_xy_center", None)
     scene_xy_scale = batch_dev.get("scene_xy_scale", None)
     ref_idx = batch_dev.get("ref_view_idx", None)
 
     b, v, _, h, w = height_abs.shape
-    n_inv = _invert_affine_bv(affine_noise)
     pair_terms: list[torch.Tensor] = []
 
     for bi in range(b):
@@ -269,8 +267,8 @@ def _affine_pair_truth(
             pred_i2j_noisy = torch.stack([li_n.view(1, -1), si_n.view(1, -1)], dim=-1).to(height_abs.device, height_abs.dtype)
             pred_j2i_noisy = torch.stack([lj_n.view(1, -1), sj_n.view(1, -1)], dim=-1).to(height_abs.device, height_abs.dtype)
 
-            pred_i2j = apply_affine_to_points(pred_i2j_noisy, n_inv[bi : bi + 1, j])
-            pred_j2i = apply_affine_to_points(pred_j2i_noisy, n_inv[bi : bi + 1, i])
+            pred_i2j = pred_i2j_noisy
+            pred_j2i = pred_j2i_noisy
 
             e_i2j = torch.linalg.norm(pred_i2j - gt_i2j, dim=-1)
             e_j2i = torch.linalg.norm(pred_j2i - gt_j2i, dim=-1)
