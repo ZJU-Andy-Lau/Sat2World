@@ -146,6 +146,13 @@ class Trainer:
             return torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
         return torch.autocast(device_type="cuda", enabled=False)
 
+    def _format_hhmmss(self, sec: float) -> str:
+        sec_i = max(0, int(sec))
+        h = sec_i // 3600
+        m = (sec_i % 3600) // 60
+        s = sec_i % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
     def _forward_batch(self, batch_dev: dict[str, Any], mode: str):
         """统一前向：model -> renderer(optional) -> objective。"""
         if self.device_sanity_check:
@@ -377,7 +384,18 @@ class Trainer:
     def _run_train_epoch(self) -> None:
         """执行一个训练 epoch。"""
         self.model.train()
+        epoch_t0 = time.time()
+        steps_target = len(self.train_loader)
+        if self.max_train_steps_per_epoch > 0:
+            steps_target = min(steps_target, self.max_train_steps_per_epoch)
         prev_time = time.time()
+        loss_sums = {
+            "loss_total": 0.0,
+            "loss_affine_grid": 0.0,
+            "loss_affine_pair": 0.0,
+            "loss_affine_height": 0.0,
+        }
+        n_loss_steps = 0
         for step_idx, batch in enumerate(self.train_loader):
             if self.max_train_steps_per_epoch > 0 and step_idx >= self.max_train_steps_per_epoch:
                 break
@@ -393,10 +411,33 @@ class Trainer:
             self.step_in_epoch = step_idx + 1
             prev_time = time.time()
 
-            if is_main_process() and (step_idx % self.log_interval == 0):
-                lt = logs.get("loss_total", None)
-                lr = logs.get("optim/lr", None)
-                print(f"[train] epoch={self.epoch} step={step_idx} gstep={self.global_step} loss={lt} lr={lr}")
+            lt = logs.get("loss_total", None)
+            lag = logs.get("loss_affine_grid", None)
+            lap = logs.get("loss_affine_pair", None)
+            lh = logs.get("loss_height", None)
+            if lt is not None and lag is not None and lap is not None and lh is not None:
+                loss_sums["loss_total"] += float(lt)
+                loss_sums["loss_affine_grid"] += float(lag)
+                loss_sums["loss_affine_pair"] += float(lap)
+                loss_sums["loss_affine_height"] += float(lh)
+                n_loss_steps += 1
+
+            if is_main_process():
+                lr = float(logs.get("optim/lr", 0.0))
+                elapsed = time.time() - epoch_t0
+                done = max(step_idx + 1, 1)
+                eta = (elapsed / done) * max(steps_target - done, 0)
+                print(
+                    "[train] "
+                    f"epoch={self.epoch} step={step_idx} gstep={self.global_step} "
+                    f"loss_total={float(lt) if lt is not None else float('nan'):.6f} "
+                    f"loss_affine_grid={float(lag) if lag is not None else float('nan'):.6f} "
+                    f"loss_affine_pair={float(lap) if lap is not None else float('nan'):.6f} "
+                    f"loss_affine_height={float(lh) if lh is not None else float('nan'):.6f} "
+                    f"lr={lr:.2e} "
+                    f"time={self._format_hhmmss(elapsed)} "
+                    f"eta={self._format_hhmmss(eta)}"
+                )
 
             if self.global_step > 0 and self.global_step % self.ckpt_interval == 0:
                 self._save_last_checkpoint(step_in_epoch=step_idx + 1)
@@ -406,6 +447,19 @@ class Trainer:
                 self.model.train()
 
         self.step_in_epoch = 0
+        if is_main_process() and n_loss_steps > 0:
+            avg_total = loss_sums["loss_total"] / n_loss_steps
+            avg_ag = loss_sums["loss_affine_grid"] / n_loss_steps
+            avg_ap = loss_sums["loss_affine_pair"] / n_loss_steps
+            avg_ah = loss_sums["loss_affine_height"] / n_loss_steps
+            print(
+                "[train][epoch_summary] "
+                f"epoch={self.epoch} "
+                f"avg_total_loss={avg_total:.6f} "
+                f"avg_loss_affine_grid={avg_ag:.6f} "
+                f"avg_loss_affine_pair={avg_ap:.6f} "
+                f"avg_loss_affine_height={avg_ah:.6f}"
+            )
 
     def validate(self) -> dict[str, float]:
         """执行完整验证流程。"""
