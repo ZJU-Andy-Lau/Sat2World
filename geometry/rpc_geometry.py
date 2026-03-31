@@ -246,7 +246,7 @@ class RPCGeometryOps:
         scene_xy_center: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
         scene_xy_scale: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
     ) -> torch.Tensor:
-        """批量计算 patch 级 22 维几何特征。
+        """批量计算 patch 级 43 维几何特征。
 
         参数:
             rpc_batch: [B][V] RPC 列表。
@@ -255,7 +255,7 @@ class RPCGeometryOps:
             scene_xy_center/scene_xy_scale: [B,2] 或等价 list。
 
         返回:
-            geom_feat: [B,V,N,22]，float32。
+            geom_feat: [B,V,N,43]，float32。
 
         说明:
             本函数默认不对 affine 保梯度，内部使用 no_grad 调用几何特征接口，
@@ -278,33 +278,68 @@ class RPCGeometryOps:
         else:
             raise ValueError(f"Unsupported patch_centers shape: {tuple(patch_centers.shape)}")
 
-        out = torch.empty((b, v, n, 22), device=height_ref.device, dtype=self.net_dtype)
+        out = torch.empty((b, v, n, 43), device=height_ref.device, dtype=self.net_dtype)
+        h_offsets = torch.tensor([-50.0, -10.0, -5.0, -1.0, 0.0, 1.0, 5.0, 10.0, 50.0], dtype=self.rpc_dtype)
 
         for bi in range(b):
             for vi in range(v):
                 rpc_obj = rpc_batch[bi][vi]
                 coords = centers_bv[bi, vi].to(dtype=self.rpc_dtype, device=rpc_obj.device)
-                dem = torch.full((n,), float(height_ref[bi, vi].item()), dtype=self.rpc_dtype, device=rpc_obj.device)
+                h_ref_scalar = float(height_ref[bi, vi].item())
+                dem = torch.full((n,), h_ref_scalar, dtype=self.rpc_dtype, device=rpc_obj.device)
+                xy_center = self._to_rpc_param(centers[bi], rpc_obj.device)
+                xy_scale = self._to_rpc_param(scales[bi], rpc_obj.device)
 
                 feat = rpc_obj.compute_geometry_features(
                     Coords=coords,
                     dem=dem,
-                    xy_center=self._to_rpc_param(centers[bi], rpc_obj.device),
-                    xy_scale=self._to_rpc_param(scales[bi], rpc_obj.device),
+                    xy_center=xy_center,
+                    xy_scale=xy_scale,
                 )
-                x_norm, y_norm = rpc_obj.RPC_LINESAMP2XY(
-                    line_in=coords[:, 0],
-                    samp_in=coords[:, 1],
-                    h_in=dem,
+                h_ref_digits = self._encode_height_ref_digits(h_ref_scalar, device=rpc_obj.device)
+                h_ref_digits_n = h_ref_digits.unsqueeze(0).expand(n, -1)  # [N,5]
+
+                h_anchors = dem.unsqueeze(1) + h_offsets.to(device=rpc_obj.device).unsqueeze(0)  # [N,9]
+                line_rep = coords[:, 0].unsqueeze(1).expand(-1, 9).reshape(-1)
+                samp_rep = coords[:, 1].unsqueeze(1).expand(-1, 9).reshape(-1)
+                h_rep = h_anchors.reshape(-1)
+                x_norm_rep, y_norm_rep = rpc_obj.RPC_LINESAMP2XY(
+                    line_in=line_rep,
+                    samp_in=samp_rep,
+                    h_in=h_rep,
                     output_type="tensor",
-                    xy_center=self._to_rpc_param(centers[bi], rpc_obj.device),
-                    xy_scale=self._to_rpc_param(scales[bi], rpc_obj.device),
+                    xy_center=xy_center,
+                    xy_scale=xy_scale,
                 )
-                xy_norm_feat = torch.stack([x_norm, y_norm], dim=-1)  # [N,2]
-                feat22 = torch.cat([feat, xy_norm_feat], dim=-1)
-                out[bi, vi] = feat22.detach().to(dtype=self.net_dtype, device=height_ref.device)
+                xy_anchors = torch.stack([x_norm_rep, y_norm_rep], dim=-1).view(n, 9, 2).reshape(n, 18)  # [N,18]
+
+                feat43 = torch.cat([feat, h_ref_digits_n, xy_anchors], dim=-1)
+                out[bi, vi] = feat43.detach().to(dtype=self.net_dtype, device=height_ref.device)
 
         return out
+
+    def _encode_height_ref_digits(self, h_ref: float, *, device: torch.device) -> torch.Tensor:
+        """将 h_ref 编码为 5 维：[千位, 百位, 十位, 个位, 小数]，并归一化到 [0,1]。"""
+        h_abs = abs(float(h_ref))
+        int_part = int(h_abs)
+        frac_part = h_abs - float(int_part)
+
+        thousands = (int_part // 1000) % 10
+        hundreds = (int_part // 100) % 10
+        tens = (int_part // 10) % 10
+        ones = int_part % 10
+
+        return torch.tensor(
+            [
+                float(thousands) / 9.0,
+                float(hundreds) / 9.0,
+                float(tens) / 9.0,
+                float(ones) / 9.0,
+                float(frac_part),
+            ],
+            dtype=self.rpc_dtype,
+            device=device,
+        )
 
     def centers_from_rpc_and_height_batch(
         self,
