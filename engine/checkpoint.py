@@ -131,6 +131,8 @@ def save_checkpoint(
     try:
         torch.save(payload, tmp_path)
         os.replace(tmp_path, path)
+    except:
+        pass
     finally:
         if tmp_path.exists():
             _safe_unlink(tmp_path)
