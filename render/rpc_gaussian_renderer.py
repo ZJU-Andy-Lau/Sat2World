@@ -150,11 +150,12 @@ def estimate_local_view_direction(
     方法:
         在中心像素处取 h_ref 和 h_ref+delta_h 两个高度反投影，方向取差分单位向量。
     """
-    c_line = torch.tensor([(image_h - 1) * 0.5], dtype=torch.float32)
-    c_samp = torch.tensor([(image_w - 1) * 0.5], dtype=torch.float32)
+    base_device = getattr(target_rpc, "device", torch.device("cpu"))
+    c_line = torch.tensor([(image_h - 1) * 0.5], dtype=torch.float32, device=base_device)
+    c_samp = torch.tensor([(image_w - 1) * 0.5], dtype=torch.float32, device=base_device)
 
-    h0 = torch.tensor([float(h_ref)], dtype=torch.float32)
-    h1 = torch.tensor([float(h_ref + delta_h_dir)], dtype=torch.float32)
+    h0 = torch.tensor([float(h_ref)], dtype=torch.float32, device=base_device)
+    h1 = torch.tensor([float(h_ref + delta_h_dir)], dtype=torch.float32, device=base_device)
 
     x0, y0 = geometry_ops.linesamp_to_xy(
         target_rpc,
@@ -311,44 +312,41 @@ def rasterize_projected_gaussians(
     rasterized = 0
 
     eye = torch.eye(2, device=device, dtype=dtype)
-    for g in range(n):
-        l0, l1, s0, s1 = [int(x.item()) for x in bboxes[g]]
-        if l1 < l0 or s1 < s0:
-            continue
-        rasterized += 1
-        patch_h = l1 - l0 + 1
-        patch_w = s1 - s0 + 1
+    step = max(int(chunk_size), 1)
+    for g0 in range(0, n, step):
+        g1 = min(g0 + step, n)
+        for g in range(g0, g1):
+            l0, l1, s0, s1 = [int(x.item()) for x in bboxes[g]]
+            if l1 < l0 or s1 < s0:
+                continue
+            rasterized += 1
 
-        yy = torch.arange(l0, l1 + 1, device=device, dtype=dtype)
-        xx = torch.arange(s0, s1 + 1, device=device, dtype=dtype)
-        gy, gx = torch.meshgrid(yy, xx, indexing="ij")
+            yy = torch.arange(l0, l1 + 1, device=device, dtype=dtype)
+            xx = torch.arange(s0, s1 + 1, device=device, dtype=dtype)
+            gy, gx = torch.meshgrid(yy, xx, indexing="ij")
 
-        d0 = gy - mean_2d[g, 0]
-        d1 = gx - mean_2d[g, 1]
-        d = torch.stack([d0, d1], dim=-1)  # [ph,pw,2]
+            d0 = gy - mean_2d[g, 0]
+            d1 = gx - mean_2d[g, 1]
+            d = torch.stack([d0, d1], dim=-1)  # [ph,pw,2]
 
-        inv_cov = torch.inverse(cov_2d[g] + 1e-8 * eye)
-        m = torch.einsum("...i,ij,...j->...", d, inv_cov, d)
-        w = torch.exp(-0.5 * m)
+            # 低精度（fp16/bf16）下 torch.linalg.inv 不受支持，且数值稳定性也更差。
+            # 这里局部提升到 fp32 做 2x2 逆与 Mahalanobis 计算，再回落到渲染 dtype。
+            inv_cov32 = torch.linalg.inv((cov_2d[g].to(torch.float32) + 1e-8 * eye.to(torch.float32)))
+            m = torch.einsum("...i,ij,...j->...", d.to(torch.float32), inv_cov32, d.to(torch.float32))
+            w = torch.exp(-0.5 * m).to(dtype=dtype)
 
-        alpha = torch.clamp(opacity[g] * w, 0.0, alpha_clamp_max).unsqueeze(0)
-        trans_patch = trans[:, l0 : l1 + 1, s0 : s1 + 1]
-        contrib = trans_patch * alpha
+            alpha = torch.clamp(opacity[g] * w, 0.0, alpha_clamp_max).unsqueeze(0)
+            trans_patch = trans[:, l0 : l1 + 1, s0 : s1 + 1].clone()
+            contrib = trans_patch * alpha
 
-        new_canvas_rgb = canvas_rgb.clone()
-        new_canvas_height = canvas_height.clone()
-        new_canvas_alpha = canvas_alpha.clone()
-        new_trans = trans.clone()
+            rgb_patch = canvas_rgb[:, l0 : l1 + 1, s0 : s1 + 1].clone()
+            h_patch = canvas_height[:, l0 : l1 + 1, s0 : s1 + 1].clone()
+            a_patch = canvas_alpha[:, l0 : l1 + 1, s0 : s1 + 1].clone()
 
-        new_canvas_rgb[:, l0 : l1 + 1, s0 : s1 + 1] = canvas_rgb[:, l0 : l1 + 1, s0 : s1 + 1] + contrib * rgb[g].view(3, 1, 1)
-        new_canvas_height[:, l0 : l1 + 1, s0 : s1 + 1] = canvas_height[:, l0 : l1 + 1, s0 : s1 + 1] + contrib * height_value[g]
-        new_canvas_alpha[:, l0 : l1 + 1, s0 : s1 + 1] = canvas_alpha[:, l0 : l1 + 1, s0 : s1 + 1] + contrib
-        new_trans[:, l0 : l1 + 1, s0 : s1 + 1] = trans_patch * (1.0 - alpha)
-
-        canvas_rgb = new_canvas_rgb
-        canvas_height = new_canvas_height
-        canvas_alpha = new_canvas_alpha
-        trans = new_trans
+            canvas_rgb[:, l0 : l1 + 1, s0 : s1 + 1] = rgb_patch + contrib * rgb[g].view(3, 1, 1)
+            canvas_height[:, l0 : l1 + 1, s0 : s1 + 1] = h_patch + contrib * height_value[g]
+            canvas_alpha[:, l0 : l1 + 1, s0 : s1 + 1] = a_patch + contrib
+            trans[:, l0 : l1 + 1, s0 : s1 + 1] = trans_patch * (1.0 - alpha)
 
     rendered_height = canvas_height / canvas_alpha.clamp_min(1e-8)
     rendered_height = torch.where(canvas_alpha > 1e-6, rendered_height, torch.zeros_like(rendered_height))
@@ -424,6 +422,7 @@ class RPCGaussianRendererCfg:
 
     chunk_size: int = 512
     alpha_cov_thresh: float = 0.05
+    render_compute_dtype: str = "fp16"
 
     deterministic_target_selection: bool = True
 
@@ -457,6 +456,14 @@ class RPCGaussianRenderer:
         """
         self.geometry_ops = geometry_ops
         self.cfg = cfg or RPCGaussianRendererCfg()
+
+    def _get_render_dtype(self, device: torch.device) -> torch.dtype:
+        mode = str(getattr(self.cfg, "render_compute_dtype", "fp16")).lower()
+        if mode == "bf16":
+            return torch.bfloat16 if device.type == "cuda" else torch.float32
+        if mode == "fp32":
+            return torch.float32
+        return torch.float16 if device.type == "cuda" else torch.float32
 
     def select_target_views(
         self,
@@ -748,13 +755,14 @@ class RPCGaussianRenderer:
         opacity = torch.clamp(pack["opacity"][visible] * pack["confidence"][visible], 0.0, 1.0)
         h_val = c[visible, 2:3]
 
+        rdtype = self._get_render_dtype(c.device)
         rr, ra, rh, stats = rasterize_projected_gaussians(
-            mean_2d=mean_2d.to(torch.float32),
-            cov_2d=cov_2d.to(torch.float32),
-            depth_proxy=depth_proxy.to(torch.float32),
-            rgb=rgb.to(torch.float32),
-            opacity=opacity.to(torch.float32),
-            height_value=h_val.to(torch.float32),
+            mean_2d=mean_2d.to(rdtype),
+            cov_2d=cov_2d.to(rdtype),
+            depth_proxy=depth_proxy.to(rdtype),
+            rgb=rgb.to(rdtype),
+            opacity=opacity.to(rdtype),
+            height_value=h_val.to(rdtype),
             image_h=h_out,
             image_w=w_out,
             nsigma=self.cfg.nsigma,
