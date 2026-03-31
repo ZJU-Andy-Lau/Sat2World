@@ -404,8 +404,10 @@ def main() -> None:
     cfg = load_cfg(args.config)
     dist_state = init_distributed(backend=str(cfg.get("system", {}).get("ddp_backend", "nccl")))
     device: torch.device = dist_state["device"]
+    rank:int  = dist_state["rank"]
     seed_everything(args.seed)
 
+    print(f"[rank:{rank}] start building dataloaders")
     train_loader, _ = build_dataloaders(cfg, distributed=dist_state["distributed"])
     it = iter(train_loader)
 
@@ -437,6 +439,7 @@ def main() -> None:
 
     all_results = []
     for name, a_on, h_on, p_on in phases:
+        print(f"[rank:{rank}] start {name}")
         r_acc: dict[str, torch.Tensor] | None = None
         n_used = 0
         for _ in range(max(int(args.phase_batches), 1)):
