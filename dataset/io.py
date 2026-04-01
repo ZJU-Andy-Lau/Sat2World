@@ -294,7 +294,6 @@ def load_or_scan_dataset_root(root_dir: str | os.PathLike[str], manifest_name: s
         try:
             payload = _read_manifest_payload(root_dir, manifest_name=manifest_name)
             scenes = _manifest_dict_to_scenes(root_dir, payload)
-            _load_log(f"manifest_read_ok(num_scenes={len(scenes)})")
             return scenes
         except Exception:
             _load_log("manifest_read_failed_fallback_scan")
@@ -314,7 +313,6 @@ def load_or_scan_dataset_root(root_dir: str | os.PathLike[str], manifest_name: s
         try:
             payload = _read_manifest_payload(root_dir, manifest_name=manifest_name)
             scenes = _manifest_dict_to_scenes(root_dir, payload)
-            _load_log(f"manifest_read_ok(num_scenes={len(scenes)})", rank=rank)
             obj_list[0] = payload
         except Exception:
             _load_log("manifest_read_failed_fallback_scan", rank=rank)
@@ -330,16 +328,12 @@ def load_or_scan_dataset_root(root_dir: str | os.PathLike[str], manifest_name: s
             pass
         if obj_list[0] is None:
             obj_list[0] = _scenes_to_manifest_dict(root_dir, scenes, version=1)
-        _load_log("manifest_payload_built", rank=rank)
-
-    t_bcast0 = time.perf_counter()
     dist.broadcast_object_list(obj_list, src=0)
     _load_log(f"broadcast_done(elapsed={time.perf_counter() - t_bcast0:.2f}s)", rank=rank)
     payload = obj_list[0]
     if payload is None:
         raise RuntimeError("Distributed manifest broadcast failed: received None payload")
     scenes = _manifest_dict_to_scenes(root_dir, payload)
-    _load_log(f"manifest_payload_decoded(num_scenes={len(scenes)})", rank=rank)
     return scenes
 
 

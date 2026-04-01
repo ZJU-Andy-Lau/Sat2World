@@ -392,6 +392,8 @@ def main() -> None:
             scaler=scaler,
             map_location="cpu",
         )
+        if resume_state is not None:
+            resume_state["resume_path"] = str(resume_path)
         if is_main_process() and monitor is not None:
             monitor.log_text("events/resume", f"resume from {resume_path}", 0)
 

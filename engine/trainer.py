@@ -105,9 +105,26 @@ class Trainer:
         self.skip_steps_in_current_epoch = 0
 
         if resume_state is not None:
-            self.start_epoch = int(resume_state.get("epoch", 0))
+            saved_epoch = int(resume_state.get("epoch", 0))
+            saved_step = int(resume_state.get("step_in_epoch", 0))
+            saved_gstep = int(resume_state.get("global_step", 0))
+            extra_state = resume_state.get("extra_state", {}) or {}
+            if not isinstance(extra_state, dict):
+                extra_state = {}
+            save_reason = str(extra_state.get("save_reason", "")).strip().lower()
+            resume_path = str(resume_state.get("resume_path", "")).strip()
+
+            # 语义修复：
+            # - epoch_end 保存点表示“该 epoch 已完成”，恢复应从下一 epoch 开始；
+            # - 兼容旧 checkpoint（无 save_reason）：若从 last.pt 恢复且 step_in_epoch==0，按 epoch_end 处理。
+            is_epoch_end_ckpt = (saved_step == 0) and (
+                save_reason == "epoch_end"
+                or (save_reason == "" and saved_gstep > 0 and Path(resume_path).name == "last.pt")
+            )
+
+            self.start_epoch = saved_epoch + 1 if is_epoch_end_ckpt else saved_epoch
             self.epoch = self.start_epoch
-            self.skip_steps_in_current_epoch = int(resume_state.get("step_in_epoch", 0))
+            self.skip_steps_in_current_epoch = 0 if is_epoch_end_ckpt else saved_step
             self.global_step = int(resume_state.get("global_step", 0))
             self.best_metric = float(resume_state.get("best_metric", self.best_metric))
 
@@ -345,9 +362,10 @@ class Trainer:
             self.monitor.log_scalars(split, scalar, self.global_step)
         self.model.train()
 
-    def _save_last_checkpoint(self, step_in_epoch: int) -> None:
+    def _save_last_checkpoint(self, step_in_epoch: int, *, save_reason: str | None = None) -> None:
         """保存 last checkpoint。"""
         t0 = time.time()
+        reason = str(save_reason).strip() if save_reason is not None else ("epoch_end" if int(step_in_epoch) == 0 else "in_epoch")
         save_checkpoint(
             self.ckpt_dir / "last.pt",
             model=self.model,
@@ -359,7 +377,7 @@ class Trainer:
             global_step=self.global_step,
             best_metric=self.best_metric,
             cfg=self.cfg,
-            extra_state={},
+            extra_state={"save_reason": reason},
         )
         dt = time.time() - t0
         if is_main_process() and self.monitor is not None:
@@ -508,11 +526,11 @@ class Trainer:
                 self._run_train_epoch()
                 if self.validate_each_epoch:
                     self.validate()
-                self._save_last_checkpoint(step_in_epoch=0)
+                self._save_last_checkpoint(step_in_epoch=0, save_reason="epoch_end")
         except KeyboardInterrupt:
             if is_main_process():
                 print("KeyboardInterrupt: saving emergency checkpoint...")
-            self._save_last_checkpoint(step_in_epoch=self.step_in_epoch)
+            self._save_last_checkpoint(step_in_epoch=self.step_in_epoch, save_reason="emergency")
         finally:
             if is_main_process() and self.monitor is not None:
                 self.monitor.flush()
