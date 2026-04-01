@@ -329,7 +329,6 @@ def load_or_scan_dataset_root(root_dir: str | os.PathLike[str], manifest_name: s
         if obj_list[0] is None:
             obj_list[0] = _scenes_to_manifest_dict(root_dir, scenes, version=1)
     dist.broadcast_object_list(obj_list, src=0)
-    _load_log(f"broadcast_done(elapsed={time.perf_counter() - t_bcast0:.2f}s)", rank=rank)
     payload = obj_list[0]
     if payload is None:
         raise RuntimeError("Distributed manifest broadcast failed: received None payload")

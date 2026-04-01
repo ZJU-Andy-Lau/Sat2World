@@ -499,9 +499,15 @@ class TensorBoardMonitor:
     def flush(self) -> None:
         """强制 flush。"""
         if self.is_enabled and self.writer is not None:
-            self.writer.flush()
+            try:
+                self.writer.flush()
+            except Exception as e:
+                print(f"[WARN] TensorBoard flush failed (likely disk full): {e}")
 
     def close(self) -> None:
         """关闭 writer。"""
         if self.is_enabled and self.writer is not None:
-            self.writer.close()
+            try:
+                self.writer.close()
+            except Exception as e:
+                print(f"[WARN] TensorBoard close failed: {e}")

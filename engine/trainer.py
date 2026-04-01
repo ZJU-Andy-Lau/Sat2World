@@ -366,39 +366,48 @@ class Trainer:
         """保存 last checkpoint。"""
         t0 = time.time()
         reason = str(save_reason).strip() if save_reason is not None else ("epoch_end" if int(step_in_epoch) == 0 else "in_epoch")
-        save_checkpoint(
-            self.ckpt_dir / "last.pt",
-            model=self.model,
-            optimizer=self.optimizer,
-            scheduler=self.scheduler,
-            scaler=self.scaler,
-            epoch=self.epoch,
-            step_in_epoch=step_in_epoch,
-            global_step=self.global_step,
-            best_metric=self.best_metric,
-            cfg=self.cfg,
-            extra_state={"save_reason": reason},
-        )
-        dt = time.time() - t0
-        if is_main_process() and self.monitor is not None:
-            self.monitor.log_scalars("ckpt", {"save_time_sec": dt}, self.global_step)
-            self.monitor.log_text("events/checkpoint", f"saved last checkpoint at step={self.global_step}", self.global_step)
+        try:
+            success = save_checkpoint(
+                self.ckpt_dir / "last.pt",
+                model=self.model,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                scaler=self.scaler,
+                epoch=self.epoch,
+                step_in_epoch=step_in_epoch,
+                global_step=self.global_step,
+                best_metric=self.best_metric,
+                cfg=self.cfg,
+                extra_state={"save_reason": reason},
+                min_disk_gb=float(self.cfg.get("min_disk_gb", 2.0)),
+            )
+            if success:
+                dt = time.time() - t0
+                if is_main_process() and self.monitor is not None:
+                    self.monitor.log_scalars("ckpt", {"save_time_sec": dt}, self.global_step)
+                    self.monitor.log_text("events/checkpoint", f"saved last checkpoint at step={self.global_step}", self.global_step)
+        except Exception as e:
+            print(f"[ERROR] Trainer failed to save last checkpoint: {e}")
 
     def _save_best_checkpoint(self) -> None:
         """保存 best checkpoint。"""
-        save_checkpoint(
-            self.ckpt_dir / "best.pt",
-            model=self.model,
-            optimizer=self.optimizer,
-            scheduler=self.scheduler,
-            scaler=self.scaler,
-            epoch=self.epoch,
-            step_in_epoch=0,
-            global_step=self.global_step,
-            best_metric=self.best_metric,
-            cfg=self.cfg,
-            extra_state={},
-        )
+        try:
+            save_checkpoint(
+                self.ckpt_dir / "best.pt",
+                model=self.model,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                scaler=self.scaler,
+                epoch=self.epoch,
+                step_in_epoch=self.step_in_epoch,
+                global_step=self.global_step,
+                best_metric=self.best_metric,
+                cfg=self.cfg,
+                extra_state={"is_best": True},
+                min_disk_gb=float(self.cfg.get("min_disk_gb", 2.0)),
+            )
+        except Exception as e:
+            print(f"[ERROR] Trainer failed to save best checkpoint: {e}")
 
     def _run_train_epoch(self) -> None:
         """执行一个训练 epoch。"""

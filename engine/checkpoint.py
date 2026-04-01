@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from engine.distributed import is_main_process, unwrap_model
+from engine.utils import has_sufficient_disk_space
 
 
 def capture_rng_state() -> dict[str, Any]:
@@ -105,12 +106,27 @@ def save_checkpoint(
     best_metric: float,
     cfg: dict[str, Any],
     extra_state: dict[str, Any] | None = None,
-) -> None:
-    """保存 checkpoint（主进程执行，临时文件+原子替换）。"""
+    min_disk_gb: float = 2.0,
+) -> bool:
+    """保存 checkpoint（主进程执行，临时文件+原子替换）。
+
+    返回:
+        success: 是否保存成功（空间不足或 IO 失败返回 False）。
+    """
     if not is_main_process():
-        return
+        return True
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 预检磁盘空间，避免写入中途由于磁盘满载导致崩溃
+    if not has_sufficient_disk_space(path.parent, min_gb=min_disk_gb):
+        print(f"[WARN] Disk space critically low (<{min_disk_gb}GB). Skipping checkpoint: {path.name}")
+        return False
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"[ERROR] Failed to create directory {path.parent}: {e}")
+        return False
 
     payload = {
         "model": unwrap_model(model).state_dict(),
@@ -131,8 +147,10 @@ def save_checkpoint(
     try:
         torch.save(payload, tmp_path)
         os.replace(tmp_path, path)
+        return True
     except Exception as e:
-        raise RuntimeError(f"Failed to save checkpoint to {path}: {e}") from e
+        print(f"[ERROR] Failed to save checkpoint to {path}: {e}")
+        return False
     finally:
         if tmp_path.exists():
             _safe_unlink(tmp_path)
