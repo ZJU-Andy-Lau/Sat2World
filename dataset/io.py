@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Optional, Sequence
@@ -93,6 +94,18 @@ def scan_dataset_root(root_dir: str | os.PathLike[str]) -> list[SceneRecord]:
     返回:
         scenes: SceneRecord 列表，按 scene_id 升序；每个场景内 views 按 view_id 升序。
     """
+    scan_t0 = time.perf_counter()
+    scan_t_last = scan_t0
+
+    def _scan_log(stage: str) -> None:
+        nonlocal scan_t_last
+        now = time.perf_counter()
+        print(
+            f"[startup][scan_dataset_root] root={root_dir} {stage} | step={now - scan_t_last:.2f}s total={now - scan_t0:.2f}s",
+            flush=True,
+        )
+        scan_t_last = now
+
     root = Path(root_dir)
     if not root.exists() or not root.is_dir():
         raise FileNotFoundError(f"Dataset root not found or not a directory: {root}")
@@ -107,10 +120,14 @@ def scan_dataset_root(root_dir: str | os.PathLike[str]) -> list[SceneRecord]:
             scene_dirs.append((sid, p))
 
     scene_dirs.sort(key=lambda x: x[0])
+    _scan_log(f"scene_dirs_enumerated(num_scene_dirs={len(scene_dirs)})")
     if len(scene_dirs) == 0:
         raise RuntimeError(f"No scene_* directories found under: {root}")
 
+    shape_probe_total = 0.0
+    shape_probe_count = 0
     for scene_id, scene_dir in scene_dirs:
+        scene_t0 = time.perf_counter()
         view_dirs: list[tuple[int, Path]] = []
         for p in scene_dir.iterdir():
             if not p.is_dir():
@@ -132,7 +149,10 @@ def scan_dataset_root(root_dir: str | os.PathLike[str]) -> list[SceneRecord]:
             image_path = _select_unique_file(view_dir, image_pat, "image tif")
             height_path = _select_unique_file(view_dir, height_pat, "height tif")
             rpc_path = _select_unique_file(view_dir, rpc_pat, "rpc txt")
+            t_shape0 = time.perf_counter()
             full_hw = inspect_raster_shape(str(image_path))[:2]
+            shape_probe_total += (time.perf_counter() - t_shape0)
+            shape_probe_count += 1
 
             views.append(
                 ViewRecord(
@@ -146,6 +166,14 @@ def scan_dataset_root(root_dir: str | os.PathLike[str]) -> list[SceneRecord]:
             )
 
         scenes.append(SceneRecord(scene_id=scene_id, views=views))
+        _scan_log(
+            f"scene_scanned(scene_id={scene_id}, num_views={len(views)}, elapsed={time.perf_counter() - scene_t0:.2f}s)"
+        )
+
+    _scan_log(
+        f"scan_done(num_scenes={len(scenes)}, shape_probe_count={shape_probe_count}, "
+        f"shape_probe_total={shape_probe_total:.2f}s)"
+    )
 
     return scenes
 
@@ -155,28 +183,32 @@ def _manifest_path(root_dir: str | os.PathLike[str], manifest_name: str = "manif
 
 
 def _scenes_to_manifest_dict(root_dir: str | os.PathLike[str], scenes: Sequence[SceneRecord], version: int = 1) -> dict:
-    root = Path(root_dir).resolve()
+    root = Path(root_dir).absolute()
+    root_str = str(root)
     out_scenes = []
     for s in scenes:
         out_views = []
         for v in s.views:
-            img_rel = str(Path(v.image_path).resolve().relative_to(root))
-            hgt_rel = str(Path(v.height_path).resolve().relative_to(root))
-            rpc_rel = str(Path(v.rpc_path).resolve().relative_to(root))
+            img_abs = str(Path(v.image_path).absolute())
+            hgt_abs = str(Path(v.height_path).absolute())
+            rpc_abs = str(Path(v.rpc_path).absolute())
+            img_rel = os.path.relpath(img_abs, root_str)
+            hgt_rel = os.path.relpath(hgt_abs, root_str)
+            rpc_rel = os.path.relpath(rpc_abs, root_str)
             out_views.append(
                 {
                     "scene_id": int(v.scene_id),
                     "view_id": int(v.view_id),
-                    "image_path": img_rel,
-                    "height_path": hgt_rel,
-                    "rpc_path": rpc_rel,
+                    "image_path": img_rel.replace("\\", "/"),
+                    "height_path": hgt_rel.replace("\\", "/"),
+                    "rpc_path": rpc_rel.replace("\\", "/"),
                     "full_hw": [int(v.full_hw[0]), int(v.full_hw[1])],
                 }
             )
         out_scenes.append({"scene_id": int(s.scene_id), "views": out_views})
     return {
         "manifest_version": int(version),
-        "root": str(root),
+        "root": root_str,
         "scenes": out_scenes,
     }
 
@@ -184,7 +216,7 @@ def _scenes_to_manifest_dict(root_dir: str | os.PathLike[str], scenes: Sequence[
 def _manifest_dict_to_scenes(root_dir: str | os.PathLike[str], obj: dict) -> list[SceneRecord]:
     if int(obj.get("manifest_version", -1)) != 1:
         raise ValueError(f"Unsupported manifest_version={obj.get('manifest_version')}")
-    root = Path(root_dir).resolve()
+    root = Path(root_dir).absolute()
     scene_objs = obj.get("scenes", None)
     if not isinstance(scene_objs, list):
         raise ValueError("Manifest 'scenes' must be a list")
@@ -200,9 +232,9 @@ def _manifest_dict_to_scenes(root_dir: str | os.PathLike[str], obj: dict) -> lis
             full_hw = v.get("full_hw", None)
             if not isinstance(full_hw, (list, tuple)) or len(full_hw) != 2:
                 raise ValueError(f"Invalid full_hw for scene={sid}, view={v.get('view_id')}")
-            image_path = str((root / str(v["image_path"])).resolve())
-            height_path = str((root / str(v["height_path"])).resolve())
-            rpc_path = str((root / str(v["rpc_path"])).resolve())
+            image_path = os.path.normpath(str(root / str(v["image_path"])))
+            height_path = os.path.normpath(str(root / str(v["height_path"])))
+            rpc_path = os.path.normpath(str(root / str(v["rpc_path"])))
             views.append(
                 ViewRecord(
                     scene_id=int(v["scene_id"]),
@@ -226,6 +258,12 @@ def _read_manifest(root_dir: str | os.PathLike[str], manifest_name: str = "manif
     return _manifest_dict_to_scenes(root_dir, obj)
 
 
+def _read_manifest_payload(root_dir: str | os.PathLike[str], manifest_name: str = "manifest.json") -> dict:
+    p = _manifest_path(root_dir, manifest_name=manifest_name)
+    with p.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _write_manifest(root_dir: str | os.PathLike[str], scenes: Sequence[SceneRecord], manifest_name: str = "manifest.json") -> None:
     p = _manifest_path(root_dir, manifest_name=manifest_name)
     tmp = p.with_suffix(p.suffix + ".tmp")
@@ -237,15 +275,36 @@ def _write_manifest(root_dir: str | os.PathLike[str], scenes: Sequence[SceneReco
 
 def load_or_scan_dataset_root(root_dir: str | os.PathLike[str], manifest_name: str = "manifest.json") -> list[SceneRecord]:
     """优先读 manifest；若缺失/损坏则扫描；分布式下仅 rank0 读写并广播结果。"""
+    load_t0 = time.perf_counter()
+    load_t_last = load_t0
+
+    def _load_log(stage: str, rank: int = 0) -> None:
+        nonlocal load_t_last
+        if rank != 0:
+            return
+        now = time.perf_counter()
+        print(
+            f"[startup][load_or_scan_dataset_root] root={root_dir} {stage} | step={now - load_t_last:.2f}s total={now - load_t0:.2f}s",
+            flush=True,
+        )
+        load_t_last = now
+
     is_dist = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
     if not is_dist:
         try:
-            return _read_manifest(root_dir, manifest_name=manifest_name)
+            payload = _read_manifest_payload(root_dir, manifest_name=manifest_name)
+            scenes = _manifest_dict_to_scenes(root_dir, payload)
+            _load_log(f"manifest_read_ok(num_scenes={len(scenes)})")
+            return scenes
         except Exception:
+            _load_log("manifest_read_failed_fallback_scan")
             scenes = scan_dataset_root(root_dir)
+            _load_log(f"scan_finished(num_scenes={len(scenes)})")
             try:
                 _write_manifest(root_dir, scenes, manifest_name=manifest_name)
+                _load_log("manifest_written")
             except Exception:
+                _load_log("manifest_write_failed")
                 pass
             return scenes
 
@@ -253,20 +312,35 @@ def load_or_scan_dataset_root(root_dir: str | os.PathLike[str], manifest_name: s
     obj_list: list[dict | None] = [None]
     if rank == 0:
         try:
-            scenes = _read_manifest(root_dir, manifest_name=manifest_name)
+            payload = _read_manifest_payload(root_dir, manifest_name=manifest_name)
+            scenes = _manifest_dict_to_scenes(root_dir, payload)
+            _load_log(f"manifest_read_ok(num_scenes={len(scenes)})", rank=rank)
+            obj_list[0] = payload
         except Exception:
+            _load_log("manifest_read_failed_fallback_scan", rank=rank)
             scenes = scan_dataset_root(root_dir)
+            _load_log(f"scan_finished(num_scenes={len(scenes)})", rank=rank)
             try:
                 _write_manifest(root_dir, scenes, manifest_name=manifest_name)
+                _load_log("manifest_written", rank=rank)
             except Exception:
+                _load_log("manifest_write_failed", rank=rank)
                 pass
-        obj_list[0] = _scenes_to_manifest_dict(root_dir, scenes, version=1)
+            # 写失败也不影响：直接使用内存 payload 继续广播。
+            pass
+        if obj_list[0] is None:
+            obj_list[0] = _scenes_to_manifest_dict(root_dir, scenes, version=1)
+        _load_log("manifest_payload_built", rank=rank)
 
+    t_bcast0 = time.perf_counter()
     dist.broadcast_object_list(obj_list, src=0)
+    _load_log(f"broadcast_done(elapsed={time.perf_counter() - t_bcast0:.2f}s)", rank=rank)
     payload = obj_list[0]
     if payload is None:
         raise RuntimeError("Distributed manifest broadcast failed: received None payload")
-    return _manifest_dict_to_scenes(root_dir, payload)
+    scenes = _manifest_dict_to_scenes(root_dir, payload)
+    _load_log(f"manifest_payload_decoded(num_scenes={len(scenes)})", rank=rank)
+    return scenes
 
 
 def _read_tif_with_rasterio(path: str) -> tuple[np.ndarray, Optional[float]]:
