@@ -192,12 +192,26 @@ def build_dataloaders(cfg: dict[str, Any], distributed: bool):
 
     data_cfg = cfg.get("data", {})
     loader_cfg = data_cfg.get("loader", {})
+    t0 = time.perf_counter()
+    t_last = t0
+
+    def _log(stage: str) -> None:
+        nonlocal t_last
+        now = time.perf_counter()
+        print(
+            f"[startup][dataloader] {stage} | step={now - t_last:.2f}s total={now - t0:.2f}s",
+            flush=True,
+        )
+        t_last = now
 
     train_dataset = build_dataset(mode="train", **data_cfg.get("train", {}))
+    _log("train_dataset_built")
     val_dataset = build_dataset(mode="val", **data_cfg.get("val", {}))
+    _log("val_dataset_built")
 
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if distributed else None
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if distributed else None
+    _log("samplers_built")
 
     num_workers = int(loader_cfg.get("num_workers", 4))
     pin_memory = bool(loader_cfg.get("pin_memory", True))
@@ -220,6 +234,7 @@ def build_dataloaders(cfg: dict[str, Any], distributed: bool):
         prefetch_factor=prefetch_factor,
         collate_fn=rpc_scene_collate_fn,
     )
+    _log("train_loader_constructed")
     val_loader = DataLoader(
         val_dataset,
         batch_size=int(loader_cfg.get("val_batch_size", 1)),
@@ -232,6 +247,7 @@ def build_dataloaders(cfg: dict[str, Any], distributed: bool):
         prefetch_factor=prefetch_factor,
         collate_fn=rpc_scene_collate_fn,
     )
+    _log("val_loader_constructed")
     return train_loader, val_loader
 
 

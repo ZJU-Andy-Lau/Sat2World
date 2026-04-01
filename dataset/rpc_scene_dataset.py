@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import copy
+import time
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 
 import torch
@@ -117,9 +118,26 @@ class RPCSceneDataset(Dataset):
         if self.crop_size <= 0:
             raise ValueError("crop_size must be > 0")
         self.anchors_per_view_per_sample = int(anchors_per_view_per_sample)
+        init_t0 = time.perf_counter()
+        init_t_last = init_t0
+
+        def _init_log(stage: str) -> None:
+            nonlocal init_t_last
+            rank = 0
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            if rank == 0:
+                now = time.perf_counter()
+                print(
+                    f"[startup][dataset:{self.mode}] {stage} | step={now - init_t_last:.2f}s total={now - init_t0:.2f}s",
+                    flush=True,
+                )
+                init_t_last = now
 
         all_scenes = load_or_scan_dataset_root(root)
+        _init_log("load_or_scan_dataset_root_done")
         scenes = [s for s in all_scenes if len(s.views) >= self.min_views]
+        _init_log("filter_min_views_done")
         if len(scenes) == 0:
             raise RuntimeError(
                 f"No valid scenes after filtering min_views={self.min_views}. "
@@ -127,6 +145,7 @@ class RPCSceneDataset(Dataset):
             )
 
         self.scenes = sorted(scenes, key=lambda s: s.scene_id)
+        _init_log(f"scene_sort_done(num_scenes={len(self.scenes)})")
 
         if self.mode == "train":
             if self.max_view_num is None:
