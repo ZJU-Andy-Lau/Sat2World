@@ -155,28 +155,32 @@ def _manifest_path(root_dir: str | os.PathLike[str], manifest_name: str = "manif
 
 
 def _scenes_to_manifest_dict(root_dir: str | os.PathLike[str], scenes: Sequence[SceneRecord], version: int = 1) -> dict:
-    root = Path(root_dir).resolve()
+    root = Path(root_dir).absolute()
+    root_str = str(root)
     out_scenes = []
     for s in scenes:
         out_views = []
         for v in s.views:
-            img_rel = str(Path(v.image_path).resolve().relative_to(root))
-            hgt_rel = str(Path(v.height_path).resolve().relative_to(root))
-            rpc_rel = str(Path(v.rpc_path).resolve().relative_to(root))
+            img_abs = str(Path(v.image_path).absolute())
+            hgt_abs = str(Path(v.height_path).absolute())
+            rpc_abs = str(Path(v.rpc_path).absolute())
+            img_rel = os.path.relpath(img_abs, root_str)
+            hgt_rel = os.path.relpath(hgt_abs, root_str)
+            rpc_rel = os.path.relpath(rpc_abs, root_str)
             out_views.append(
                 {
                     "scene_id": int(v.scene_id),
                     "view_id": int(v.view_id),
-                    "image_path": img_rel,
-                    "height_path": hgt_rel,
-                    "rpc_path": rpc_rel,
+                    "image_path": img_rel.replace("\\", "/"),
+                    "height_path": hgt_rel.replace("\\", "/"),
+                    "rpc_path": rpc_rel.replace("\\", "/"),
                     "full_hw": [int(v.full_hw[0]), int(v.full_hw[1])],
                 }
             )
         out_scenes.append({"scene_id": int(s.scene_id), "views": out_views})
     return {
         "manifest_version": int(version),
-        "root": str(root),
+        "root": root_str,
         "scenes": out_scenes,
     }
 
@@ -184,7 +188,7 @@ def _scenes_to_manifest_dict(root_dir: str | os.PathLike[str], scenes: Sequence[
 def _manifest_dict_to_scenes(root_dir: str | os.PathLike[str], obj: dict) -> list[SceneRecord]:
     if int(obj.get("manifest_version", -1)) != 1:
         raise ValueError(f"Unsupported manifest_version={obj.get('manifest_version')}")
-    root = Path(root_dir).resolve()
+    root = Path(root_dir).absolute()
     scene_objs = obj.get("scenes", None)
     if not isinstance(scene_objs, list):
         raise ValueError("Manifest 'scenes' must be a list")
@@ -200,9 +204,9 @@ def _manifest_dict_to_scenes(root_dir: str | os.PathLike[str], obj: dict) -> lis
             full_hw = v.get("full_hw", None)
             if not isinstance(full_hw, (list, tuple)) or len(full_hw) != 2:
                 raise ValueError(f"Invalid full_hw for scene={sid}, view={v.get('view_id')}")
-            image_path = str((root / str(v["image_path"])).resolve())
-            height_path = str((root / str(v["height_path"])).resolve())
-            rpc_path = str((root / str(v["rpc_path"])).resolve())
+            image_path = os.path.normpath(str(root / str(v["image_path"])))
+            height_path = os.path.normpath(str(root / str(v["height_path"])))
+            rpc_path = os.path.normpath(str(root / str(v["rpc_path"])))
             views.append(
                 ViewRecord(
                     scene_id=int(v["scene_id"]),
@@ -226,6 +230,12 @@ def _read_manifest(root_dir: str | os.PathLike[str], manifest_name: str = "manif
     return _manifest_dict_to_scenes(root_dir, obj)
 
 
+def _read_manifest_payload(root_dir: str | os.PathLike[str], manifest_name: str = "manifest.json") -> dict:
+    p = _manifest_path(root_dir, manifest_name=manifest_name)
+    with p.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _write_manifest(root_dir: str | os.PathLike[str], scenes: Sequence[SceneRecord], manifest_name: str = "manifest.json") -> None:
     p = _manifest_path(root_dir, manifest_name=manifest_name)
     tmp = p.with_suffix(p.suffix + ".tmp")
@@ -240,7 +250,9 @@ def load_or_scan_dataset_root(root_dir: str | os.PathLike[str], manifest_name: s
     is_dist = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
     if not is_dist:
         try:
-            return _read_manifest(root_dir, manifest_name=manifest_name)
+            payload = _read_manifest_payload(root_dir, manifest_name=manifest_name)
+            scenes = _manifest_dict_to_scenes(root_dir, payload)
+            return scenes
         except Exception:
             scenes = scan_dataset_root(root_dir)
             try:
@@ -253,20 +265,25 @@ def load_or_scan_dataset_root(root_dir: str | os.PathLike[str], manifest_name: s
     obj_list: list[dict | None] = [None]
     if rank == 0:
         try:
-            scenes = _read_manifest(root_dir, manifest_name=manifest_name)
+            payload = _read_manifest_payload(root_dir, manifest_name=manifest_name)
+            scenes = _manifest_dict_to_scenes(root_dir, payload)
+            obj_list[0] = payload
         except Exception:
             scenes = scan_dataset_root(root_dir)
             try:
                 _write_manifest(root_dir, scenes, manifest_name=manifest_name)
             except Exception:
                 pass
-        obj_list[0] = _scenes_to_manifest_dict(root_dir, scenes, version=1)
-
+            # 写失败也不影响：直接使用内存 payload 继续广播。
+            pass
+        if obj_list[0] is None:
+            obj_list[0] = _scenes_to_manifest_dict(root_dir, scenes, version=1)
     dist.broadcast_object_list(obj_list, src=0)
     payload = obj_list[0]
     if payload is None:
         raise RuntimeError("Distributed manifest broadcast failed: received None payload")
-    return _manifest_dict_to_scenes(root_dir, payload)
+    scenes = _manifest_dict_to_scenes(root_dir, payload)
+    return scenes
 
 
 def _read_tif_with_rasterio(path: str) -> tuple[np.ndarray, Optional[float]]:

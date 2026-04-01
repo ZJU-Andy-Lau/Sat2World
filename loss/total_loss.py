@@ -95,7 +95,8 @@ class LossWeightScheduler:
         st1 = int(self.stage1_steps)
         st2 = int(self.stage2_steps)
         if global_step < st1:
-            w["lambda_point"] = 0.0
+            # Stage-1 现在保留 point 分支监督（用户要求：第一阶段加入 point_map_loss）。
+            # 其余较“后期”的项仍保持关闭，以避免渲染与高斯正则过早干扰几何主线。
             w["lambda_center"] = 0.0
             w["lambda_opacity_reg"] = 0.0
             w["lambda_scale_reg"] = 0.0
