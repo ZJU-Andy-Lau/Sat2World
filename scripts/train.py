@@ -13,6 +13,7 @@ import argparse
 import math
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 import torch
@@ -269,6 +270,22 @@ def main() -> None:
 
     args = parse_args()
     cfg = apply_cli_overrides(load_cfg(args.config), args)
+    startup_t0 = time.perf_counter()
+    startup_last = startup_t0
+
+    def _startup_log(stage: str, rank: int | None = None) -> None:
+        nonlocal startup_last
+        now = time.perf_counter()
+        step_sec = now - startup_last
+        total_sec = now - startup_t0
+        rank_str = "?" if rank is None else str(rank)
+        print(
+            f"[startup][rank={rank_str}] {stage} | step={step_sec:.2f}s total={total_sec:.2f}s",
+            flush=True,
+        )
+        startup_last = now
+
+    _startup_log("config_loaded")
 
     system_cfg = cfg.get("system", {})
     work_dir = Path(system_cfg.get("work_dir", "work_dirs/default"))
@@ -276,9 +293,11 @@ def main() -> None:
     checkpoint_cfg = cfg.get("checkpoint", {})
     checkpoints_dir = Path(checkpoint_cfg.get("checkpoints_dir", str(work_dir / "checkpoints")))
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    _startup_log("workdir_and_checkpoint_dirs_ready")
 
     dist_state = init_distributed(backend=str(system_cfg.get("ddp_backend", "nccl")))
     device = dist_state["device"]
+    _startup_log("distributed_initialized", rank=int(dist_state["rank"]))
 
     seed_everything(int(system_cfg.get("seed", 42)))
     configure_cuda_runtime(
@@ -287,17 +306,24 @@ def main() -> None:
             "allow_tf32": bool(system_cfg.get("allow_tf32", True)),
         }
     )
+    _startup_log("seed_and_cuda_runtime_configured", rank=int(dist_state["rank"]))
 
     train_loader, val_loader = build_dataloaders(cfg, distributed=dist_state["distributed"])
+    _startup_log("dataloaders_built", rank=int(dist_state["rank"]))
 
     model = build_model(cfg).to(device)
+    _startup_log("model_built_and_to_device", rank=int(dist_state["rank"]))
     renderer = build_renderer(cfg, model.rpc_ops)
+    _startup_log("renderer_built", rank=int(dist_state["rank"]))
     objective = build_objective(cfg, model.rpc_ops)
+    _startup_log("objective_built", rank=int(dist_state["rank"]))
     optimizer, scheduler = build_optimizer_and_scheduler(cfg, model)
+    _startup_log("optimizer_and_scheduler_built", rank=int(dist_state["rank"]))
 
     amp_dtype = str(cfg.get("train", {}).get("amp_dtype", "fp16"))
     use_scaler = bool(cfg.get("train", {}).get("enable_grad_scaler", True)) and amp_dtype == "fp16" and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    _startup_log("grad_scaler_ready", rank=int(dist_state["rank"]))
 
     model = wrap_ddp(model, device)
 
