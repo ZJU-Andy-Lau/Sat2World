@@ -383,6 +383,8 @@ def main() -> None:
     resume_path = str(system_cfg.get("resume_path", ""))
     checkpoint_path = str(system_cfg.get("checkpoint_path", ""))
     auto_resume = bool(system_cfg.get("auto_resume", True))
+    checkpoint_load_model_only = bool(system_cfg.get("checkpoint_load_model_only", False))
+    checkpoint_model_strict = bool(system_cfg.get("checkpoint_model_strict", False))
 
     if checkpoint_path:
         resume_path = checkpoint_path
@@ -405,12 +407,17 @@ def main() -> None:
         resume_state = resume_from_checkpoint(
             resume_path,
             model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
+            optimizer=None if checkpoint_load_model_only else optimizer,
+            scheduler=None if checkpoint_load_model_only else scheduler,
+            scaler=None if checkpoint_load_model_only else scaler,
             map_location="cpu",
+            model_strict=checkpoint_model_strict,
+            load_model_only=checkpoint_load_model_only,
+            restore_rng=(not checkpoint_load_model_only),
         )
-        if resume_state is not None:
+        if checkpoint_load_model_only:
+            resume_state = None
+        elif resume_state is not None:
             resume_state["resume_path"] = str(resume_path)
         if is_main_process() and monitor is not None:
             monitor.log_text("events/resume", f"resume from {resume_path}", 0)

@@ -163,6 +163,9 @@ def main() -> None:
         scheduler=None,
         scaler=None,
         map_location="cpu",
+        model_strict=bool(cfg.get("system", {}).get("checkpoint_model_strict", False)),
+        load_model_only=True,
+        restore_rng=False,
     )
 
     trainer_cfg = dict(cfg.get("train", {}))
