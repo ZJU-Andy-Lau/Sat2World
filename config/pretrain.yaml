@@ -1,0 +1,177 @@
+system:
+  project_name: Sat2World
+  experiment_name: geom_pretrain
+  work_dir: work_dirs/sat2world_geom_pretrain
+  output_dir: work_dirs/sat2world_geom_pretrain
+  seed: 42
+  deterministic: false
+  cudnn_benchmark: true
+  allow_tf32: true
+  device: cuda
+  compile_model: false
+  ddp_backend: nccl
+  auto_resume: true
+  resume_path: ""
+  checkpoint_path: ""
+  eval_only: false
+
+data:
+  train:
+    root: train_data
+    max_view_num: 4
+    min_view_num: 2
+    samples_per_scene: 10
+    min_views: 2
+    apply_perturbation: true
+    synthetic_perturbation_in_eval: false
+    cache_rpc: true
+    cache_image: false
+    cache_height: false
+    base_seed: 12345
+    reference_policy: first
+    strict_same_hw: true
+    crop_size: 512
+    anchors_per_view_per_sample: 128
+    perturb_cfg:
+      tx_range: [-2.0, 2.0]
+      ty_range: [-2.0, 2.0]
+      scale_range: [-0.0005, 0.0005]
+      shear_range: [-0.0005, 0.0005]
+  val:
+    root: test_data
+    max_view_num: 4
+    min_view_num: 2
+    samples_per_scene: 1
+    min_views: 2
+    apply_perturbation: false
+    synthetic_perturbation_in_eval: false
+    cache_rpc: true
+    cache_image: false
+    cache_height: false
+    base_seed: 22345
+    reference_policy: first
+    strict_same_hw: true
+    crop_size: 512
+    anchors_per_view_per_sample: 128
+    perturb_cfg:
+      tx_range: [-2.0, 2.0]
+      ty_range: [-2.0, 2.0]
+      scale_range: [-0.0005, 0.0005]
+      shear_range: [-0.0005, 0.0005]
+  test:
+    root: test_data
+    crop_size: 512
+  loader:
+    batch_size: 1
+    val_batch_size: 1
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: false
+    prefetch_factor: 2
+    drop_last: true
+
+geometry:
+  rpc_dtype: float64
+  net_dtype: float32
+
+model:
+  dino_weight_path: "path/to/dinov3_vitl16_pretrain.pth"
+  pretrained: true
+  freeze_backbone: true
+  patch_size: 16
+  embed_dim: 1024
+  geometry_token_dim: 256
+  fusion_dim: 1024
+  encoder_depth: 4
+  encoder_num_heads: 8
+  encoder_ffn_ratio: 4.0
+  encoder_dropout: 0.0
+  affine_diag_scale: 0.05
+  affine_offdiag_scale: 0.05
+  affine_trans_scale: 4.0
+  height_bins: 33
+  height_bin_size: 1.0
+  height_fine_range: 0.5
+  point_bins: 33
+  point_bin_size_xy: 2.0
+  point_bin_size_z: 1.0
+  point_fine_range_xy: 1.0
+  point_fine_range_z: 0.5
+  center_downsample_stage_steps: [0, 20000, 60000]
+  center_downsample_factors: [4, 2, 1]
+  sh_dim: 48
+  gaussian_scale_epsilon: 1.0e-4
+  output_raw_logits: true
+
+loss:
+  lambda_affine_grid: 1.0
+  lambda_affine_pair: 1.0
+  lambda_affine_reg: 0.1
+  lambda_affine_ref: 0.1
+  lambda_height: 1.0
+  lambda_point: 1.0
+  height_beta: 1.0
+  point_beta: 1.0
+  affine_grid_h: 16
+  affine_grid_w: 16
+  anchors_per_pair: 256
+  max_pairs: 12
+  sample_from_valid_only: true
+
+optim:
+  type: adamw
+  base_lr: 1.0e-4
+  backbone_lr_mult: 0.5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  scheduler: warmup_cosine
+  warmup_steps: 1000
+  max_steps: 100000
+  min_lr_ratio: 0.05
+
+train:
+  max_epochs: 50
+  accumulate_steps: 1
+  grad_clip_norm: 1.0
+  amp_dtype: fp16
+  enable_grad_scaler: true
+  enable_render_train: false
+  enable_render_val: false
+  skip_nan_batch: true
+  log_interval: 20
+  hist_interval: 200
+  vis_interval: 500
+  val_interval: 1000
+  ckpt_interval: 1000
+  save_every_epoch: true
+  validate_first: false
+  validate_each_epoch: true
+  best_metric: loss_total
+  best_mode: min
+  max_train_steps_per_epoch: -1
+  max_val_steps: -1
+  device_sanity_check: false
+  enable_fixed_monitor_cache: true
+
+logging:
+  tensorboard:
+    enable: true
+    log_dir: work_dirs/sat2world_geom_pretrain/tb
+    enable_mesh: true
+    image_max_views: 4
+    max_pointcloud_points: 8192
+    flush_secs: 30
+    fixed_monitor_samples: 1
+    record_histograms: true
+    record_pointcloud: true
+
+checkpoint:
+  checkpoints_dir: work_dirs/sat2world_geom_pretrain/checkpoints
+  save_last: true
+  save_best: true
+  best_metric_name: loss_total
+  best_metric_mode: min
+  keep_last_n: 5
+  save_optimizer_state: true
+  save_scheduler_state: true
