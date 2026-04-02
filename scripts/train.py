@@ -89,6 +89,7 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
         scfg.center_downsample_stage_steps = tuple(int(x) for x in m.get("center_downsample_stage_steps", scfg.center_downsample_stage_steps))
     if "center_downsample_factors" in m:
         scfg.center_downsample_factors = tuple(int(x) for x in m.get("center_downsample_factors", scfg.center_downsample_factors))
+    scfg.enable_gaussian_branch = bool(m.get("enable_gaussian_branch", scfg.enable_gaussian_branch))
     return Sat2World(scfg)
 
 

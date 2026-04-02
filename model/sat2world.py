@@ -65,6 +65,8 @@ class Sat2WorldCfg:
     center_downsample_stage_steps: tuple[int, ...] = (0, 20000, 60000)
     center_downsample_factors: tuple[int, ...] = (4, 2, 1)
 
+    enable_gaussian_branch: bool = True
+
 
 class Sat2World(nn.Module):
     """Sat2World 主模型。
@@ -116,10 +118,24 @@ class Sat2World(nn.Module):
         self.rpc_ops = RPCGeometryOps(rpc_dtype=torch.double, net_dtype=torch.float32)
         self.runtime_global_step: int = 0
         self.runtime_mode: str = "train"
+        self.runtime_pretrain_geometry_only: bool = False
 
     def set_runtime_context(self, *, global_step: int, mode: str) -> None:
         self.runtime_global_step = int(global_step)
         self.runtime_mode = str(mode)
+
+    def set_pretrain_geometry_only(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        self.runtime_pretrain_geometry_only = enabled
+
+        # 预训练几何模式下冻结高斯头参数，避免 DDP(find_unused_parameters=False)
+        # 因分支跳过而触发“unused parameters”归约错误。
+        if enabled:
+            self.gaussian_head.requires_grad_(False)
+        else:
+            # 仅在配置允许高斯分支时恢复可训练。
+            if bool(self.cfg.enable_gaussian_branch):
+                self.gaussian_head.requires_grad_(True)
 
     def _current_center_downsample(self) -> int:
         steps = tuple(int(x) for x in self.cfg.center_downsample_stage_steps)
@@ -264,27 +280,9 @@ class Sat2World(nn.Module):
         )
         point_abs = point_decoded["point_abs"]
 
-        # 9) 高斯属性分支
-        gauss_pred = self.gaussian_head(dense_feat)
-        gaussian_opacity = self._reshape_logits_to_bv(gauss_pred["opacity"], b, v)
-        gaussian_scale = self._reshape_logits_to_bv(gauss_pred["scale"], b, v)
-        gaussian_rotation = self._reshape_logits_to_bv(gauss_pred["rotation"], b, v)
-        gaussian_sh = self._reshape_logits_to_bv(gauss_pred["sh"], b, v)
-        gaussian_conf_rpc = self._reshape_logits_to_bv(gauss_pred["confidence_rpc"], b, v)
-        gaussian_conf_point = self._reshape_logits_to_bv(gauss_pred["confidence_point"], b, v)
+        gaussian_enabled = bool(self.cfg.enable_gaussian_branch) and (not self.runtime_pretrain_geometry_only)
 
-        # 10) 双路径中心
-        centers_rpc = self.rpc_ops.centers_from_rpc_and_height_batch(
-            corrected_rpc_batch=rpc_corrected,
-            pixel_grid=image_grid,
-            height_abs=height_abs,
-            scene_xy_center=scene_xy_center,
-            scene_xy_scale=scene_xy_scale,
-            downsample_factor=self._current_center_downsample(),
-        )
-        centers_point = point_abs
-
-        return {
+        out = {
             "affine_pred": affine_pred,
             "rpc_corrected": rpc_corrected,
             "height_ref": height_ref,
@@ -299,16 +297,44 @@ class Sat2World(nn.Module):
             "point_delta_fine": point_decoded["delta_xyz_fine"],
             "point_logits": {"x": x_logits, "y": y_logits, "z": z_logits},
             "point_fine_raw": {"x": x_fine, "y": y_fine, "z": z_fine},
-            "gaussian_opacity": gaussian_opacity,
-            "gaussian_scale": gaussian_scale,
-            "gaussian_rotation": gaussian_rotation,
-            "gaussian_sh": gaussian_sh,
-            "gaussian_confidence_rpc": gaussian_conf_rpc,
-            "gaussian_confidence_point": gaussian_conf_point,
-            "gaussian_centers_rpc": centers_rpc,
-            "gaussian_centers_point": centers_point,
             "patch_valid_mask": patch_valid_mask,
             "patch_tokens_final": patch_tokens_final,
             "view_tokens_final": view_tokens_final,
             "scene_token_final": scene_token_final,
+            "gaussian_branch_enabled": gaussian_enabled,
         }
+
+        if gaussian_enabled:
+            # 9) 高斯属性分支
+            gauss_pred = self.gaussian_head(dense_feat)
+            gaussian_opacity = self._reshape_logits_to_bv(gauss_pred["opacity"], b, v)
+            gaussian_scale = self._reshape_logits_to_bv(gauss_pred["scale"], b, v)
+            gaussian_rotation = self._reshape_logits_to_bv(gauss_pred["rotation"], b, v)
+            gaussian_sh = self._reshape_logits_to_bv(gauss_pred["sh"], b, v)
+            gaussian_conf_rpc = self._reshape_logits_to_bv(gauss_pred["confidence_rpc"], b, v)
+            gaussian_conf_point = self._reshape_logits_to_bv(gauss_pred["confidence_point"], b, v)
+
+            # 10) 双路径中心
+            centers_rpc = self.rpc_ops.centers_from_rpc_and_height_batch(
+                corrected_rpc_batch=rpc_corrected,
+                pixel_grid=image_grid,
+                height_abs=height_abs,
+                scene_xy_center=scene_xy_center,
+                scene_xy_scale=scene_xy_scale,
+                downsample_factor=self._current_center_downsample(),
+            )
+            centers_point = point_abs
+            out.update(
+                {
+                    "gaussian_opacity": gaussian_opacity,
+                    "gaussian_scale": gaussian_scale,
+                    "gaussian_rotation": gaussian_rotation,
+                    "gaussian_sh": gaussian_sh,
+                    "gaussian_confidence_rpc": gaussian_conf_rpc,
+                    "gaussian_confidence_point": gaussian_conf_point,
+                    "gaussian_centers_rpc": centers_rpc,
+                    "gaussian_centers_point": centers_point,
+                }
+            )
+
+        return out
