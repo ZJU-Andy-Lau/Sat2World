@@ -133,7 +133,7 @@ python scripts/sanity_check.py --config config/default.yaml
 python scripts/pretrain.py --config config/pretrain.yaml
 ```
 
-该入口会复用现有数据/模型/DDP 训练框架，但使用几何预训练 objective，且不启用 renderer。
+该入口会复用现有数据/模型/DDP 训练框架，但使用几何预训练 objective，且不启用 renderer，并在模型前向中跳过 Gaussian 分支计算。
 
 ---
 

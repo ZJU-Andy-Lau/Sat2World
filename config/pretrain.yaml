@@ -99,6 +99,7 @@ model:
   point_fine_range_z: 0.5
   center_downsample_stage_steps: [0, 20000, 60000]
   center_downsample_factors: [4, 2, 1]
+  enable_gaussian_branch: false
   sh_dim: 48
   gaussian_scale_epsilon: 1.0e-4
   output_raw_logits: true

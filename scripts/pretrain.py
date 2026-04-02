@@ -176,6 +176,8 @@ def main() -> None:
     _startup_log("dataloaders_built", rank=int(dist_state["rank"]))
 
     model = build_model(cfg).to(device)
+    if hasattr(model, "set_pretrain_geometry_only"):
+        model.set_pretrain_geometry_only(True)
     _startup_log("model_built_and_to_device", rank=int(dist_state["rank"]))
     objective = build_objective(cfg, model.rpc_ops)
     _startup_log("objective_built", rank=int(dist_state["rank"]))
