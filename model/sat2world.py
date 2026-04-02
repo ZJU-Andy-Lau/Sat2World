@@ -66,6 +66,10 @@ class Sat2WorldCfg:
     center_downsample_factors: tuple[int, ...] = (4, 2, 1)
 
     enable_gaussian_branch: bool = True
+    # 预训练中间层对比监督配置
+    nce_layer_index: int = 3  # 0-based，第 4 层
+    nce_projector_dim: int = 256
+    nce_projector_hidden_dim: int = 512
 
 
 class Sat2World(nn.Module):
@@ -105,6 +109,12 @@ class Sat2World(nn.Module):
         self.height_head = HeightHead(in_ch=256, num_bins=cfg.height_bins)
         self.point_head = PointHead(in_ch=256, num_bins=cfg.point_bins)
         self.gaussian_head = GaussianHead(in_ch=256, sh_dim=cfg.sh_dim)
+        self.nce_projector = nn.Sequential(
+            nn.LayerNorm(self.backbone.embed_dim),
+            nn.Linear(self.backbone.embed_dim, int(cfg.nce_projector_hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(cfg.nce_projector_hidden_dim), int(cfg.nce_projector_dim)),
+        )
 
         self.height_coder = HeightCoder(
             SymmetricBinCoderCfg(num_bins=cfg.height_bins, bin_size=cfg.height_bin_size, fine_range=cfg.height_fine_range)
@@ -226,10 +236,22 @@ class Sat2World(nn.Module):
         geom_tok = self.geom_mlp(geom_feat)
         fused_tok = self.fuser(patch_tokens_vis, geom_tok)
 
-        enc_out = self.encoder(fused_tok, patch_valid_mask, ref_view_idx=ref_view_idx)
+        enc_out = self.encoder(
+            fused_tok,
+            patch_valid_mask,
+            ref_view_idx=ref_view_idx,
+            return_all_layers=True,
+        )
         patch_tokens_final = enc_out["patch_tokens"]
         view_tokens_final = enc_out["view_tokens"]
         scene_token_final = enc_out["scene_token"]
+        patch_tokens_layers = enc_out["patch_tokens_layers"]
+        layer_idx = int(self.cfg.nce_layer_index)
+        if layer_idx < 0:
+            layer_idx = patch_tokens_layers.shape[1] + layer_idx
+        layer_idx = max(0, min(layer_idx, patch_tokens_layers.shape[1] - 1))
+        patch_tokens_layer_sel = patch_tokens_layers[:, layer_idx]
+        patch_tokens_nce_proj = self.nce_projector(patch_tokens_layer_sel)
 
         # 4) 单阶段仿射预测（参考视图约束在 loss 阶段处理）
         affine_pred = self.affine_head(view_tokens_final)
@@ -299,8 +321,13 @@ class Sat2World(nn.Module):
             "point_fine_raw": {"x": x_fine, "y": y_fine, "z": z_fine},
             "patch_valid_mask": patch_valid_mask,
             "patch_tokens_final": patch_tokens_final,
+            "patch_tokens_layer_for_nce": patch_tokens_layer_sel,
+            "patch_tokens_nce_proj": patch_tokens_nce_proj,
             "view_tokens_final": view_tokens_final,
             "scene_token_final": scene_token_final,
+            "patch_centers": patch_centers,
+            "patch_grid_hw": (gh, gw),
+            "patch_padded_hw": backbone_out["pad_hw"],
             "gaussian_branch_enabled": gaussian_enabled,
         }
 

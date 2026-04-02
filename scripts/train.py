@@ -90,6 +90,9 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
     if "center_downsample_factors" in m:
         scfg.center_downsample_factors = tuple(int(x) for x in m.get("center_downsample_factors", scfg.center_downsample_factors))
     scfg.enable_gaussian_branch = bool(m.get("enable_gaussian_branch", scfg.enable_gaussian_branch))
+    scfg.nce_layer_index = int(m.get("nce_layer_index", scfg.nce_layer_index))
+    scfg.nce_projector_dim = int(m.get("nce_projector_dim", scfg.nce_projector_dim))
+    scfg.nce_projector_hidden_dim = int(m.get("nce_projector_hidden_dim", scfg.nce_projector_hidden_dim))
     return Sat2World(scfg)
 
 
@@ -105,6 +108,8 @@ def build_renderer(cfg: dict[str, Any], geometry_ops: Any) -> RPCGaussianRendere
 
 def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTrainingObjective:
     from loss.affine_loss import AffineGridLossCfg, AffinePairwiseGeometryLossCfg
+    from loss.feature_nce_loss import FeatureInfoNCELossCfg
+    from loss.point_pair_loss import PointPairwiseLossCfg
     from loss.total_loss import LossWeightScheduler, RPCAnySplatTrainingObjective
 
     lcfg = cfg.get("loss", {})
@@ -129,6 +134,8 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
             "lambda_affine_ref": float(lcfg.get("lambda_affine_ref", 0.1)),
             "lambda_height": float(lcfg.get("lambda_height", 1.0)),
             "lambda_point": float(lcfg.get("lambda_point", 1.0)),
+            "lambda_point_pair": float(lcfg.get("lambda_point_pair", 0.2)),
+            "lambda_feature_nce": float(lcfg.get("lambda_feature_nce", 0.1)),
             "lambda_center": float(lcfg.get("lambda_center", 0.2)),
             "lambda_opacity_reg": float(lcfg.get("lambda_opacity_reg", 0.01)),
             "lambda_scale_reg": float(lcfg.get("lambda_scale_reg", 0.01)),
@@ -141,10 +148,20 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
         },
         ramp_mode=str(lcfg.get("ramp_mode", "linear")),
     )
+    feature_nce_cfg = FeatureInfoNCELossCfg(
+        temperature=float(lcfg.get("feature_nce_temperature", 0.1)),
+        max_pairs=int(lcfg.get("feature_nce_max_pairs", 4096)),
+    )
+    point_pair_cfg = PointPairwiseLossCfg(
+        grid_h=int(lcfg.get("point_pair_grid_h", 64)),
+        grid_w=int(lcfg.get("point_pair_grid_w", 64)),
+    )
     return RPCAnySplatTrainingObjective(
         geometry_ops=geometry_ops,
         affine_grid_cfg=grid_cfg,
         affine_pair_cfg=pair_cfg,
+        point_pair_cfg=point_pair_cfg,
+        feature_nce_cfg=feature_nce_cfg,
         height_beta=float(lcfg.get("height_beta", 1.0)),
         point_beta=float(lcfg.get("point_beta", 1.0)),
         scale_min=float(lcfg.get("scale_min", 1e-4)),
@@ -366,6 +383,8 @@ def main() -> None:
     resume_path = str(system_cfg.get("resume_path", ""))
     checkpoint_path = str(system_cfg.get("checkpoint_path", ""))
     auto_resume = bool(system_cfg.get("auto_resume", True))
+    checkpoint_load_model_only = bool(system_cfg.get("checkpoint_load_model_only", False))
+    checkpoint_model_strict = bool(system_cfg.get("checkpoint_model_strict", False))
 
     if checkpoint_path:
         resume_path = checkpoint_path
@@ -388,12 +407,17 @@ def main() -> None:
         resume_state = resume_from_checkpoint(
             resume_path,
             model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
+            optimizer=None if checkpoint_load_model_only else optimizer,
+            scheduler=None if checkpoint_load_model_only else scheduler,
+            scaler=None if checkpoint_load_model_only else scaler,
             map_location="cpu",
+            model_strict=checkpoint_model_strict,
+            load_model_only=checkpoint_load_model_only,
+            restore_rng=(not checkpoint_load_model_only),
         )
-        if resume_state is not None:
+        if checkpoint_load_model_only:
+            resume_state = None
+        elif resume_state is not None:
             resume_state["resume_path"] = str(resume_path)
         if is_main_process() and monitor is not None:
             monitor.log_text("events/resume", f"resume from {resume_path}", 0)

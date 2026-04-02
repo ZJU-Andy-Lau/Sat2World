@@ -164,17 +164,19 @@ def load_checkpoint(
     scheduler: Any = None,
     scaler: Any = None,
     map_location: str = "cpu",
+    model_strict: bool = False,
+    load_model_only: bool = False,
 ) -> dict[str, Any]:
     """加载 checkpoint 并恢复对象状态。"""
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
-    unwrap_model(model).load_state_dict(ckpt["model"], strict=False)
+    unwrap_model(model).load_state_dict(ckpt["model"], strict=bool(model_strict))
 
-    if optimizer is not None and ckpt.get("optimizer", None) is not None:
+    if (not load_model_only) and optimizer is not None and ckpt.get("optimizer", None) is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
         _move_optimizer_state_to_device(optimizer, _infer_model_device(model))
-    if scheduler is not None and ckpt.get("scheduler", None) is not None:
+    if (not load_model_only) and scheduler is not None and ckpt.get("scheduler", None) is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
-    if scaler is not None and ckpt.get("scaler", None) is not None:
+    if (not load_model_only) and scaler is not None and ckpt.get("scaler", None) is not None:
         scaler.load_state_dict(ckpt["scaler"])
 
     return {
@@ -213,6 +215,9 @@ def resume_from_checkpoint(
     scheduler: Any = None,
     scaler: Any = None,
     map_location: str = "cpu",
+    model_strict: bool = False,
+    load_model_only: bool = False,
+    restore_rng: bool = True,
 ) -> dict[str, Any]:
     """恢复 checkpoint 并恢复随机状态。"""
     state = load_checkpoint(
@@ -222,6 +227,9 @@ def resume_from_checkpoint(
         scheduler=scheduler,
         scaler=scaler,
         map_location=map_location,
+        model_strict=model_strict,
+        load_model_only=load_model_only,
     )
-    restore_rng_state(state.get("rng_state", None))
+    if restore_rng and (not load_model_only):
+        restore_rng_state(state.get("rng_state", None))
     return state

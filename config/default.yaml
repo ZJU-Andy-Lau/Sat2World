@@ -11,6 +11,8 @@ system:
   compile_model: false
   ddp_backend: nccl
   auto_resume: true
+  checkpoint_load_model_only: false
+  checkpoint_model_strict: false
   resume_path: ""
   checkpoint_path: ""
   eval_only: false
@@ -83,6 +85,9 @@ model:
   geometry_token_dim: 256
   fusion_dim: 1024
   encoder_depth: 4
+  nce_layer_index: 3
+  nce_projector_dim: 256
+  nce_projector_hidden_dim: 512
   encoder_num_heads: 8
   encoder_ffn_ratio: 4.0
   encoder_dropout: 0.0
@@ -142,6 +147,8 @@ loss:
   lambda_affine_ref: 0.1
   lambda_height: 1.0
   lambda_point: 1.0
+  lambda_point_pair: 0.2
+  lambda_feature_nce: 0.1
   lambda_center: 0.2
   lambda_opacity_reg: 0.01
   lambda_scale_reg: 0.01
@@ -151,6 +158,10 @@ loss:
   render_rgb_ssim: 0.2
   render_height: 0.5
   render_alpha: 0.01
+  feature_nce_temperature: 0.1
+  feature_nce_max_pairs: 4096
+  point_pair_grid_h: 64
+  point_pair_grid_w: 64
   height_beta: 1.0
   point_beta: 1.0
   affine_grid_h: 16

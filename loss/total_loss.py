@@ -24,8 +24,10 @@ from loss.affine_loss import (
     AffinePairwiseGeometryLossCfg,
     RefAffineIdentityLoss,
 )
+from loss.feature_nce_loss import FeatureInfoNCELoss, FeatureInfoNCELossCfg
 from loss.height_loss import HeightHuberLoss
 from loss.point_loss import PointMapLoss
+from loss.point_pair_loss import PointPairwiseConsistencyLoss, PointPairwiseLossCfg
 from loss.regularization_loss import CenterConsistencyLoss, CoderProbe, GaussianRegularizationLoss
 from loss.render_loss import RenderPathLoss
 
@@ -55,6 +57,8 @@ class LossWeightScheduler:
             "lambda_affine_ref": 0.1,
             "lambda_height": 1.0,
             "lambda_point": 1.0,
+            "lambda_point_pair": 0.2,
+            "lambda_feature_nce": 0.1,
             "lambda_center": 0.2,
             "lambda_opacity_reg": 0.01,
             "lambda_scale_reg": 0.01,
@@ -102,10 +106,12 @@ class LossWeightScheduler:
             w["lambda_scale_reg"] = 0.0
             w["lambda_render_rpc"] = 0.0
             w["lambda_render_point"] = 0.0
+            w["lambda_point_pair"] = w.get("lambda_point_pair", 0.0) * 0.2
             stage_mul = 0.0
         elif global_step < st2:
             stage_mul = 0.35
             w["lambda_point"] = w["lambda_point"] * stage_mul
+            w["lambda_point_pair"] = w.get("lambda_point_pair", 0.0) * 0.6
             w["lambda_center"] = w["lambda_center"] * stage_mul
             w["lambda_opacity_reg"] = w["lambda_opacity_reg"] * stage_mul
             w["lambda_scale_reg"] = w["lambda_scale_reg"] * stage_mul
@@ -152,6 +158,8 @@ class RPCAnySplatTrainingObjective:
         affine_pair_cfg: AffinePairwiseGeometryLossCfg | None = None,
         height_beta: float = 1.0,
         point_beta: float = 1.0,
+        point_pair_cfg: PointPairwiseLossCfg | None = None,
+        feature_nce_cfg: FeatureInfoNCELossCfg | None = None,
         scale_min: float = 1e-4,
         scale_max: float = 0.5,
         scheduler: LossWeightScheduler | None = None,
@@ -165,6 +173,8 @@ class RPCAnySplatTrainingObjective:
 
         self.height_loss = HeightHuberLoss(beta=height_beta)
         self.point_loss = PointMapLoss(geometry_ops=geometry_ops, beta=point_beta)
+        self.point_pair_loss = PointPairwiseConsistencyLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
+        self.feature_nce_loss = FeatureInfoNCELoss(geometry_ops=geometry_ops, cfg=feature_nce_cfg or FeatureInfoNCELossCfg())
 
         self.center_loss = CenterConsistencyLoss()
         self.gaussian_reg = GaussianRegularizationLoss(scale_min=scale_min, scale_max=scale_max)
@@ -255,6 +265,11 @@ class RPCAnySplatTrainingObjective:
                 "gaussian_scale",
                 "gaussian_rotation",
                 "rpc_corrected",
+                "patch_tokens_nce_proj",
+                "patch_valid_mask",
+                "patch_centers",
+                "patch_grid_hw",
+                "patch_padded_hw",
             ],
             "outputs",
         )
@@ -293,6 +308,15 @@ class RPCAnySplatTrainingObjective:
         )
 
         l_p, p_p, aux_point = self.point_loss(outputs["point_abs"], outputs["point_anchor"], batch, return_aux=False)
+        l_ppair, p_ppair, aux_ppair = self.point_pair_loss(outputs["point_abs"], batch)
+        l_nce, p_nce, aux_nce = self.feature_nce_loss(
+            patch_tokens_proj=outputs["patch_tokens_nce_proj"],
+            patch_valid_mask=outputs["patch_valid_mask"],
+            patch_centers=outputs["patch_centers"],
+            patch_grid_hw=outputs["patch_grid_hw"],
+            patch_padded_hw=outputs["patch_padded_hw"],
+            batch=batch,
+        )
 
         l_center, p_center = self.center_loss(
             outputs["gaussian_centers_rpc"],
@@ -339,6 +363,8 @@ class RPCAnySplatTrainingObjective:
             + weights.get("lambda_affine_ref", 1.0) * l_aff_ref
             + weights["lambda_height"] * l_h
             + weights["lambda_point"] * l_p
+            + weights.get("lambda_point_pair", 0.0) * l_ppair
+            + weights.get("lambda_feature_nce", 0.0) * l_nce
             + weights["lambda_center"] * l_center
             + weights["lambda_opacity_reg"] * l_opacity
             + weights["lambda_scale_reg"] * l_scale
@@ -354,6 +380,8 @@ class RPCAnySplatTrainingObjective:
             "loss_affine_ref": l_aff_ref,
             "loss_height": l_h,
             "loss_point": l_p,
+            "loss_point_pair": l_ppair,
+            "loss_feature_nce": l_nce,
             "loss_center_consistency": l_center,
             "loss_gaussian_opacity_reg": l_opacity,
             "loss_gaussian_scale_reg": l_scale,
@@ -368,6 +396,10 @@ class RPCAnySplatTrainingObjective:
             "metric_point_xy_rmse": p_p.get("point_xy_rmse", zero),
             "metric_point_z_rmse": p_p.get("point_z_rmse", zero),
             "metric_point_anchor_displacement_mean": p_p.get("point_anchor_displacement_mean", zero),
+            "metric_point_pair_dist_mean": p_ppair.get("point_pair_dist_mean", zero),
+            "metric_point_pair_num_pairs_used": p_ppair.get("point_pair_num_pairs_used", zero),
+            "metric_feature_nce_valid_pairs": p_nce.get("feature_nce_valid_pairs", zero),
+            "metric_feature_nce_acc_top1": p_nce.get("feature_nce_acc_top1", zero),
             "metric_center_dist_mean": p_center.get("center_dist_mean", zero),
             "metric_center_dist_rmse": p_center.get("center_dist_rmse", zero),
             "probe_gaussian_opacity_mean": p_gauss.get("gaussian_opacity_mean", zero),
@@ -391,6 +423,8 @@ class RPCAnySplatTrainingObjective:
             "weight_affine_ref": weights.get("lambda_affine_ref", 1.0),
             "weight_height": weights["lambda_height"],
             "weight_point": weights["lambda_point"],
+            "weight_point_pair": weights.get("lambda_point_pair", 0.0),
+            "weight_feature_nce": weights.get("lambda_feature_nce", 0.0),
             "weight_center": weights["lambda_center"],
             "weight_opacity_reg": weights["lambda_opacity_reg"],
             "weight_scale_reg": weights["lambda_scale_reg"],
@@ -404,6 +438,8 @@ class RPCAnySplatTrainingObjective:
             "render_point_num_targets": float(p_render_point.get("render_num_targets", zero).detach().item()) if torch.is_tensor(p_render_point.get("render_num_targets", None)) else p_render_point.get("render_num_targets", 0),
         }
         aux_dict.update(aux_point)
+        aux_dict.update(aux_ppair)
+        aux_dict.update(aux_nce)
 
         return total, self._to_float_scalar_dict(scalar_dict), aux_dict
 
