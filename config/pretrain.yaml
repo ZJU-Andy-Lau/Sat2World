@@ -1,8 +1,8 @@
 system:
   project_name: Sat2World
-  experiment_name: default_exp
-  work_dir: work_dirs/sat2world_default
-  output_dir: work_dirs/sat2world_default
+  experiment_name: geom_pretrain
+  work_dir: work_dirs/sat2world_geom_pretrain
+  output_dir: work_dirs/sat2world_geom_pretrain
   seed: 42
   deterministic: false
   cudnn_benchmark: true
@@ -33,10 +33,10 @@ data:
     crop_size: 512
     anchors_per_view_per_sample: 128
     perturb_cfg:
-      tx_range: [ -2.0, 2.0 ]
-      ty_range: [ -2.0, 2.0 ]
-      scale_range: [ -0.0005, 0.0005 ]
-      shear_range: [ -0.0005, 0.0005 ]
+      tx_range: [-2.0, 2.0]
+      ty_range: [-2.0, 2.0]
+      scale_range: [-0.0005, 0.0005]
+      shear_range: [-0.0005, 0.0005]
   val:
     root: test_data
     max_view_num: 4
@@ -54,10 +54,10 @@ data:
     crop_size: 512
     anchors_per_view_per_sample: 128
     perturb_cfg:
-      tx_range: [ -2.0, 2.0 ]
-      ty_range: [ -2.0, 2.0 ]
-      scale_range: [ -0.0005, 0.0005 ]
-      shear_range: [ -0.0005, 0.0005 ]
+      tx_range: [-2.0, 2.0]
+      ty_range: [-2.0, 2.0]
+      scale_range: [-0.0005, 0.0005]
+      shear_range: [-0.0005, 0.0005]
   test:
     root: test_data
     crop_size: 512
@@ -99,58 +99,18 @@ model:
   point_fine_range_z: 0.5
   center_downsample_stage_steps: [0, 20000, 60000]
   center_downsample_factors: [4, 2, 1]
-  enable_gaussian_branch: true
+  enable_gaussian_branch: false
   sh_dim: 48
   gaussian_scale_epsilon: 1.0e-4
   output_raw_logits: true
 
-renderer:
-  train_num_target_views: 1
-  val_num_target_views: 1
-  use_all_targets_in_val: false
-  exclude_self_source: true
-  allow_self_source_if_single_view: true
-  source_stride: 4
-  confidence_threshold: 0.1
-  topk_per_target: 4000
-  enable_voxelization: false
-  voxel_xy: 2.0
-  voxel_z: 1.0
-  render_downsample_factor_train: 4
-  render_downsample_factor_val: 2
-  nsigma: 2.5
-  alpha_clamp_max: 0.98
-  eps_xy_fd: 0.01
-  eps_h_fd: 0.1
-  eps_cov: 1.0e-4
-  depth_dir_delta_h: 10.0
-  depth_sort_descending: false
-  chunk_size: 512
-  alpha_cov_thresh: 0.05
-  render_compute_dtype: fp16
-  deterministic_target_selection: true
-
 loss:
-  warmup_steps_geom_only: 1000
-  render_ramp_steps: 2000
-  stage1_steps: 5000
-  stage2_steps: 20000
-  ramp_mode: linear
   lambda_affine_grid: 1.0
   lambda_affine_pair: 1.0
   lambda_affine_reg: 0.1
   lambda_affine_ref: 0.1
   lambda_height: 1.0
   lambda_point: 1.0
-  lambda_center: 0.2
-  lambda_opacity_reg: 0.01
-  lambda_scale_reg: 0.01
-  lambda_render_rpc: 1.0
-  lambda_render_point: 1.0
-  render_rgb_l1: 1.0
-  render_rgb_ssim: 0.2
-  render_height: 0.5
-  render_alpha: 0.01
   height_beta: 1.0
   point_beta: 1.0
   affine_grid_h: 16
@@ -158,9 +118,6 @@ loss:
   anchors_per_pair: 256
   max_pairs: 12
   sample_from_valid_only: true
-  center_consistency_enable: true
-  scale_min: 1.0e-4
-  scale_max: 0.5
 
 optim:
   type: adamw
@@ -180,8 +137,8 @@ train:
   grad_clip_norm: 1.0
   amp_dtype: fp16
   enable_grad_scaler: true
-  enable_render_train: true
-  enable_render_val: true
+  enable_render_train: false
+  enable_render_val: false
   skip_nan_batch: true
   log_interval: 20
   hist_interval: 200
@@ -201,7 +158,7 @@ train:
 logging:
   tensorboard:
     enable: true
-    log_dir: work_dirs/sat2world_default/tb
+    log_dir: work_dirs/sat2world_geom_pretrain/tb
     enable_mesh: true
     image_max_views: 4
     max_pointcloud_points: 8192
@@ -211,7 +168,7 @@ logging:
     record_pointcloud: true
 
 checkpoint:
-  checkpoints_dir: work_dirs/sat2world_default/checkpoints
+  checkpoints_dir: work_dirs/sat2world_geom_pretrain/checkpoints
   save_last: true
   save_best: true
   best_metric_name: loss_total

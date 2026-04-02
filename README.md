@@ -125,6 +125,16 @@ python scripts/sanity_check.py --config config/default.yaml
 
 > 说明：`sanity_check.py` 会 monkeypatch DINO backbone，因此不依赖真实 DINO 权重即可验证全链路。
 
+### 4.4 几何预训练（仅 affine/height/point）
+
+如果你希望先训练几何主线（不训练 3DGS 渲染相关能力），可使用：
+
+```bash
+python scripts/pretrain.py --config config/pretrain.yaml
+```
+
+该入口会复用现有数据/模型/DDP 训练框架，但使用几何预训练 objective，且不启用 renderer，并在模型前向中跳过 Gaussian 分支计算。
+
 ---
 
 ## 5. 数据准备
