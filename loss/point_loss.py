@@ -10,6 +10,7 @@ from typing import Any
 import torch
 
 from loss.common import masked_huber_loss, masked_l1_loss, masked_reduce, safe_rmse
+from loss.point_pair_loss import point_map_to_metric
 
 
 class PointMapLoss:
@@ -66,6 +67,8 @@ class PointMapLoss:
         rpc_gt = batch["rpc_gt"]
         scene_xy_center = batch.get("scene_xy_center", None)
         scene_xy_scale = batch.get("scene_xy_scale", None)
+        if scene_xy_scale is not None and torch.is_tensor(scene_xy_scale):
+            scene_xy_scale = scene_xy_scale.to(device=point_abs.device, dtype=point_abs.dtype)
 
         b, v, _, h, w = point_abs.shape
         image_grid = self._get_grid(h, w, point_abs.device, point_abs.dtype)
@@ -78,15 +81,19 @@ class PointMapLoss:
             scene_xy_scale=scene_xy_scale,
         )
 
-        loss = masked_huber_loss(point_abs, gt_point_map, mask=height_valid_mask, beta=self.beta)
+        point_abs_metric = point_map_to_metric(point_abs, scene_xy_scale if torch.is_tensor(scene_xy_scale) else None)
+        gt_point_map_metric = point_map_to_metric(gt_point_map, scene_xy_scale if torch.is_tensor(scene_xy_scale) else None)
+        point_anchor_metric = point_map_to_metric(point_anchor, scene_xy_scale if torch.is_tensor(scene_xy_scale) else None)
 
-        d = point_abs - gt_point_map
+        loss = masked_huber_loss(point_abs_metric, gt_point_map_metric, mask=height_valid_mask, beta=self.beta)
+
+        d = point_abs_metric - gt_point_map_metric
         dx2 = d[:, :, 0:1].square()
         dy2 = d[:, :, 1:2].square()
         dz2 = d[:, :, 2:3].square()
 
         norm_xyz = torch.sqrt((d.square().sum(dim=2, keepdim=True)).clamp_min(1e-8))
-        anchor_delta = point_abs - point_anchor
+        anchor_delta = point_abs_metric - point_anchor_metric
         anchor_norm = torch.sqrt((anchor_delta.square().sum(dim=2, keepdim=True)).clamp_min(1e-8))
 
         probe = {
@@ -100,5 +107,5 @@ class PointMapLoss:
 
         aux: dict[str, Any] = {}
         if return_aux:
-            aux["gt_point_map"] = gt_point_map
+            aux["gt_point_map"] = gt_point_map_metric
         return loss, probe, aux

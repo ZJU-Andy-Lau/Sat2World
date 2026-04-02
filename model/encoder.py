@@ -228,6 +228,7 @@ class AlternatingEncoder(nn.Module):
         patch_tokens: torch.Tensor,
         patch_valid_mask: torch.Tensor,
         ref_view_idx: int | torch.Tensor = 0,
+        return_all_layers: bool = False,
     ) -> dict[str, torch.Tensor]:
         """执行交替编码。
 
@@ -263,12 +264,18 @@ class AlternatingEncoder(nn.Module):
         scene = scene_per_view.mean(dim=1).contiguous()
         patch = patch_tokens
 
+        patch_layers: list[torch.Tensor] = []
         for intra, cross in zip(self.intra_blocks, self.cross_blocks):
             patch, view = intra(patch, view, patch_valid_mask)
             patch, view, scene = cross(patch, view, scene, patch_valid_mask)
+            if return_all_layers:
+                patch_layers.append(patch)
 
-        return {
+        out = {
             "patch_tokens": patch,
             "view_tokens": view,
             "scene_token": scene,
         }
+        if return_all_layers:
+            out["patch_tokens_layers"] = torch.stack(patch_layers, dim=1)
+        return out
