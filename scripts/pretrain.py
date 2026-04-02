@@ -1,0 +1,280 @@
+"""Sat2World 几何预训练入口。
+
+目标：仅训练几何主线（仿射 / 高程 / 点云），
+不引入 3DGS 渲染及其相关损失。
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+import time
+from typing import Any
+
+import torch
+import yaml
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser("Sat2World Geometry Pretrain")
+    p.add_argument("--config", type=str, default="config/pretrain.yaml")
+    p.add_argument("--work-dir", type=str, default="")
+    p.add_argument("--resume", type=str, default="")
+    p.add_argument("--checkpoint", type=str, default="")
+    p.add_argument("--eval-only", action="store_true")
+    p.add_argument("--sanity-only", action="store_true")
+    p.add_argument("--seed", type=int, default=-1)
+    p.add_argument("--local-rank", type=int, default=0)
+    return p.parse_args()
+
+
+def load_cfg(path: str) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def apply_cli_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    cfg = dict(cfg)
+    system = cfg.setdefault("system", {})
+    if args.work_dir:
+        system["work_dir"] = args.work_dir
+    if args.seed >= 0:
+        system["seed"] = int(args.seed)
+    if args.eval_only:
+        system["eval_only"] = True
+    if args.resume:
+        system["resume_path"] = args.resume
+    if args.checkpoint:
+        system["checkpoint_path"] = args.checkpoint
+    return cfg
+
+
+def build_model(cfg: dict[str, Any]) -> Any:
+    from scripts.train import build_model as _build_model
+
+    return _build_model(cfg)
+
+
+def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> Any:
+    from loss.affine_loss import AffineGridLossCfg, AffinePairwiseGeometryLossCfg
+    from loss.pretrain_objective import GeometryPretrainObjective, GeometryPretrainWeightCfg
+
+    lcfg = cfg.get("loss", {})
+    pair_cfg = AffinePairwiseGeometryLossCfg(
+        anchors_per_pair=int(lcfg.get("anchors_per_pair", 256)),
+        max_pairs=lcfg.get("max_pairs", None),
+        sample_from_valid_only=bool(lcfg.get("sample_from_valid_only", True)),
+    )
+    grid_cfg = AffineGridLossCfg(
+        grid_h=int(lcfg.get("affine_grid_h", 16)),
+        grid_w=int(lcfg.get("affine_grid_w", 16)),
+    )
+    weights = GeometryPretrainWeightCfg(
+        lambda_affine_grid=float(lcfg.get("lambda_affine_grid", 1.0)),
+        lambda_affine_pair=float(lcfg.get("lambda_affine_pair", 1.0)),
+        lambda_affine_reg=float(lcfg.get("lambda_affine_reg", 0.1)),
+        lambda_affine_ref=float(lcfg.get("lambda_affine_ref", 0.1)),
+        lambda_height=float(lcfg.get("lambda_height", 1.0)),
+        lambda_point=float(lcfg.get("lambda_point", 1.0)),
+    )
+    return GeometryPretrainObjective(
+        geometry_ops=geometry_ops,
+        affine_grid_cfg=grid_cfg,
+        affine_pair_cfg=pair_cfg,
+        height_beta=float(lcfg.get("height_beta", 1.0)),
+        point_beta=float(lcfg.get("point_beta", 1.0)),
+        weights=weights,
+    )
+
+
+def build_optimizer_and_scheduler(cfg: dict[str, Any], model: torch.nn.Module):
+    from scripts.train import build_optimizer_and_scheduler as _build_optimizer_and_scheduler
+
+    return _build_optimizer_and_scheduler(cfg, model)
+
+
+def build_dataloaders(cfg: dict[str, Any], distributed: bool):
+    from scripts.train import build_dataloaders as _build_dataloaders
+
+    return _build_dataloaders(cfg, distributed)
+
+
+def run_sanity_once(model, objective, loader, device) -> None:
+    """几何预训练闭环自检：仅 model + objective 前向一次。"""
+    from engine.distributed import move_batch_to_device
+
+    batch = next(iter(loader))
+    batch = move_batch_to_device(batch, device)
+    model.eval()
+    with torch.no_grad():
+        outputs = model(batch)
+        total_loss, scalar_dict, _ = objective(outputs, batch, global_step=0, epoch=0, render_outputs=None, mode="train")
+
+    print("[pretrain sanity] outputs keys:", sorted(list(outputs.keys()))[:10], "...")
+    print("[pretrain sanity] loss_total:", float(total_loss.detach().cpu().item()))
+    print("[pretrain sanity] scalar sample:", {k: scalar_dict[k] for k in list(scalar_dict.keys())[:8]})
+
+
+def main() -> None:
+    from engine import (
+        TensorBoardMonitor,
+        Trainer,
+        auto_resume_latest,
+        configure_cuda_runtime,
+        destroy_distributed,
+        init_distributed,
+        is_main_process,
+        resume_from_checkpoint,
+        seed_everything,
+        wrap_ddp,
+    )
+
+    args = parse_args()
+    cfg = apply_cli_overrides(load_cfg(args.config), args)
+
+    startup_t0 = time.perf_counter()
+    startup_last = startup_t0
+
+    def _startup_log(stage: str, rank: int | None = None) -> None:
+        nonlocal startup_last
+        now = time.perf_counter()
+        step_sec = now - startup_last
+        total_sec = now - startup_t0
+        rank_str = "?" if rank is None else str(rank)
+        print(f"[startup][rank={rank_str}] {stage} | step={step_sec:.2f}s total={total_sec:.2f}s", flush=True)
+        startup_last = now
+
+    _startup_log("config_loaded")
+
+    system_cfg = cfg.get("system", {})
+    work_dir = Path(system_cfg.get("work_dir", "work_dirs/pretrain_default"))
+    work_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_cfg = cfg.get("checkpoint", {})
+    checkpoints_dir = Path(checkpoint_cfg.get("checkpoints_dir", str(work_dir / "checkpoints")))
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    _startup_log("workdir_and_checkpoint_dirs_ready")
+
+    dist_state = init_distributed(backend=str(system_cfg.get("ddp_backend", "nccl")))
+    device = dist_state["device"]
+    _startup_log("distributed_initialized", rank=int(dist_state["rank"]))
+
+    seed_everything(int(system_cfg.get("seed", 42)))
+    configure_cuda_runtime(
+        {
+            "cudnn_benchmark": bool(system_cfg.get("cudnn_benchmark", True)),
+            "allow_tf32": bool(system_cfg.get("allow_tf32", True)),
+        }
+    )
+    _startup_log("seed_and_cuda_runtime_configured", rank=int(dist_state["rank"]))
+
+    train_loader, val_loader = build_dataloaders(cfg, distributed=dist_state["distributed"])
+    _startup_log("dataloaders_built", rank=int(dist_state["rank"]))
+
+    model = build_model(cfg).to(device)
+    _startup_log("model_built_and_to_device", rank=int(dist_state["rank"]))
+    objective = build_objective(cfg, model.rpc_ops)
+    _startup_log("objective_built", rank=int(dist_state["rank"]))
+    optimizer, scheduler = build_optimizer_and_scheduler(cfg, model)
+    _startup_log("optimizer_and_scheduler_built", rank=int(dist_state["rank"]))
+
+    amp_dtype = str(cfg.get("train", {}).get("amp_dtype", "fp16"))
+    use_scaler = bool(cfg.get("train", {}).get("enable_grad_scaler", True)) and amp_dtype == "fp16" and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    _startup_log("grad_scaler_ready", rank=int(dist_state["rank"]))
+
+    model = wrap_ddp(model, device)
+
+    if args.sanity_only:
+        run_sanity_once(model, objective, train_loader, device)
+        destroy_distributed()
+        return
+
+    monitor = None
+    if is_main_process() and bool(cfg.get("logging", {}).get("tensorboard", {}).get("enable", True)):
+        tb_cfg = cfg.get("logging", {}).get("tensorboard", {})
+        log_dir = tb_cfg.get("log_dir", str(work_dir / "tb"))
+        monitor = TensorBoardMonitor(
+            log_dir=log_dir,
+            is_enabled=True,
+            enable_mesh=bool(tb_cfg.get("enable_mesh", True)),
+            image_max_views=int(tb_cfg.get("image_max_views", 4)),
+            max_pointcloud_points=int(tb_cfg.get("max_pointcloud_points", 8192)),
+            flush_secs=int(tb_cfg.get("flush_secs", 30)),
+        )
+
+    resume_state = None
+    resume_path = str(system_cfg.get("resume_path", ""))
+    checkpoint_path = str(system_cfg.get("checkpoint_path", ""))
+    auto_resume = bool(system_cfg.get("auto_resume", True))
+
+    if checkpoint_path:
+        resume_path = checkpoint_path
+    elif args.checkpoint:
+        resume_path = args.checkpoint
+    elif args.resume:
+        resume_path = args.resume
+    elif resume_path == "" and auto_resume:
+        last_ckpt = checkpoints_dir / "last.pt"
+        if last_ckpt.exists():
+            resume_path = str(last_ckpt)
+        else:
+            cands = sorted(checkpoints_dir.glob("epoch_*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+            resume_path = str(cands[0]) if cands else ""
+            if resume_path == "":
+                resume_path = auto_resume_latest(str(work_dir)) or ""
+
+    if resume_path:
+        resume_state = resume_from_checkpoint(
+            resume_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            map_location="cpu",
+        )
+        if resume_state is not None:
+            resume_state["resume_path"] = str(resume_path)
+        if is_main_process() and monitor is not None:
+            monitor.log_text("events/resume", f"resume from {resume_path}", 0)
+
+    trainer_cfg = dict(cfg.get("train", {}))
+    trainer_cfg["enable_render_train"] = False
+    trainer_cfg["enable_render_val"] = False
+    trainer_cfg["best_metric"] = checkpoint_cfg.get("best_metric_name", trainer_cfg.get("best_metric", "loss_total"))
+    trainer_cfg["best_mode"] = checkpoint_cfg.get("best_metric_mode", trainer_cfg.get("best_mode", "min"))
+    trainer_cfg["checkpoints_dir"] = str(checkpoints_dir)
+
+    trainer = Trainer(
+        cfg=trainer_cfg,
+        model=model,
+        renderer=None,
+        objective=objective,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        monitor=monitor,
+        scaler=scaler,
+        distributed_state=dist_state,
+        work_dir=str(work_dir),
+        resume_state=resume_state,
+    )
+
+    if bool(system_cfg.get("eval_only", False)) or args.eval_only:
+        trainer.validate()
+    else:
+        trainer.fit()
+
+    if monitor is not None:
+        monitor.close()
+    destroy_distributed()
+
+
+if __name__ == "__main__":
+    main()
