@@ -125,7 +125,17 @@ class Sat2World(nn.Module):
         self.runtime_mode = str(mode)
 
     def set_pretrain_geometry_only(self, enabled: bool) -> None:
-        self.runtime_pretrain_geometry_only = bool(enabled)
+        enabled = bool(enabled)
+        self.runtime_pretrain_geometry_only = enabled
+
+        # 预训练几何模式下冻结高斯头参数，避免 DDP(find_unused_parameters=False)
+        # 因分支跳过而触发“unused parameters”归约错误。
+        if enabled:
+            self.gaussian_head.requires_grad_(False)
+        else:
+            # 仅在配置允许高斯分支时恢复可训练。
+            if bool(self.cfg.enable_gaussian_branch):
+                self.gaussian_head.requires_grad_(True)
 
     def _current_center_downsample(self) -> int:
         steps = tuple(int(x) for x in self.cfg.center_downsample_stage_steps)

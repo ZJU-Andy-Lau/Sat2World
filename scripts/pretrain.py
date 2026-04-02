@@ -178,6 +178,8 @@ def main() -> None:
     model = build_model(cfg).to(device)
     if hasattr(model, "set_pretrain_geometry_only"):
         model.set_pretrain_geometry_only(True)
+    elif hasattr(model, "gaussian_head"):
+        model.gaussian_head.requires_grad_(False)
     _startup_log("model_built_and_to_device", rank=int(dist_state["rank"]))
     objective = build_objective(cfg, model.rpc_ops)
     _startup_log("objective_built", rank=int(dist_state["rank"]))
