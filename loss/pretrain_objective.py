@@ -125,6 +125,7 @@ class GeometryPretrainObjective:
                 "patch_valid_mask",
                 "patch_centers",
                 "patch_grid_hw",
+                "patch_padded_hw",
             ],
             "outputs",
         )
@@ -158,6 +159,7 @@ class GeometryPretrainObjective:
             patch_valid_mask=outputs["patch_valid_mask"],
             patch_centers=outputs["patch_centers"],
             patch_grid_hw=outputs["patch_grid_hw"],
+            patch_padded_hw=outputs["patch_padded_hw"],
             batch=batch,
         )
 

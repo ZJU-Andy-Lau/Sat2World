@@ -48,6 +48,7 @@ class FeatureInfoNCELoss:
         patch_valid_mask: torch.Tensor,
         patch_centers: torch.Tensor,
         patch_grid_hw: tuple[int, int],
+        patch_padded_hw: tuple[int, int] | None,
         batch: dict[str, Any],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
         """计算单向 InfoNCE。
@@ -80,6 +81,15 @@ class FeatureInfoNCELoss:
 
         centers = patch_centers.to(device=device, dtype=dtype).view(1, n, 2)
         ref_feat_map_all = patch_tokens_proj.view(b, v, gh, gw, d).permute(0, 1, 4, 2, 3).contiguous()
+        # 关键：将像素坐标投影点映射到 patch-grid 坐标系后再采样 ref_feat_map。
+        if patch_padded_hw is not None:
+            hp, wp = int(patch_padded_hw[0]), int(patch_padded_hw[1])
+        else:
+            hp = int(batch["images"].shape[-2])
+            wp = int(batch["images"].shape[-1])
+        patch_h = float(hp) / float(max(gh, 1))
+        patch_w = float(wp) / float(max(gw, 1))
+        loss_stub = patch_tokens_proj.sum() * 0.0
 
         for bi in range(b):
             ref = int(ref_idx[bi].item())
@@ -119,8 +129,11 @@ class FeatureInfoNCELoss:
                     scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
                     scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
                 )
-                pts_ref = torch.stack([l_ref.view(1, -1), s_ref.view(1, -1)], dim=-1).to(device=device, dtype=dtype)
-                pos_feat, in_ref = sample_map_bilinear(ref_feat_map, pts_ref)
+                pts_ref_pix = torch.stack([l_ref.view(1, -1), s_ref.view(1, -1)], dim=-1).to(device=device, dtype=dtype)
+                pts_ref_patch = pts_ref_pix.clone()
+                pts_ref_patch[..., 0] = (pts_ref_patch[..., 0] + 0.5) / patch_h - 0.5
+                pts_ref_patch[..., 1] = (pts_ref_patch[..., 1] + 0.5) / patch_w - 0.5
+                pos_feat, in_ref = sample_map_bilinear(ref_feat_map, pts_ref_patch)
                 if not bool(in_ref.any()):
                     continue
 
@@ -134,7 +147,7 @@ class FeatureInfoNCELoss:
 
         if len(anchors_all) == 0:
             zero = torch.zeros((), device=device, dtype=dtype)
-            return zero, {"feature_nce_valid_pairs": zero}, {"feature_nce_valid_pairs": 0}
+            return loss_stub, {"feature_nce_valid_pairs": zero}, {"feature_nce_valid_pairs": 0}
 
         anchors = torch.cat(anchors_all, dim=0)
         positives = torch.cat(positives_all, dim=0)
@@ -149,7 +162,7 @@ class FeatureInfoNCELoss:
 
         logits = torch.matmul(anchors.float(), positives.float().transpose(0, 1)) / float(self.cfg.temperature)
         targets = torch.arange(logits.shape[0], device=device, dtype=torch.long)
-        loss = F.cross_entropy(logits, targets).to(dtype=dtype)
+        loss = F.cross_entropy(logits, targets).to(dtype=dtype) + loss_stub
 
         with torch.no_grad():
             pred = logits.argmax(dim=1)

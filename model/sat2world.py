@@ -327,6 +327,7 @@ class Sat2World(nn.Module):
             "scene_token_final": scene_token_final,
             "patch_centers": patch_centers,
             "patch_grid_hw": (gh, gw),
+            "patch_padded_hw": backbone_out["pad_hw"],
             "gaussian_branch_enabled": gaussian_enabled,
         }
 
