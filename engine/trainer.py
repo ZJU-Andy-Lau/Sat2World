@@ -391,8 +391,9 @@ class Trainer:
 
     def _save_best_checkpoint(self) -> None:
         """保存 best checkpoint。"""
+        t0 = time.time()
         try:
-            save_checkpoint(
+            success = save_checkpoint(
                 self.ckpt_dir / "best.pt",
                 model=self.model,
                 optimizer=self.optimizer,
@@ -406,6 +407,17 @@ class Trainer:
                 extra_state={"is_best": True},
                 min_disk_gb=float(self.cfg.get("min_disk_gb", 2.0)),
             )
+            if is_main_process():
+                dt = time.time() - t0
+                if self.monitor is not None:
+                    self.monitor.log_scalars("ckpt", {"best_save_time_sec": dt}, self.global_step)
+                if success:
+                    if self.monitor is not None:
+                        self.monitor.log_text("events/checkpoint", f"saved best checkpoint at step={self.global_step}", self.global_step)
+                else:
+                    print(f"[WARN] Skip saving best checkpoint at step={self.global_step} (save_checkpoint returned False)")
+                    if self.monitor is not None:
+                        self.monitor.log_text("events/checkpoint", f"failed to save best checkpoint at step={self.global_step}", self.global_step)
         except Exception as e:
             print(f"[ERROR] Trainer failed to save best checkpoint: {e}")
 
@@ -421,7 +433,9 @@ class Trainer:
             "loss_total": 0.0,
             "loss_affine_grid": 0.0,
             "loss_affine_pair": 0.0,
-            "loss_affine_height": 0.0,
+            "loss_height": 0.0,
+            "loss_height_rel": 0.0,
+            "loss_point": 0.0,
         }
         n_loss_steps = 0
         for step_idx, batch in enumerate(self.train_loader):
@@ -443,11 +457,15 @@ class Trainer:
             lag = logs.get("loss_affine_grid", None)
             lap = logs.get("loss_affine_pair", None)
             lh = logs.get("loss_height", None)
-            if lt is not None and lag is not None and lap is not None and lh is not None:
+            lhrel = logs.get("loss_height_rel", None)
+            lp = logs.get("loss_point", None)
+            if lt is not None and lag is not None and lap is not None and lh is not None and lhrel is not None and lp is not None:
                 loss_sums["loss_total"] += float(lt)
                 loss_sums["loss_affine_grid"] += float(lag)
                 loss_sums["loss_affine_pair"] += float(lap)
-                loss_sums["loss_affine_height"] += float(lh)
+                loss_sums["loss_height"] += float(lh)
+                loss_sums["loss_height_rel"] += float(lhrel)
+                loss_sums["loss_point"] += float(lp)
                 n_loss_steps += 1
 
             if is_main_process():
@@ -458,10 +476,12 @@ class Trainer:
                 print(
                     "[train] "
                     f"epoch={self.epoch} step={step_idx} gstep={self.global_step} "
-                    f"loss_total={float(lt) if lt is not None else float('nan'):.6f} "
-                    f"loss_affine_grid={float(lag) if lag is not None else float('nan'):.6f} "
-                    f"loss_affine_pair={float(lap) if lap is not None else float('nan'):.6f} "
-                    f"loss_affine_height={float(lh) if lh is not None else float('nan'):.6f} "
+                    f"l_tot={float(lt) if lt is not None else float('nan'):.6f} "
+                    f"l_ag={float(lag) if lag is not None else float('nan'):.6f} "
+                    f"l_ap={float(lap) if lap is not None else float('nan'):.6f} "
+                    f"l_h_abs={float(lh) if lh is not None else float('nan'):.6f} "
+                    f"l_h_rel={float(lhrel) if lhrel is not None else float('nan'):.6f} "
+                    f"l_pt={float(lp) if lp is not None else float('nan'):.6f} "
                     f"lr={lr:.2e} "
                     f"time={self._format_hhmmss(elapsed)} "
                     f"eta={self._format_hhmmss(eta)}"
@@ -479,14 +499,18 @@ class Trainer:
             avg_total = loss_sums["loss_total"] / n_loss_steps
             avg_ag = loss_sums["loss_affine_grid"] / n_loss_steps
             avg_ap = loss_sums["loss_affine_pair"] / n_loss_steps
-            avg_ah = loss_sums["loss_affine_height"] / n_loss_steps
+            avg_h_abs = loss_sums["loss_height"] / n_loss_steps
+            avg_h_rel = loss_sums["loss_height_rel"] / n_loss_steps
+            avg_pt = loss_sums["loss_point"] / n_loss_steps
             print(
                 "[train][epoch_summary] "
                 f"epoch={self.epoch} "
-                f"avg_total_loss={avg_total:.6f} "
-                f"avg_loss_affine_grid={avg_ag:.6f} "
-                f"avg_loss_affine_pair={avg_ap:.6f} "
-                f"avg_loss_affine_height={avg_ah:.6f}"
+                f"l_tot={avg_total:.6f} "
+                f"l_ag={avg_ag:.6f} "
+                f"l_ap={avg_ap:.6f} "
+                f"l_h_abs={avg_h_abs:.6f} "
+                f"l_h_rel={avg_h_rel:.6f} "
+                f"l_pt={avg_pt:.6f}"
             )
 
     def validate(self) -> dict[str, float]:

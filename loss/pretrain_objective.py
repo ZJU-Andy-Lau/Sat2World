@@ -21,6 +21,7 @@ from loss.affine_loss import (
 )
 from loss.feature_nce_loss import FeatureInfoNCELoss, FeatureInfoNCELossCfg
 from loss.height_loss import HeightHuberLoss
+from loss.height_pair_loss import HeightPairwiseLossCfg, HeightPairwiseRelativeLoss
 from loss.point_pair_loss import PointPairwiseConsistencyLoss, PointPairwiseLossCfg
 from loss.point_loss import PointMapLoss
 
@@ -34,9 +35,11 @@ class GeometryPretrainWeightCfg:
     lambda_affine_reg: float = 0.1
     lambda_affine_ref: float = 0.1
     lambda_height: float = 1.0
+    lambda_height_rel: float = 0.0
     lambda_point: float = 1.0
     lambda_point_pair: float = 0.1
     lambda_feature_nce: float = 0.1
+    height_abs_keep_steps: int = 5000
 
 
 class GeometryPretrainObjective:
@@ -58,6 +61,7 @@ class GeometryPretrainObjective:
         affine_grid_cfg: AffineGridLossCfg | None = None,
         affine_pair_cfg: AffinePairwiseGeometryLossCfg | None = None,
         point_pair_cfg: PointPairwiseLossCfg | None = None,
+        height_pair_cfg: HeightPairwiseLossCfg | None = None,
         feature_nce_cfg: FeatureInfoNCELossCfg | None = None,
         height_beta: float = 1.0,
         point_beta: float = 1.0,
@@ -71,6 +75,7 @@ class GeometryPretrainObjective:
         self.height_loss = HeightHuberLoss(beta=height_beta)
         self.point_loss = PointMapLoss(geometry_ops=geometry_ops, beta=point_beta)
         self.point_pair_loss = PointPairwiseConsistencyLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
+        self.height_pair_loss = HeightPairwiseRelativeLoss(geometry_ops=geometry_ops, cfg=height_pair_cfg or HeightPairwiseLossCfg())
         self.feature_nce_loss = FeatureInfoNCELoss(geometry_ops=geometry_ops, cfg=feature_nce_cfg or FeatureInfoNCELossCfg())
         self.weights = weights or GeometryPretrainWeightCfg()
 
@@ -111,7 +116,7 @@ class GeometryPretrainObjective:
         render_outputs: dict[str, dict[str, torch.Tensor | None]] | None = None,
         mode: str = "train",
     ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor], dict[str, Any]]:
-        del global_step, epoch, render_outputs, mode
+        del epoch, render_outputs, mode
 
         self._require_keys(
             outputs,
@@ -154,6 +159,7 @@ class GeometryPretrainObjective:
 
         l_p, p_p, aux_point = self.point_loss(outputs["point_abs"], outputs["point_anchor"], batch, return_aux=False)
         l_ppair, p_ppair, aux_ppair = self.point_pair_loss(outputs["point_abs"], batch)
+        l_hrel, p_hrel, aux_hrel = self.height_pair_loss(outputs["height_abs"], batch)
         l_nce, p_nce, aux_nce = self.feature_nce_loss(
             patch_tokens_proj=outputs["patch_tokens_nce_proj"],
             patch_valid_mask=outputs["patch_valid_mask"],
@@ -164,12 +170,14 @@ class GeometryPretrainObjective:
         )
 
         w = self.weights
+        w_h_abs = float(w.lambda_height) if int(global_step) < int(w.height_abs_keep_steps) else 0.0
         total = (
             w.lambda_affine_grid * l_aff_grid
             + w.lambda_affine_pair * l_aff_pair
             + w.lambda_affine_reg * l_aff_reg
             + w.lambda_affine_ref * l_aff_ref
-            + w.lambda_height * l_h
+            + w_h_abs * l_h
+            + w.lambda_height_rel * l_hrel
             + w.lambda_point * l_p
             + w.lambda_point_pair * l_ppair
             + w.lambda_feature_nce * l_nce
@@ -183,6 +191,7 @@ class GeometryPretrainObjective:
             "loss_affine_reg": l_aff_reg,
             "loss_affine_ref": l_aff_ref,
             "loss_height": l_h,
+            "loss_height_rel": l_hrel,
             "loss_point": l_p,
             "loss_point_pair": l_ppair,
             "loss_feature_nce": l_nce,
@@ -191,6 +200,10 @@ class GeometryPretrainObjective:
             "metric_ref_affine_identity_l2": p_aff_ref.get("ref_affine_identity_l2", zero),
             "metric_height_rmse": p_h.get("height_rmse", zero),
             "metric_height_mae": p_h.get("height_mae", zero),
+            "metric_height_rel_consistency": p_hrel.get("height_rel_consistency", zero),
+            "metric_height_rel_cycle_px": p_hrel.get("height_rel_cycle_px", zero),
+            "metric_height_rel_cycle_px_rmse": p_hrel.get("height_rel_cycle_px_rmse", zero),
+            "metric_height_rel_pairs_used": p_hrel.get("height_rel_num_pairs_used", zero),
             "metric_point_xyz_rmse": p_p.get("point_xyz_rmse", zero),
             "metric_point_xy_rmse": p_p.get("point_xy_rmse", zero),
             "metric_point_z_rmse": p_p.get("point_z_rmse", zero),
@@ -201,7 +214,8 @@ class GeometryPretrainObjective:
             "weight_affine_pair": float(w.lambda_affine_pair),
             "weight_affine_reg": float(w.lambda_affine_reg),
             "weight_affine_ref": float(w.lambda_affine_ref),
-            "weight_height": float(w.lambda_height),
+            "weight_height": float(w_h_abs),
+            "weight_height_rel": float(w.lambda_height_rel),
             "weight_point": float(w.lambda_point),
             "weight_point_pair": float(w.lambda_point_pair),
             "weight_feature_nce": float(w.lambda_feature_nce),
@@ -225,6 +239,7 @@ class GeometryPretrainObjective:
         }
         aux_dict.update(aux_point)
         aux_dict.update(aux_ppair)
+        aux_dict.update(aux_hrel)
         aux_dict.update(aux_nce)
         scalar_dict["metric_feature_nce_valid_pairs"] = p_nce.get("feature_nce_valid_pairs", zero)
         scalar_dict["metric_feature_nce_acc_top1"] = p_nce.get("feature_nce_acc_top1", zero)

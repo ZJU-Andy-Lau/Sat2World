@@ -26,6 +26,7 @@ from loss.affine_loss import (
 )
 from loss.feature_nce_loss import FeatureInfoNCELoss, FeatureInfoNCELossCfg
 from loss.height_loss import HeightHuberLoss
+from loss.height_pair_loss import HeightPairwiseLossCfg, HeightPairwiseRelativeLoss
 from loss.point_loss import PointMapLoss
 from loss.point_pair_loss import PointPairwiseConsistencyLoss, PointPairwiseLossCfg
 from loss.regularization_loss import CenterConsistencyLoss, CoderProbe, GaussianRegularizationLoss
@@ -56,6 +57,7 @@ class LossWeightScheduler:
             "lambda_affine_reg": 0.1,
             "lambda_affine_ref": 0.1,
             "lambda_height": 1.0,
+            "lambda_height_rel": 0.0,
             "lambda_point": 1.0,
             "lambda_point_pair": 0.2,
             "lambda_feature_nce": 0.1,
@@ -73,6 +75,7 @@ class LossWeightScheduler:
     ramp_mode: str = "linear"
     stage1_steps: int = 5000
     stage2_steps: int = 20000
+    height_abs_keep_steps: int = 5000
 
     def _render_multiplier(self, global_step: int) -> float:
         """计算 render 权重乘子。"""
@@ -107,11 +110,13 @@ class LossWeightScheduler:
             w["lambda_render_rpc"] = 0.0
             w["lambda_render_point"] = 0.0
             w["lambda_point_pair"] = w.get("lambda_point_pair", 0.0) * 0.2
+            w["lambda_height_rel"] = w.get("lambda_height_rel", 0.0) * 0.2
             stage_mul = 0.0
         elif global_step < st2:
             stage_mul = 0.35
             w["lambda_point"] = w["lambda_point"] * stage_mul
             w["lambda_point_pair"] = w.get("lambda_point_pair", 0.0) * 0.6
+            w["lambda_height_rel"] = w.get("lambda_height_rel", 0.0) * 0.6
             w["lambda_center"] = w["lambda_center"] * stage_mul
             w["lambda_opacity_reg"] = w["lambda_opacity_reg"] * stage_mul
             w["lambda_scale_reg"] = w["lambda_scale_reg"] * stage_mul
@@ -119,6 +124,8 @@ class LossWeightScheduler:
             w["lambda_render_point"] = w["lambda_render_point"] * stage_mul
         else:
             stage_mul = 1.0
+        if global_step >= int(self.height_abs_keep_steps):
+            w["lambda_height"] = 0.0
         return w, {"schedule_render_multiplier": mul, "schedule_detail_stage_multiplier": stage_mul}
 
 
@@ -159,6 +166,7 @@ class RPCAnySplatTrainingObjective:
         height_beta: float = 1.0,
         point_beta: float = 1.0,
         point_pair_cfg: PointPairwiseLossCfg | None = None,
+        height_pair_cfg: HeightPairwiseLossCfg | None = None,
         feature_nce_cfg: FeatureInfoNCELossCfg | None = None,
         scale_min: float = 1e-4,
         scale_max: float = 0.5,
@@ -174,6 +182,7 @@ class RPCAnySplatTrainingObjective:
         self.height_loss = HeightHuberLoss(beta=height_beta)
         self.point_loss = PointMapLoss(geometry_ops=geometry_ops, beta=point_beta)
         self.point_pair_loss = PointPairwiseConsistencyLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
+        self.height_pair_loss = HeightPairwiseRelativeLoss(geometry_ops=geometry_ops, cfg=height_pair_cfg or HeightPairwiseLossCfg())
         self.feature_nce_loss = FeatureInfoNCELoss(geometry_ops=geometry_ops, cfg=feature_nce_cfg or FeatureInfoNCELossCfg())
 
         self.center_loss = CenterConsistencyLoss()
@@ -309,6 +318,7 @@ class RPCAnySplatTrainingObjective:
 
         l_p, p_p, aux_point = self.point_loss(outputs["point_abs"], outputs["point_anchor"], batch, return_aux=False)
         l_ppair, p_ppair, aux_ppair = self.point_pair_loss(outputs["point_abs"], batch)
+        l_hrel, p_hrel, aux_hrel = self.height_pair_loss(outputs["height_abs"], batch)
         l_nce, p_nce, aux_nce = self.feature_nce_loss(
             patch_tokens_proj=outputs["patch_tokens_nce_proj"],
             patch_valid_mask=outputs["patch_valid_mask"],
@@ -362,6 +372,7 @@ class RPCAnySplatTrainingObjective:
             + weights["lambda_affine_reg"] * l_aff_reg
             + weights.get("lambda_affine_ref", 1.0) * l_aff_ref
             + weights["lambda_height"] * l_h
+            + weights.get("lambda_height_rel", 0.0) * l_hrel
             + weights["lambda_point"] * l_p
             + weights.get("lambda_point_pair", 0.0) * l_ppair
             + weights.get("lambda_feature_nce", 0.0) * l_nce
@@ -379,6 +390,7 @@ class RPCAnySplatTrainingObjective:
             "loss_affine_reg": l_aff_reg,
             "loss_affine_ref": l_aff_ref,
             "loss_height": l_h,
+            "loss_height_rel": l_hrel,
             "loss_point": l_p,
             "loss_point_pair": l_ppair,
             "loss_feature_nce": l_nce,
@@ -392,6 +404,10 @@ class RPCAnySplatTrainingObjective:
             "metric_ref_affine_identity_l2": p_aff_ref.get("ref_affine_identity_l2", zero),
             "metric_height_rmse": p_h.get("height_rmse", zero),
             "metric_height_mae": p_h.get("height_mae", zero),
+            "metric_height_rel_consistency": p_hrel.get("height_rel_consistency", zero),
+            "metric_height_rel_cycle_px": p_hrel.get("height_rel_cycle_px", zero),
+            "metric_height_rel_cycle_px_rmse": p_hrel.get("height_rel_cycle_px_rmse", zero),
+            "metric_height_rel_pairs_used": p_hrel.get("height_rel_num_pairs_used", zero),
             "metric_point_xyz_rmse": p_p.get("point_xyz_rmse", zero),
             "metric_point_xy_rmse": p_p.get("point_xy_rmse", zero),
             "metric_point_z_rmse": p_p.get("point_z_rmse", zero),
@@ -422,6 +438,7 @@ class RPCAnySplatTrainingObjective:
             "weight_affine_reg": weights["lambda_affine_reg"],
             "weight_affine_ref": weights.get("lambda_affine_ref", 1.0),
             "weight_height": weights["lambda_height"],
+            "weight_height_rel": weights.get("lambda_height_rel", 0.0),
             "weight_point": weights["lambda_point"],
             "weight_point_pair": weights.get("lambda_point_pair", 0.0),
             "weight_feature_nce": weights.get("lambda_feature_nce", 0.0),
@@ -439,6 +456,7 @@ class RPCAnySplatTrainingObjective:
         }
         aux_dict.update(aux_point)
         aux_dict.update(aux_ppair)
+        aux_dict.update(aux_hrel)
         aux_dict.update(aux_nce)
 
         return total, self._to_float_scalar_dict(scalar_dict), aux_dict
