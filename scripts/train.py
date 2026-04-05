@@ -109,6 +109,7 @@ def build_renderer(cfg: dict[str, Any], geometry_ops: Any) -> RPCGaussianRendere
 def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTrainingObjective:
     from loss.affine_loss import AffineGridLossCfg, AffinePairwiseGeometryLossCfg
     from loss.feature_nce_loss import FeatureInfoNCELossCfg
+    from loss.height_pair_loss import HeightPairwiseLossCfg
     from loss.point_pair_loss import PointPairwiseLossCfg
     from loss.total_loss import LossWeightScheduler, RPCAnySplatTrainingObjective
 
@@ -127,12 +128,14 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
         render_ramp_steps=int(lcfg.get("render_ramp_steps", 2000)),
         stage1_steps=int(lcfg.get("stage1_steps", 5000)),
         stage2_steps=int(lcfg.get("stage2_steps", 20000)),
+        height_abs_keep_steps=int(lcfg.get("height_abs_keep_steps", 5000)),
         base_weights={
             "lambda_affine_grid": float(lcfg.get("lambda_affine_grid", 1.0)),
             "lambda_affine_pair": float(lcfg.get("lambda_affine_pair", 1.0)),
             "lambda_affine_reg": float(lcfg.get("lambda_affine_reg", 0.1)),
             "lambda_affine_ref": float(lcfg.get("lambda_affine_ref", 0.1)),
             "lambda_height": float(lcfg.get("lambda_height", 1.0)),
+            "lambda_height_rel": float(lcfg.get("lambda_height_rel", 0.0)),
             "lambda_point": float(lcfg.get("lambda_point", 1.0)),
             "lambda_point_pair": float(lcfg.get("lambda_point_pair", 0.2)),
             "lambda_feature_nce": float(lcfg.get("lambda_feature_nce", 0.1)),
@@ -156,11 +159,20 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
         grid_h=int(lcfg.get("point_pair_grid_h", 64)),
         grid_w=int(lcfg.get("point_pair_grid_w", 64)),
     )
+    height_pair_cfg = HeightPairwiseLossCfg(
+        anchors_per_pair=int(lcfg.get("height_rel_anchors_per_pair", lcfg.get("anchors_per_pair", 256))),
+        max_pairs=lcfg.get("height_rel_max_pairs", lcfg.get("max_pairs", None)),
+        sample_from_valid_only=bool(lcfg.get("height_rel_sample_from_valid_only", lcfg.get("sample_from_valid_only", True))),
+        beta=float(lcfg.get("height_rel_beta", 1.0)),
+        lambda_consistency=float(lcfg.get("lambda_height_rel_consistency", 1.0)),
+        lambda_cycle=float(lcfg.get("lambda_height_rel_cycle", 1.0)),
+    )
     return RPCAnySplatTrainingObjective(
         geometry_ops=geometry_ops,
         affine_grid_cfg=grid_cfg,
         affine_pair_cfg=pair_cfg,
         point_pair_cfg=point_pair_cfg,
+        height_pair_cfg=height_pair_cfg,
         feature_nce_cfg=feature_nce_cfg,
         height_beta=float(lcfg.get("height_beta", 1.0)),
         point_beta=float(lcfg.get("point_beta", 1.0)),
