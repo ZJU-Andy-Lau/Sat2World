@@ -323,6 +323,7 @@ class RPCGeometryOps:
         h_abs = abs(float(h_ref))
         int_part = int(h_abs)
         frac_part = h_abs - float(int_part)
+        sym = h_ref / h_abs
 
         thousands = (int_part // 1000) % 10
         hundreds = (int_part // 100) % 10
@@ -331,11 +332,11 @@ class RPCGeometryOps:
 
         return torch.tensor(
             [
-                float(thousands) / 9.0,
-                float(hundreds) / 9.0,
-                float(tens) / 9.0,
-                float(ones) / 9.0,
-                float(frac_part),
+                sym * float(thousands) / 9.0,
+                sym * float(hundreds) / 9.0,
+                sym * float(tens) / 9.0,
+                sym * float(ones) / 9.0,
+                sym * float(frac_part),
             ],
             dtype=self.rpc_dtype,
             device=device,
