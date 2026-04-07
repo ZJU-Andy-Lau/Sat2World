@@ -240,6 +240,7 @@ class Sat2World(nn.Module):
             fused_tok,
             patch_valid_mask,
             ref_view_idx=ref_view_idx,
+            patch_grid_hw=(gh, gw),
             return_all_layers=True,
         )
         patch_tokens_final = enc_out["patch_tokens"]
