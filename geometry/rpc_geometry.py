@@ -323,7 +323,7 @@ class RPCGeometryOps:
         h_abs = abs(float(h_ref))
         int_part = int(h_abs)
         frac_part = h_abs - float(int_part)
-        sym = h_ref / h_abs
+        sym = 0.0 if h_abs < 1e-8 else (h_ref / h_abs)
 
         thousands = (int_part // 1000) % 10
         hundreds = (int_part // 100) % 10
