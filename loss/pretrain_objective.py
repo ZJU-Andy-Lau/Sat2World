@@ -22,6 +22,7 @@ from loss.affine_loss import (
 from loss.feature_nce_loss import FeatureInfoNCELoss, FeatureInfoNCELossCfg
 from loss.height_loss import HeightHuberLoss
 from loss.height_pair_loss import HeightPairwiseLossCfg, HeightPairwiseRelativeLoss
+from loss.normal_loss import PointNormalLoss, PointNormalLossCfg
 from loss.point_pair_loss import PointPairwiseConsistencyLoss, PointPairwiseLossCfg
 from loss.point_loss import PointMapLoss
 
@@ -38,6 +39,8 @@ class GeometryPretrainWeightCfg:
     lambda_height_rel: float = 0.0
     lambda_point: float = 1.0
     lambda_point_pair: float = 0.1
+    lambda_normal_height: float = 0.2
+    lambda_normal_point: float = 0.2
     lambda_feature_nce: float = 0.1
     height_abs_keep_steps: int = 5000
 
@@ -63,6 +66,7 @@ class GeometryPretrainObjective:
         point_pair_cfg: PointPairwiseLossCfg | None = None,
         height_pair_cfg: HeightPairwiseLossCfg | None = None,
         feature_nce_cfg: FeatureInfoNCELossCfg | None = None,
+        normal_cfg: PointNormalLossCfg | None = None,
         height_beta: float = 1.0,
         point_beta: float = 1.0,
         weights: GeometryPretrainWeightCfg | None = None,
@@ -77,6 +81,7 @@ class GeometryPretrainObjective:
         self.point_pair_loss = PointPairwiseConsistencyLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.height_pair_loss = HeightPairwiseRelativeLoss(geometry_ops=geometry_ops, cfg=height_pair_cfg or HeightPairwiseLossCfg())
         self.feature_nce_loss = FeatureInfoNCELoss(geometry_ops=geometry_ops, cfg=feature_nce_cfg or FeatureInfoNCELossCfg())
+        self.normal_loss = PointNormalLoss(geometry_ops=geometry_ops, cfg=normal_cfg or PointNormalLossCfg())
         self.weights = weights or GeometryPretrainWeightCfg()
 
     def _require_keys(self, data: dict[str, Any], keys: list[str], name: str) -> None:
@@ -159,6 +164,11 @@ class GeometryPretrainObjective:
 
         l_p, p_p, aux_point = self.point_loss(outputs["point_abs"], outputs["point_anchor"], batch, return_aux=False)
         l_ppair, p_ppair, aux_ppair = self.point_pair_loss(outputs["point_abs"], batch)
+        l_nh, l_np, p_norm, aux_norm = self.normal_loss(
+            height_abs=outputs["height_abs"],
+            point_abs=outputs["point_abs"],
+            batch=batch,
+        )
         l_hrel, p_hrel, aux_hrel = self.height_pair_loss(outputs["height_abs"], batch)
         l_nce, p_nce, aux_nce = self.feature_nce_loss(
             patch_tokens_proj=outputs["patch_tokens_nce_proj"],
@@ -180,6 +190,8 @@ class GeometryPretrainObjective:
             + w.lambda_height_rel * l_hrel
             + w.lambda_point * l_p
             + w.lambda_point_pair * l_ppair
+            + w.lambda_normal_height * l_nh
+            + w.lambda_normal_point * l_np
             + w.lambda_feature_nce * l_nce
         )
 
@@ -194,6 +206,8 @@ class GeometryPretrainObjective:
             "loss_height_rel": l_hrel,
             "loss_point": l_p,
             "loss_point_pair": l_ppair,
+            "loss_normal_height": l_nh,
+            "loss_normal_point": l_np,
             "loss_feature_nce": l_nce,
             "metric_affine_grid_error_px_mean": p_aff_grid.get("affine_grid_error_px_mean", zero),
             "metric_affine_pair_error_px_mean": p_aff_pair.get("affine_pair_error_px_mean", zero),
@@ -210,6 +224,11 @@ class GeometryPretrainObjective:
             "metric_point_anchor_displacement_mean": p_p.get("point_anchor_displacement_mean", zero),
             "metric_point_pair_dist_mean": p_ppair.get("point_pair_dist_mean", zero),
             "metric_point_pair_num_pairs_used": p_ppair.get("point_pair_num_pairs_used", zero),
+            "metric_normal_h_cos_mean": p_norm.get("normal_h_cos_mean", zero),
+            "metric_normal_h_ang_deg_mean": p_norm.get("normal_h_ang_deg_mean", zero),
+            "metric_normal_p_cos_mean": p_norm.get("normal_p_cos_mean", zero),
+            "metric_normal_p_ang_deg_mean": p_norm.get("normal_p_ang_deg_mean", zero),
+            "metric_normal_valid_ratio": p_norm.get("normal_valid_ratio", zero),
             "weight_affine_grid": float(w.lambda_affine_grid),
             "weight_affine_pair": float(w.lambda_affine_pair),
             "weight_affine_reg": float(w.lambda_affine_reg),
@@ -218,6 +237,8 @@ class GeometryPretrainObjective:
             "weight_height_rel": float(w.lambda_height_rel),
             "weight_point": float(w.lambda_point),
             "weight_point_pair": float(w.lambda_point_pair),
+            "weight_normal_height": float(w.lambda_normal_height),
+            "weight_normal_point": float(w.lambda_normal_point),
             "weight_feature_nce": float(w.lambda_feature_nce),
             # 显式输出关闭项，便于日志检查
             "weight_center": 0.0,
@@ -239,6 +260,7 @@ class GeometryPretrainObjective:
         }
         aux_dict.update(aux_point)
         aux_dict.update(aux_ppair)
+        aux_dict.update(aux_norm)
         aux_dict.update(aux_hrel)
         aux_dict.update(aux_nce)
         scalar_dict["metric_feature_nce_valid_pairs"] = p_nce.get("feature_nce_valid_pairs", zero)

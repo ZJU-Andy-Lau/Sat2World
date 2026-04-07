@@ -69,6 +69,7 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
 
 def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTrainingObjective:
     from loss.affine_loss import AffineGridLossCfg, AffinePairwiseGeometryLossCfg
+    from loss.normal_loss import PointNormalLossCfg
     from loss.total_loss import LossWeightScheduler, RPCAnySplatTrainingObjective
 
     lcfg = cfg.get("loss", {})
@@ -85,10 +86,18 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
         warmup_steps_geom_only=int(lcfg.get("warmup_steps_geom_only", 1000)),
         render_ramp_steps=int(lcfg.get("render_ramp_steps", 2000)),
     )
+    normal_cfg = PointNormalLossCfg(
+        w_cos=float(lcfg.get("normal_w_cos", 1.0)),
+        w_l1=float(lcfg.get("normal_w_l1", 0.5)),
+        eps=float(lcfg.get("normal_eps", 1e-6)),
+        sign_invariant=bool(lcfg.get("normal_sign_invariant", True)),
+        detach_gt=bool(lcfg.get("normal_detach_gt", True)),
+    )
     return RPCAnySplatTrainingObjective(
         geometry_ops=geometry_ops,
         affine_grid_cfg=grid_cfg,
         affine_pair_cfg=pair_cfg,
+        normal_cfg=normal_cfg,
         height_beta=float(lcfg.get("height_beta", 1.0)),
         point_beta=float(lcfg.get("point_beta", 1.0)),
         scale_min=float(lcfg.get("scale_min", 1e-4)),

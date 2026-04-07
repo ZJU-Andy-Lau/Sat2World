@@ -64,6 +64,7 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> Any:
     from loss.affine_loss import AffineGridLossCfg, AffinePairwiseGeometryLossCfg
     from loss.feature_nce_loss import FeatureInfoNCELossCfg
     from loss.height_pair_loss import HeightPairwiseLossCfg
+    from loss.normal_loss import PointNormalLossCfg
     from loss.point_pair_loss import PointPairwiseLossCfg
     from loss.pretrain_objective import GeometryPretrainObjective, GeometryPretrainWeightCfg
 
@@ -86,6 +87,8 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> Any:
         lambda_height_rel=float(lcfg.get("lambda_height_rel", 0.0)),
         lambda_point=float(lcfg.get("lambda_point", 1.0)),
         lambda_point_pair=float(lcfg.get("lambda_point_pair", 0.1)),
+        lambda_normal_height=float(lcfg.get("lambda_normal_height", 0.2)),
+        lambda_normal_point=float(lcfg.get("lambda_normal_point", 0.2)),
         lambda_feature_nce=float(lcfg.get("lambda_feature_nce", 0.1)),
         height_abs_keep_steps=int(lcfg.get("height_abs_keep_steps", 5000)),
     )
@@ -96,6 +99,13 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> Any:
     feature_nce_cfg = FeatureInfoNCELossCfg(
         temperature=float(lcfg.get("feature_nce_temperature", 0.1)),
         max_pairs=int(lcfg.get("feature_nce_max_pairs", 4096)),
+    )
+    normal_cfg = PointNormalLossCfg(
+        w_cos=float(lcfg.get("normal_w_cos", 1.0)),
+        w_l1=float(lcfg.get("normal_w_l1", 0.5)),
+        eps=float(lcfg.get("normal_eps", 1e-6)),
+        sign_invariant=bool(lcfg.get("normal_sign_invariant", True)),
+        detach_gt=bool(lcfg.get("normal_detach_gt", True)),
     )
     height_pair_cfg = HeightPairwiseLossCfg(
         anchors_per_pair=int(lcfg.get("height_rel_anchors_per_pair", lcfg.get("anchors_per_pair", 256))),
@@ -112,6 +122,7 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> Any:
         point_pair_cfg=point_pair_cfg,
         height_pair_cfg=height_pair_cfg,
         feature_nce_cfg=feature_nce_cfg,
+        normal_cfg=normal_cfg,
         height_beta=float(lcfg.get("height_beta", 1.0)),
         point_beta=float(lcfg.get("point_beta", 1.0)),
         weights=weights,

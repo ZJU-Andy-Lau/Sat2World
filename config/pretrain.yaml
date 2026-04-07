@@ -141,7 +141,14 @@ loss:
   height_rel_sample_from_valid_only: true
   lambda_point: 1.0
   lambda_point_pair: 0.2
+  lambda_normal_height: 0.2
+  lambda_normal_point: 0.2
   lambda_feature_nce: 0.1
+  normal_w_cos: 1.0
+  normal_w_l1: 0.5
+  normal_eps: 1.0e-6
+  normal_sign_invariant: true
+  normal_detach_gt: true
   feature_nce_temperature: 0.1
   feature_nce_max_pairs: 4096
   point_pair_grid_h: 64
