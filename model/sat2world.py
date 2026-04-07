@@ -148,23 +148,29 @@ class Sat2World(nn.Module):
         self.runtime_global_step: int = 0
         self.runtime_mode: str = "train"
         self.runtime_pretrain_geometry_only: bool = False
+        self._set_gaussian_trainable(bool(self.cfg.enable_gaussian_branch))
 
     def set_runtime_context(self, *, global_step: int, mode: str) -> None:
         self.runtime_global_step = int(global_step)
         self.runtime_mode = str(mode)
 
+    def _set_gaussian_trainable(self, trainable: bool) -> None:
+        trainable = bool(trainable)
+        self.gaussian_adapter.requires_grad_(trainable)
+        self.gaussian_head.requires_grad_(trainable)
+
     def set_pretrain_geometry_only(self, enabled: bool) -> None:
         enabled = bool(enabled)
         self.runtime_pretrain_geometry_only = enabled
 
-        # 预训练几何模式下冻结高斯头参数，避免 DDP(find_unused_parameters=False)
+        # 预训练几何模式下冻结高斯分支参数，避免 DDP(find_unused_parameters=False)
         # 因分支跳过而触发“unused parameters”归约错误。
         if enabled:
-            self.gaussian_head.requires_grad_(False)
+            self._set_gaussian_trainable(False)
         else:
             # 仅在配置允许高斯分支时恢复可训练。
             if bool(self.cfg.enable_gaussian_branch):
-                self.gaussian_head.requires_grad_(True)
+                self._set_gaussian_trainable(True)
 
     def _current_center_downsample(self) -> int:
         steps = tuple(int(x) for x in self.cfg.center_downsample_stage_steps)

@@ -201,6 +201,13 @@ def main() -> None:
     train_loader, val_loader = build_dataloaders(cfg, distributed=dist_state["distributed"])
     _startup_log("dataloaders_built", rank=int(dist_state["rank"]))
 
+    # 预训练阶段永久跳过高斯分支（同时避免分支参数进入优化与 DDP 归约路径）。
+    model_cfg = cfg.get("model", {})
+    if bool(model_cfg.get("enable_gaussian_branch", True)):
+        _startup_log("force_disable_gaussian_branch_for_pretrain", rank=int(dist_state["rank"]))
+    model_cfg["enable_gaussian_branch"] = False
+    cfg["model"] = model_cfg
+
     model = build_model(cfg).to(device)
     if hasattr(model, "set_pretrain_geometry_only"):
         model.set_pretrain_geometry_only(True)
