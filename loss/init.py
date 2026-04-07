@@ -6,6 +6,7 @@ loss 目录导出入口。
 from loss.affine_loss import AffineGridLoss, AffineLinearRegularization, AffinePairwiseGeometryLoss, RefAffineIdentityLoss
 from loss.common import masked_huber_loss, masked_l1_loss, masked_l2_loss, psnr_from_mse, softmax_entropy, ssim_map
 from loss.height_loss import HeightHuberLoss
+from loss.normal_loss import PointNormalLoss, PointNormalLossCfg
 from loss.point_loss import PointMapLoss
 from loss.point_pair_loss import PointPairwiseConsistencyLoss, PointPairwiseLossCfg, point_map_to_metric
 from loss.regularization_loss import CenterConsistencyLoss, CoderProbe, GaussianRegularizationLoss
@@ -24,6 +25,8 @@ __all__ = [
     "AffineLinearRegularization",
     "RefAffineIdentityLoss",
     "HeightHuberLoss",
+    "PointNormalLoss",
+    "PointNormalLossCfg",
     "PointMapLoss",
     "PointPairwiseConsistencyLoss",
     "PointPairwiseLossCfg",

@@ -27,6 +27,7 @@ from loss.affine_loss import (
 from loss.feature_nce_loss import FeatureInfoNCELoss, FeatureInfoNCELossCfg
 from loss.height_loss import HeightHuberLoss
 from loss.height_pair_loss import HeightPairwiseLossCfg, HeightPairwiseRelativeLoss
+from loss.normal_loss import PointNormalLoss, PointNormalLossCfg
 from loss.point_loss import PointMapLoss
 from loss.point_pair_loss import PointPairwiseConsistencyLoss, PointPairwiseLossCfg
 from loss.regularization_loss import CenterConsistencyLoss, CoderProbe, GaussianRegularizationLoss
@@ -60,6 +61,8 @@ class LossWeightScheduler:
             "lambda_height_rel": 0.0,
             "lambda_point": 1.0,
             "lambda_point_pair": 0.2,
+            "lambda_normal_height": 0.2,
+            "lambda_normal_point": 0.2,
             "lambda_feature_nce": 0.1,
             "lambda_center": 0.2,
             "lambda_opacity_reg": 0.01,
@@ -168,6 +171,7 @@ class RPCAnySplatTrainingObjective:
         point_pair_cfg: PointPairwiseLossCfg | None = None,
         height_pair_cfg: HeightPairwiseLossCfg | None = None,
         feature_nce_cfg: FeatureInfoNCELossCfg | None = None,
+        normal_cfg: PointNormalLossCfg | None = None,
         scale_min: float = 1e-4,
         scale_max: float = 0.5,
         scheduler: LossWeightScheduler | None = None,
@@ -184,6 +188,7 @@ class RPCAnySplatTrainingObjective:
         self.point_pair_loss = PointPairwiseConsistencyLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.height_pair_loss = HeightPairwiseRelativeLoss(geometry_ops=geometry_ops, cfg=height_pair_cfg or HeightPairwiseLossCfg())
         self.feature_nce_loss = FeatureInfoNCELoss(geometry_ops=geometry_ops, cfg=feature_nce_cfg or FeatureInfoNCELossCfg())
+        self.normal_loss = PointNormalLoss(geometry_ops=geometry_ops, cfg=normal_cfg or PointNormalLossCfg())
 
         self.center_loss = CenterConsistencyLoss()
         self.gaussian_reg = GaussianRegularizationLoss(scale_min=scale_min, scale_max=scale_max)
@@ -318,6 +323,11 @@ class RPCAnySplatTrainingObjective:
 
         l_p, p_p, aux_point = self.point_loss(outputs["point_abs"], outputs["point_anchor"], batch, return_aux=False)
         l_ppair, p_ppair, aux_ppair = self.point_pair_loss(outputs["point_abs"], batch)
+        l_nh, l_np, p_norm, aux_norm = self.normal_loss(
+            height_abs=outputs["height_abs"],
+            point_abs=outputs["point_abs"],
+            batch=batch,
+        )
         l_hrel, p_hrel, aux_hrel = self.height_pair_loss(outputs["height_abs"], batch)
         l_nce, p_nce, aux_nce = self.feature_nce_loss(
             patch_tokens_proj=outputs["patch_tokens_nce_proj"],
@@ -375,6 +385,8 @@ class RPCAnySplatTrainingObjective:
             + weights.get("lambda_height_rel", 0.0) * l_hrel
             + weights["lambda_point"] * l_p
             + weights.get("lambda_point_pair", 0.0) * l_ppair
+            + weights.get("lambda_normal_height", 0.0) * l_nh
+            + weights.get("lambda_normal_point", 0.0) * l_np
             + weights.get("lambda_feature_nce", 0.0) * l_nce
             + weights["lambda_center"] * l_center
             + weights["lambda_opacity_reg"] * l_opacity
@@ -393,6 +405,8 @@ class RPCAnySplatTrainingObjective:
             "loss_height_rel": l_hrel,
             "loss_point": l_p,
             "loss_point_pair": l_ppair,
+            "loss_normal_height": l_nh,
+            "loss_normal_point": l_np,
             "loss_feature_nce": l_nce,
             "loss_center_consistency": l_center,
             "loss_gaussian_opacity_reg": l_opacity,
@@ -414,6 +428,11 @@ class RPCAnySplatTrainingObjective:
             "metric_point_anchor_displacement_mean": p_p.get("point_anchor_displacement_mean", zero),
             "metric_point_pair_dist_mean": p_ppair.get("point_pair_dist_mean", zero),
             "metric_point_pair_num_pairs_used": p_ppair.get("point_pair_num_pairs_used", zero),
+            "metric_normal_h_cos_mean": p_norm.get("normal_h_cos_mean", zero),
+            "metric_normal_h_ang_deg_mean": p_norm.get("normal_h_ang_deg_mean", zero),
+            "metric_normal_p_cos_mean": p_norm.get("normal_p_cos_mean", zero),
+            "metric_normal_p_ang_deg_mean": p_norm.get("normal_p_ang_deg_mean", zero),
+            "metric_normal_valid_ratio": p_norm.get("normal_valid_ratio", zero),
             "metric_feature_nce_valid_pairs": p_nce.get("feature_nce_valid_pairs", zero),
             "metric_feature_nce_acc_top1": p_nce.get("feature_nce_acc_top1", zero),
             "metric_center_dist_mean": p_center.get("center_dist_mean", zero),
@@ -441,6 +460,8 @@ class RPCAnySplatTrainingObjective:
             "weight_height_rel": weights.get("lambda_height_rel", 0.0),
             "weight_point": weights["lambda_point"],
             "weight_point_pair": weights.get("lambda_point_pair", 0.0),
+            "weight_normal_height": weights.get("lambda_normal_height", 0.0),
+            "weight_normal_point": weights.get("lambda_normal_point", 0.0),
             "weight_feature_nce": weights.get("lambda_feature_nce", 0.0),
             "weight_center": weights["lambda_center"],
             "weight_opacity_reg": weights["lambda_opacity_reg"],
@@ -456,6 +477,7 @@ class RPCAnySplatTrainingObjective:
         }
         aux_dict.update(aux_point)
         aux_dict.update(aux_ppair)
+        aux_dict.update(aux_norm)
         aux_dict.update(aux_hrel)
         aux_dict.update(aux_nce)
 

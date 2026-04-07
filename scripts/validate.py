@@ -42,6 +42,22 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
     scfg.encoder.num_layers = int(m.get("encoder_depth", scfg.encoder.num_layers))
     scfg.encoder.ffn_ratio = float(m.get("encoder_ffn_ratio", scfg.encoder.ffn_ratio))
     scfg.encoder.dropout = float(m.get("encoder_dropout", scfg.encoder.dropout))
+    scfg.encoder.num_scene_tokens = int(m.get("encoder_num_scene_tokens", scfg.encoder.num_scene_tokens))
+    scfg.encoder.aa_order = tuple(m.get("encoder_aa_order", list(scfg.encoder.aa_order)))
+    scfg.encoder.aa_block_size = int(m.get("encoder_aa_block_size", scfg.encoder.aa_block_size))
+    scfg.encoder.qkv_bias = bool(m.get("encoder_qkv_bias", scfg.encoder.qkv_bias))
+    scfg.encoder.proj_bias = bool(m.get("encoder_proj_bias", scfg.encoder.proj_bias))
+    scfg.encoder.ffn_bias = bool(m.get("encoder_ffn_bias", scfg.encoder.ffn_bias))
+    scfg.encoder.qk_norm = bool(m.get("encoder_qk_norm", scfg.encoder.qk_norm))
+    scfg.encoder.fused_attn = bool(m.get("encoder_fused_attn", scfg.encoder.fused_attn))
+    scfg.encoder.rope_freq = float(m.get("encoder_rope_freq", scfg.encoder.rope_freq))
+    scfg.encoder.drop_path_rate = float(m.get("encoder_drop_path_rate", scfg.encoder.drop_path_rate))
+    scfg.encoder.init_values = float(m.get("encoder_layerscale_init_values", scfg.encoder.init_values))
+    scfg.intermediate_layer_idx = tuple(int(x) for x in m.get("intermediate_layer_idx", list(scfg.intermediate_layer_idx)))
+    scfg.dense_pos_embed = bool(m.get("dense_pos_embed", scfg.dense_pos_embed))
+    scfg.dense_down_ratio = int(m.get("dense_down_ratio", scfg.dense_down_ratio))
+    scfg.dense_frames_chunk_size = int(m.get("dense_frames_chunk_size", scfg.dense_frames_chunk_size))
+    scfg.task_adapter_depth = int(m.get("task_adapter_depth", scfg.task_adapter_depth))
     scfg.affine_head.diag_scale = float(m.get("affine_diag_scale", scfg.affine_head.diag_scale))
     scfg.affine_head.offdiag_scale = float(m.get("affine_offdiag_scale", scfg.affine_head.offdiag_scale))
     scfg.affine_head.trans_scale = float(m.get("affine_trans_scale", scfg.affine_head.trans_scale))
@@ -53,6 +69,7 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
 
 def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTrainingObjective:
     from loss.affine_loss import AffineGridLossCfg, AffinePairwiseGeometryLossCfg
+    from loss.normal_loss import PointNormalLossCfg
     from loss.total_loss import LossWeightScheduler, RPCAnySplatTrainingObjective
 
     lcfg = cfg.get("loss", {})
@@ -69,10 +86,18 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
         warmup_steps_geom_only=int(lcfg.get("warmup_steps_geom_only", 1000)),
         render_ramp_steps=int(lcfg.get("render_ramp_steps", 2000)),
     )
+    normal_cfg = PointNormalLossCfg(
+        w_cos=float(lcfg.get("normal_w_cos", 1.0)),
+        w_l1=float(lcfg.get("normal_w_l1", 0.5)),
+        eps=float(lcfg.get("normal_eps", 1e-6)),
+        sign_invariant=bool(lcfg.get("normal_sign_invariant", True)),
+        detach_gt=bool(lcfg.get("normal_detach_gt", True)),
+    )
     return RPCAnySplatTrainingObjective(
         geometry_ops=geometry_ops,
         affine_grid_cfg=grid_cfg,
         affine_pair_cfg=pair_cfg,
+        normal_cfg=normal_cfg,
         height_beta=float(lcfg.get("height_beta", 1.0)),
         point_beta=float(lcfg.get("point_beta", 1.0)),
         scale_min=float(lcfg.get("scale_min", 1e-4)),
