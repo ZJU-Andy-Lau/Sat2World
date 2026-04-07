@@ -2,14 +2,17 @@
 
 from .backbone import DINOv3Backbone, DINOv3BackboneCfg, GeometryTokenMLP, VisualGeometryFuser
 from .coders import HeightCoder, PointCoder, SymmetricBinCoderCfg, SymmetricBinScalarCoder
-from .encoder import AlternatingEncoder, AlternatingEncoderCfg, CrossViewBlock, IntraViewBlock
+from .encoder import AlternatingEncoder, AlternatingEncoderCfg
 from .heads import (
     AffineHead,
     AffineHeadCfg,
+    DPTDenseDecoder,
+    DPTDenseDecoderCfg,
     GaussianHead,
     HeightHead,
     PointHead,
     SharedDenseDecoder,
+    TaskAdapter,
 )
 from .sat2world import Sat2World, Sat2WorldCfg
 
@@ -20,13 +23,14 @@ __all__ = [
     "VisualGeometryFuser",
     "AlternatingEncoder",
     "AlternatingEncoderCfg",
-    "IntraViewBlock",
-    "CrossViewBlock",
     "SymmetricBinScalarCoder",
     "SymmetricBinCoderCfg",
     "HeightCoder",
     "PointCoder",
     "SharedDenseDecoder",
+    "DPTDenseDecoder",
+    "DPTDenseDecoderCfg",
+    "TaskAdapter",
     "AffineHead",
     "AffineHeadCfg",
     "HeightHead",

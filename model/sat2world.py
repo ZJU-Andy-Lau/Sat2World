@@ -36,10 +36,12 @@ from model.encoder import AlternatingEncoder, AlternatingEncoderCfg
 from model.heads import (
     AffineHead,
     AffineHeadCfg,
+    DPTDenseDecoder,
+    DPTDenseDecoderCfg,
     GaussianHead,
     HeightHead,
     PointHead,
-    SharedDenseDecoder,
+    TaskAdapter,
 )
 
 
@@ -66,8 +68,13 @@ class Sat2WorldCfg:
     center_downsample_factors: tuple[int, ...] = (4, 2, 1)
 
     enable_gaussian_branch: bool = True
+    intermediate_layer_idx: tuple[int, int, int, int] = (5, 11, 17, 23)
+    dense_pos_embed: bool = True
+    dense_down_ratio: int = 1
+    dense_frames_chunk_size: int = 8
+    task_adapter_depth: int = 2
     # 预训练中间层对比监督配置
-    nce_layer_index: int = 3  # 0-based，第 4 层
+    nce_layer_index: int = 5  # 0-based，第 6 层
     nce_projector_dim: int = 256
     nce_projector_hidden_dim: int = 512
 
@@ -104,7 +111,19 @@ class Sat2World(nn.Module):
             )
         self.encoder = AlternatingEncoder(encoder_cfg)
 
-        self.dense_decoder = SharedDenseDecoder(in_ch=self.backbone.embed_dim, out_ch=256)
+        self.dense_decoder = DPTDenseDecoder(
+            in_ch=self.backbone.embed_dim,
+            cfg=DPTDenseDecoderCfg(
+                out_ch=256,
+                intermediate_layer_idx=tuple(int(x) for x in cfg.intermediate_layer_idx),
+                pos_embed=bool(cfg.dense_pos_embed),
+                down_ratio=int(cfg.dense_down_ratio),
+                frames_chunk_size=int(cfg.dense_frames_chunk_size),
+            ),
+        )
+        self.height_adapter = TaskAdapter(ch=256, depth=int(cfg.task_adapter_depth))
+        self.point_adapter = TaskAdapter(ch=256, depth=int(cfg.task_adapter_depth))
+        self.gaussian_adapter = TaskAdapter(ch=256, depth=int(cfg.task_adapter_depth))
         self.affine_head = AffineHead(in_dim=self.backbone.embed_dim, hidden_dim=512, cfg=cfg.affine_head)
         self.height_head = HeightHead(in_ch=256, num_bins=cfg.height_bins)
         self.point_head = PointHead(in_ch=256, num_bins=cfg.point_bins)
@@ -129,23 +148,29 @@ class Sat2World(nn.Module):
         self.runtime_global_step: int = 0
         self.runtime_mode: str = "train"
         self.runtime_pretrain_geometry_only: bool = False
+        self._set_gaussian_trainable(bool(self.cfg.enable_gaussian_branch))
 
     def set_runtime_context(self, *, global_step: int, mode: str) -> None:
         self.runtime_global_step = int(global_step)
         self.runtime_mode = str(mode)
 
+    def _set_gaussian_trainable(self, trainable: bool) -> None:
+        trainable = bool(trainable)
+        self.gaussian_adapter.requires_grad_(trainable)
+        self.gaussian_head.requires_grad_(trainable)
+
     def set_pretrain_geometry_only(self, enabled: bool) -> None:
         enabled = bool(enabled)
         self.runtime_pretrain_geometry_only = enabled
 
-        # 预训练几何模式下冻结高斯头参数，避免 DDP(find_unused_parameters=False)
+        # 预训练几何模式下冻结高斯分支参数，避免 DDP(find_unused_parameters=False)
         # 因分支跳过而触发“unused parameters”归约错误。
         if enabled:
-            self.gaussian_head.requires_grad_(False)
+            self._set_gaussian_trainable(False)
         else:
             # 仅在配置允许高斯分支时恢复可训练。
             if bool(self.cfg.enable_gaussian_branch):
-                self.gaussian_head.requires_grad_(True)
+                self._set_gaussian_trainable(True)
 
     def _current_center_downsample(self) -> int:
         steps = tuple(int(x) for x in self.cfg.center_downsample_stage_steps)
@@ -240,6 +265,7 @@ class Sat2World(nn.Module):
             fused_tok,
             patch_valid_mask,
             ref_view_idx=ref_view_idx,
+            patch_grid_hw=(gh, gw),
             return_all_layers=True,
         )
         patch_tokens_final = enc_out["patch_tokens"]
@@ -259,13 +285,15 @@ class Sat2World(nn.Module):
         # 5) affine_pred 修正 rpc_init
         rpc_corrected = self.rpc_ops.apply_affine_correction_batch(rpc_init, affine_pred)
 
-        # 6) patch -> dense
-        patch_map_final = self.encoder.patch_tokens_to_map(patch_tokens_final, (gh, gw))
-        patch_map_final_bv = patch_map_final.view(b * v, self.backbone.embed_dim, gh, gw)
-        dense_feat = self.dense_decoder(patch_map_final_bv, images_bv)
+        # 6) patch layers -> DPT dense
+        dense_feat = self.dense_decoder(
+            patch_tokens_layers=patch_tokens_layers,
+            images=images_bv,
+            patch_grid_hw=(gh, gw),
+        )
 
         # 7) 高程分支
-        height_pred = self.height_head(dense_feat)
+        height_pred = self.height_head(self.height_adapter(dense_feat))
         h_logits = self._reshape_logits_to_bv(height_pred["logits"], b, v)
         h_fine = self._reshape_logits_to_bv(height_pred["fine"], b, v)
 
@@ -283,7 +311,7 @@ class Sat2World(nn.Module):
             scene_xy_scale=scene_xy_scale,
         )
 
-        point_pred = self.point_head(dense_feat)
+        point_pred = self.point_head(self.point_adapter(dense_feat))
         x_logits = self._reshape_logits_to_bv(point_pred["x_logits"], b, v)
         y_logits = self._reshape_logits_to_bv(point_pred["y_logits"], b, v)
         z_logits = self._reshape_logits_to_bv(point_pred["z_logits"], b, v)
@@ -333,7 +361,7 @@ class Sat2World(nn.Module):
 
         if gaussian_enabled:
             # 9) 高斯属性分支
-            gauss_pred = self.gaussian_head(dense_feat)
+            gauss_pred = self.gaussian_head(self.gaussian_adapter(dense_feat))
             gaussian_opacity = self._reshape_logits_to_bv(gauss_pred["opacity"], b, v)
             gaussian_scale = self._reshape_logits_to_bv(gauss_pred["scale"], b, v)
             gaussian_rotation = self._reshape_logits_to_bv(gauss_pred["rotation"], b, v)
