@@ -6,10 +6,13 @@ from .encoder import AlternatingEncoder, AlternatingEncoderCfg
 from .heads import (
     AffineHead,
     AffineHeadCfg,
+    DPTDenseDecoder,
+    DPTDenseDecoderCfg,
     GaussianHead,
     HeightHead,
     PointHead,
     SharedDenseDecoder,
+    TaskAdapter,
 )
 from .sat2world import Sat2World, Sat2WorldCfg
 
@@ -25,6 +28,9 @@ __all__ = [
     "HeightCoder",
     "PointCoder",
     "SharedDenseDecoder",
+    "DPTDenseDecoder",
+    "DPTDenseDecoderCfg",
+    "TaskAdapter",
     "AffineHead",
     "AffineHeadCfg",
     "HeightHead",
