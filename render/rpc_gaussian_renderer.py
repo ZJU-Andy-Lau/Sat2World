@@ -868,6 +868,16 @@ class RPCGaussianRenderer:
         scene_s = batch.get("scene_xy_scale", None)
         scene_ci = None if scene_c is None else scene_c[bi]
         scene_si = None if scene_s is None else scene_s[bi]
+        # 3DGS 渲染阶段统一使用“局部米制”中心：
+        # - 投影时仅使用 scene center 做平移恢复；
+        # - 不再对 x/y 施加 scene scale（等价于 scale=[1,1]）。
+        if scene_ci is not None:
+            if torch.is_tensor(scene_ci):
+                scene_si_render = torch.ones_like(scene_ci)
+            else:
+                scene_si_render = torch.tensor([1.0, 1.0], device=c.device, dtype=c.dtype)
+        else:
+            scene_si_render = scene_si
 
         mean_2d, cov_2d = project_gaussians_to_view(
             self.geometry_ops,
@@ -876,7 +886,7 @@ class RPCGaussianRenderer:
             pack["rotation"],
             pack["target_rpc"],
             scene_ci,
-            scene_si,
+            scene_si_render,
             self.cfg.eps_xy_fd,
             self.cfg.eps_h_fd,
             self.cfg.eps_cov,
@@ -889,7 +899,7 @@ class RPCGaussianRenderer:
             w,
             pack["target_height_ref"],
             scene_ci,
-            scene_si,
+            scene_si_render,
             delta_h_dir=self.cfg.depth_dir_delta_h,
         ).to(device=c.device, dtype=c.dtype)
         depth_proxy = compute_depth_proxy(c, view_dir)
