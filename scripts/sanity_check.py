@@ -188,8 +188,8 @@ def main() -> None:
             rpc_tgt,
             scene_center,
             scene_scale_render,
-            eps_xy=float(cfg.get("renderer", {}).get("eps_xy_fd", 1e-2)),
-            eps_h=float(cfg.get("renderer", {}).get("eps_h_fd", 1e-1)),
+            eps_xy_fd=float(cfg.get("renderer", {}).get("eps_xy_fd", 1e-2)),
+            eps_h_fd=float(cfg.get("renderer", {}).get("eps_h_fd", 1e-1)),
             eps_cov=float(cfg.get("renderer", {}).get("eps_cov", 1e-4)),
         )
         eig = torch.linalg.eigvalsh(cov_2d[0].to(torch.float64))

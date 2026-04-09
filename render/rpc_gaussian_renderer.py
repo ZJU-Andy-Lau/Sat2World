@@ -876,8 +876,13 @@ class RPCGaussianRenderer:
                 scene_si_render = torch.ones_like(scene_ci)
             else:
                 scene_si_render = torch.tensor([1.0, 1.0], device=c.device, dtype=c.dtype)
+        elif scene_si is not None:
+            if torch.is_tensor(scene_si):
+                scene_si_render = torch.ones_like(scene_si)
+            else:
+                scene_si_render = torch.tensor([1.0, 1.0], device=c.device, dtype=c.dtype)
         else:
-            scene_si_render = scene_si
+            scene_si_render = None
 
         mean_2d, cov_2d = project_gaussians_to_view(
             self.geometry_ops,
