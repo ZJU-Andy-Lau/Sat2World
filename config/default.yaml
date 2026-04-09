@@ -150,6 +150,10 @@ renderer:
   alpha_cov_thresh: 0.05
   render_compute_dtype: fp16
   deterministic_target_selection: true
+  target_selection_mode: random
+  target_selection_seed_offset: 0
+  render_backend: torch
+  cuda_backend_allow_fallback: true
 
 loss:
   warmup_steps_geom_only: 1000
