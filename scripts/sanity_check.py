@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
 from pathlib import Path
 import sys
 from typing import Any
@@ -105,6 +106,7 @@ def main() -> None:
 
     try:
         from scripts.train import build_model, build_renderer, build_objective
+        from render.rpc_gaussian_renderer import project_gaussians_to_view
 
         model = build_model(cfg).to(device)
         renderer = build_renderer(cfg, model.rpc_ops)
@@ -128,6 +130,75 @@ def main() -> None:
         render_outputs = renderer.render_paths(outputs, batch, mode="train")
         total_loss, scalar_dict, aux_dict = objective(outputs, batch, global_step=0, epoch=0, render_outputs=render_outputs, mode="train")
 
+        # ------------------------------------------------------------------
+        # 额外 3DGS 渲染几何正确性检查：
+        # 1) 选取 source 视图一个像素，用 rpc_gt + h_gt 构造物方点；
+        # 2) 投影到 target 视图，检查投影像素误差；
+        # 3) 用 0.5m 高斯尺度估计投影椭圆主轴像素长度，检查是否在合理范围。
+        # ------------------------------------------------------------------
+        bi, vi_src, vi_tgt = 0, 0, 1
+        h_img = int(batch["images"].shape[-2])
+        w_img = int(batch["images"].shape[-1])
+        line0 = torch.tensor([0.5 * (h_img - 1)], dtype=torch.float32, device=device)
+        samp0 = torch.tensor([0.5 * (w_img - 1)], dtype=torch.float32, device=device)
+        h0 = batch["height_gt"][bi, vi_src, 0, int(line0.item()), int(samp0.item())].view(1).to(torch.float32)
+
+        rpc_src = batch["rpc_gt"][bi][vi_src]
+        rpc_tgt = batch["rpc_gt"][bi][vi_tgt]
+        scene_center = batch["scene_xy_center"][bi]
+        # 3DGS 渲染语义：局部米制坐标，投影时只做 offset，不做 scale。
+        scene_scale_render = torch.ones_like(scene_center)
+
+        x_obj, y_obj = rpc_src.RPC_LINESAMP2XY(
+            line_in=line0.to(dtype=torch.double),
+            samp_in=samp0.to(dtype=torch.double),
+            h_in=h0.to(dtype=torch.double),
+            output_type="tensor",
+            xy_center=scene_center.to(dtype=torch.double),
+            xy_scale=scene_scale_render.to(dtype=torch.double),
+        )
+        line1, samp1 = rpc_tgt.RPC_XY2LINESAMP(
+            x_in=x_obj,
+            y_in=y_obj,
+            h_in=h0.to(dtype=torch.double),
+            output_type="tensor",
+            xy_center=scene_center.to(dtype=torch.double),
+            xy_scale=scene_scale_render.to(dtype=torch.double),
+        )
+        proj_err = torch.sqrt((line1 - line0.to(dtype=torch.double)).square() + (samp1 - samp0.to(dtype=torch.double)).square())
+        proj_err_px = float(proj_err.detach().cpu().item())
+        if not math.isfinite(proj_err_px) or proj_err_px > 0.5:
+            raise RuntimeError(f"3DGS projection sanity failed: reprojection error too large ({proj_err_px:.6f}px)")
+
+        centers_world = torch.stack(
+            [
+                x_obj.to(dtype=torch.float32),
+                y_obj.to(dtype=torch.float32),
+                h0.to(dtype=torch.float32),
+            ],
+            dim=-1,
+        ).view(1, 3)
+        scale_05m = torch.full((1, 3), 0.5, dtype=torch.float32, device=device)
+        rot_identity = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32, device=device)
+        mean_2d, cov_2d = project_gaussians_to_view(
+            model.rpc_ops,
+            centers_world,
+            scale_05m,
+            rot_identity,
+            rpc_tgt,
+            scene_center,
+            scene_scale_render,
+            eps_xy_fd=float(cfg.get("renderer", {}).get("eps_xy_fd", 1e-2)),
+            eps_h_fd=float(cfg.get("renderer", {}).get("eps_h_fd", 1e-1)),
+            eps_cov=float(cfg.get("renderer", {}).get("eps_cov", 1e-4)),
+        )
+        eig = torch.linalg.eigvalsh(cov_2d[0].to(torch.float64))
+        sigma_major_px = float(torch.sqrt(eig.max().clamp_min(0.0)).detach().cpu().item())
+        if not (0.0 <= sigma_major_px <= 3.0):
+            raise RuntimeError(
+                f"3DGS Gaussian size sanity failed: major-axis sigma={sigma_major_px:.6f}px out of [0,3]"
+            )
+
         total_loss.backward()
 
         print("[sanity_check] success")
@@ -135,6 +206,8 @@ def main() -> None:
         print("outputs keys:", sorted(list(outputs.keys()))[:12], "...")
         print("render rpc targets:", int(render_outputs["rpc"].get("num_targets", 0)))
         print("render point targets:", int(render_outputs["point"].get("num_targets", 0)))
+        print("rpc reprojection error(px):", proj_err_px)
+        print("projected gaussian major sigma(px):", sigma_major_px)
         print("scalar sample:", {k: scalar_dict[k] for k in list(scalar_dict.keys())[:8]})
         print("aux keys:", list(aux_dict.keys()))
     finally:
