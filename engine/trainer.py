@@ -182,7 +182,17 @@ class Trainer:
         if self.device_sanity_check:
             assert_tensor_tree_device(outputs, self.device, prefix="outputs")
         use_render = (mode == "train" and self.enable_render_train) or (mode != "train" and self.enable_render_val)
-        render_outputs = self.renderer.render_paths(outputs, batch_dev, mode=mode) if (self.renderer is not None and use_render) else None
+        render_outputs = (
+            self.renderer.render_paths(
+                outputs,
+                batch_dev,
+                mode=mode,
+                global_step=self.global_step,
+                epoch=self.epoch,
+            )
+            if (self.renderer is not None and use_render)
+            else None
+        )
         if self.device_sanity_check and render_outputs is not None:
             assert_tensor_tree_device(render_outputs, self.device, prefix="render_outputs")
         total_loss, scalar_dict, aux_dict = self.objective(outputs, batch_dev, self.global_step, self.epoch, render_outputs, mode)
