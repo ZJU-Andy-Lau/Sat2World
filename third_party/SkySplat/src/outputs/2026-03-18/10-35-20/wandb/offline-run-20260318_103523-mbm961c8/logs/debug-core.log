@@ -1,0 +1,7 @@
+{"time":"2026-03-18T10:35:23.680995721+08:00","level":"INFO","msg":"main: starting server","port-filename":"/tmp/tmpk7pr9yqv/port-2892510.txt","pid":2892510,"log-level":0,"disable-analytics":false,"shutdown-on-parent-exit":false}
+{"time":"2026-03-18T10:35:23.681815231+08:00","level":"INFO","msg":"Will exit if parent process dies.","ppid":2892510}
+{"time":"2026-03-18T10:35:23.681818351+08:00","level":"INFO","msg":"server is running","addr":{"IP":"127.0.0.1","Port":42863,"Zone":""}}
+{"time":"2026-03-18T10:35:23.867319611+08:00","level":"INFO","msg":"connection: ManageConnectionData: new connection created","id":"127.0.0.1:60064"}
+{"time":"2026-03-18T10:35:23.87682042+08:00","level":"INFO","msg":"handleInformInit: received","streamId":"mbm961c8","id":"127.0.0.1:60064"}
+{"time":"2026-03-18T10:35:23.999750213+08:00","level":"INFO","msg":"handleInformInit: stream started","streamId":"mbm961c8","id":"127.0.0.1:60064"}
+{"time":"2026-03-18T10:42:43.149679939+08:00","level":"INFO","msg":"received shutdown signal","signal":2}

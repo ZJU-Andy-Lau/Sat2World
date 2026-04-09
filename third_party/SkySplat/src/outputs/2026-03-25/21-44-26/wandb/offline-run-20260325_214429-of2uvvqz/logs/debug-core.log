@@ -1,0 +1,7 @@
+{"time":"2026-03-25T21:44:29.587568543+08:00","level":"INFO","msg":"main: starting server","port-filename":"/tmp/tmpar3dsc2b/port-2006692.txt","pid":2006692,"log-level":0,"disable-analytics":false,"shutdown-on-parent-exit":false}
+{"time":"2026-03-25T21:44:29.588504866+08:00","level":"INFO","msg":"Will exit if parent process dies.","ppid":2006692}
+{"time":"2026-03-25T21:44:29.588462267+08:00","level":"INFO","msg":"server is running","addr":{"IP":"127.0.0.1","Port":36565,"Zone":""}}
+{"time":"2026-03-25T21:44:29.774481009+08:00","level":"INFO","msg":"connection: ManageConnectionData: new connection created","id":"127.0.0.1:40224"}
+{"time":"2026-03-25T21:44:29.788199065+08:00","level":"INFO","msg":"handleInformInit: received","streamId":"of2uvvqz","id":"127.0.0.1:40224"}
+{"time":"2026-03-25T21:44:29.906768471+08:00","level":"INFO","msg":"handleInformInit: stream started","streamId":"of2uvvqz","id":"127.0.0.1:40224"}
+{"time":"2026-03-25T21:45:45.884268845+08:00","level":"INFO","msg":"received shutdown signal","signal":2}

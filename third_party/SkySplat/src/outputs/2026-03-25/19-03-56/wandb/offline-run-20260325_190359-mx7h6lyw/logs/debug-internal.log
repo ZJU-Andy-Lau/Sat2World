@@ -1,0 +1,15 @@
+{"time":"2026-03-25T19:03:59.310548333+08:00","level":"INFO","msg":"stream: starting","core version":"0.19.9","symlink path":"/data/huangxuejun/project/SkySplat++_Lightning/Ablation/SkySplat++_guidedHeight_hiera_RES/src/outputs/2026-03-25/19-03-56/wandb/offline-run-20260325_190359-mx7h6lyw/logs/debug-core.log"}
+{"time":"2026-03-25T19:03:59.420731523+08:00","level":"WARN","msg":"GraphQL client is nil, skipping feature loading"}
+{"time":"2026-03-25T19:03:59.420892554+08:00","level":"INFO","msg":"created new stream","id":"mx7h6lyw"}
+{"time":"2026-03-25T19:03:59.420917294+08:00","level":"INFO","msg":"stream: started","id":"mx7h6lyw"}
+{"time":"2026-03-25T19:03:59.420939344+08:00","level":"INFO","msg":"writer: Do: started","stream_id":"mx7h6lyw"}
+{"time":"2026-03-25T19:03:59.420968144+08:00","level":"INFO","msg":"handler: started","stream_id":"mx7h6lyw"}
+{"time":"2026-03-25T19:03:59.420943954+08:00","level":"INFO","msg":"sender: started","stream_id":"mx7h6lyw"}
+{"time":"2026-03-25T19:03:59.425013216+08:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2026-03-25T19:42:07.445218703+08:00","level":"INFO","msg":"stream: closing","id":"mx7h6lyw"}
+{"time":"2026-03-25T19:42:07.445472754+08:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2026-03-25T19:42:07.445566645+08:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2026-03-25T19:42:07.445681005+08:00","level":"INFO","msg":"handler: closed","stream_id":"mx7h6lyw"}
+{"time":"2026-03-25T19:42:07.445703576+08:00","level":"INFO","msg":"writer: Close: closed","stream_id":"mx7h6lyw"}
+{"time":"2026-03-25T19:42:07.445716446+08:00","level":"INFO","msg":"sender: closed","stream_id":"mx7h6lyw"}
+{"time":"2026-03-25T19:42:07.445923147+08:00","level":"INFO","msg":"stream: closed","id":"mx7h6lyw"}

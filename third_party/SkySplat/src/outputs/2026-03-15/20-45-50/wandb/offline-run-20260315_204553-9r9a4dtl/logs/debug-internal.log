@@ -1,0 +1,8 @@
+{"time":"2026-03-15T20:45:54.266638818+08:00","level":"INFO","msg":"stream: starting","core version":"0.19.9","symlink path":"/data/huangxuejun/project/SkySplat++_Lightning/Ablation/SkySplat++_guidedHeight_hiera_RES/src/outputs/2026-03-15/20-45-50/wandb/offline-run-20260315_204553-9r9a4dtl/logs/debug-core.log"}
+{"time":"2026-03-15T20:45:54.375986951+08:00","level":"WARN","msg":"GraphQL client is nil, skipping feature loading"}
+{"time":"2026-03-15T20:45:54.376135719+08:00","level":"INFO","msg":"created new stream","id":"9r9a4dtl"}
+{"time":"2026-03-15T20:45:54.376166639+08:00","level":"INFO","msg":"stream: started","id":"9r9a4dtl"}
+{"time":"2026-03-15T20:45:54.376203828+08:00","level":"INFO","msg":"writer: Do: started","stream_id":"9r9a4dtl"}
+{"time":"2026-03-15T20:45:54.376336646+08:00","level":"INFO","msg":"sender: started","stream_id":"9r9a4dtl"}
+{"time":"2026-03-15T20:45:54.376370916+08:00","level":"INFO","msg":"handler: started","stream_id":"9r9a4dtl"}
+{"time":"2026-03-15T20:45:54.381629033+08:00","level":"INFO","msg":"Starting system monitor"}
