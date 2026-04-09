@@ -13,8 +13,10 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image, ImageDraw, ImageFont
 try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:  # pragma: no cover
@@ -102,6 +104,37 @@ class TensorBoardMonitor:
             row = torch.cat([images_bvchw[bi, vi].clamp(0, 1) for vi in range(v)], dim=-1)
             rows.append(row)
         return torch.cat(rows, dim=-2)
+
+    def _draw_label_on_image(
+        self,
+        image_chw: torch.Tensor,
+        label: str,
+        *,
+        xy: tuple[int, int] = (4, 4),
+        text_color: tuple[int, int, int] = (255, 255, 255),
+        box_color: tuple[int, int, int] = (0, 0, 0),
+    ) -> torch.Tensor:
+        img = image_chw.detach().float().clamp(0, 1).cpu()
+        if img.ndim != 3 or img.shape[0] != 3:
+            raise ValueError("image_chw must be [3,H,W]")
+        h, w = int(img.shape[-2]), int(img.shape[-1])
+        pil = Image.fromarray((img.permute(1, 2, 0).numpy() * 255.0).astype("uint8"))
+        draw = ImageDraw.Draw(pil)
+        font = ImageFont.load_default()
+        x0, y0 = int(xy[0]), int(xy[1])
+        x0 = max(0, min(x0, max(w - 1, 0)))
+        y0 = max(0, min(y0, max(h - 1, 0)))
+        bbox = draw.textbbox((x0, y0), label, font=font)
+        pad = 2
+        bx0 = max(0, bbox[0] - pad)
+        by0 = max(0, bbox[1] - pad)
+        bx1 = min(w - 1, bbox[2] + pad)
+        by1 = min(h - 1, bbox[3] + pad)
+        draw.rectangle([bx0, by0, bx1, by1], fill=box_color)
+        draw.text((x0, y0), label, fill=text_color, font=font)
+        out = torch.from_numpy(np.array(pil))
+        out = out.permute(2, 0, 1).to(torch.float32) / 255.0
+        return out.clamp(0, 1)
 
     def _invert_affine_2x3(self, affine_2x3: torch.Tensor) -> torch.Tensor:
         """求 2x3 仿射逆（单视图）。"""
@@ -343,26 +376,34 @@ class TensorBoardMonitor:
             return
 
         images = batch["images"]  # [B,V,3,H,W]
+        view_ids = batch.get("view_ids", None)
         height_gt = batch.get("height_gt", None)
         pred_h = outputs.get("height_abs", None)
         pred_p = outputs.get("point_abs", None)
 
         # 兼容旧面板（第一个样本） + 新面板（整个 batch 的全部视图）。
         self.writer.add_image(f"vis/{split}/input_rgb", self.make_rgb_montage(images[0]), global_step)
-        self.writer.add_image(f"vis/{split}/I_crop", self.make_batch_view_montage(images), global_step)
+        b, v = int(images.shape[0]), int(images.shape[1])
+        labeled_rows = []
+        for bi in range(b):
+            row = []
+            for vi in range(v):
+                vid = int(view_ids[bi, vi].item()) if torch.is_tensor(view_ids) else vi
+                row.append(self._draw_label_on_image(images[bi, vi], f"view={vid}"))
+            labeled_rows.append(torch.cat(row, dim=-1))
+        self.writer.add_image(f"vis/{split}/I_crop", torch.cat(labeled_rows, dim=-2), global_step)
 
         if "affine_gt_forward" in batch:
             aff_fwd = batch["affine_gt_forward"]
             aff_corr = batch.get("affine_gt_correction", None)
-            b, v = int(images.shape[0]), int(images.shape[1])
             warped = []
             for bi in range(b):
                 warped_row = []
                 for vi in range(v):
                     aff_corr_i = aff_corr[bi, vi] if aff_corr is not None else None
-                    warped_row.append(
-                        self._warp_crop_by_affine_forward(images[bi, vi], aff_fwd[bi, vi], affine_correction_2x3=aff_corr_i)
-                    )
+                    wi = self._warp_crop_by_affine_forward(images[bi, vi], aff_fwd[bi, vi], affine_correction_2x3=aff_corr_i)
+                    vid = int(view_ids[bi, vi].item()) if torch.is_tensor(view_ids) else vi
+                    warped_row.append(self._draw_label_on_image(wi, f"view={vid}"))
                 warped.append(torch.cat(warped_row, dim=-1))
             self.writer.add_image(f"vis/{split}/I_crop_af", torch.cat(warped, dim=-2), global_step)
 
@@ -424,10 +465,16 @@ class TensorBoardMonitor:
             checker_pack = self._make_pairwise_affine_rpc_checkerboard(batch, outputs, global_step=global_step)
             if checker_pack is not None:
                 checker, image_j_corr, image_i_to_j, (i, j) = checker_pack
+                if torch.is_tensor(view_ids):
+                    view_i = int(view_ids[0, i].item())
+                    view_j = int(view_ids[0, j].item())
+                else:
+                    view_i, view_j = int(i), int(j)
+                checker_labeled = self._draw_label_on_image(checker, f"checker: view_i={view_i} / view_j={view_j}")
                 self.writer.add_image(f"vis/{split}/pair_rpc_j_corr", image_j_corr, global_step)
                 self.writer.add_image(f"vis/{split}/pair_rpc_i_to_j", image_i_to_j, global_step)
-                self.writer.add_image(f"vis/{split}/pair_rpc_checker", checker, global_step)
-                self.writer.add_text(f"vis/{split}/pair_rpc_meta", f"pair(i,j)=({i},{j})", global_step)
+                self.writer.add_image(f"vis/{split}/pair_rpc_checker", checker_labeled, global_step)
+                self.writer.add_text(f"vis/{split}/pair_rpc_meta", f"pair(i,j)=({i},{j}), view=({view_i},{view_j})", global_step)
 
         pairwise = self.make_pairwise_error_matrix(aux, v=int(images.shape[0]))
         if pairwise is not None:

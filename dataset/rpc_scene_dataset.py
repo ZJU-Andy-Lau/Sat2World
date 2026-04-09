@@ -178,8 +178,19 @@ class RPCSceneDataset(Dataset):
         views = list(scene_record.views)
         views.sort(key=lambda v: v.view_id)
         if self.mode == "train":
-            return views, 0
-        selected = views if self.max_view_num is None else views
+            v_total = len(views)
+            k_min = max(1, int(self.min_view_num))
+            k_max = v_total if self.max_view_num is None else min(int(self.max_view_num), v_total)
+            if k_min > k_max:
+                raise RuntimeError(
+                    f"Invalid view sampling range for scene={scene_record.scene_id}: "
+                    f"min_view_num={k_min}, max_view_num={k_max}, total_views={v_total}"
+                )
+            k = int(rng.integers(k_min, k_max + 1))
+            sel_idx = rng.choice(v_total, size=k, replace=False).tolist()
+            selected = [views[int(i)] for i in sel_idx]
+            return selected, 0
+        selected = views if self.max_view_num is None else views[: min(int(self.max_view_num), len(views))]
         return selected, 0
 
     def _load_rpc_full(self, rpc_path: str) -> "RPCModelParameterTorch":
@@ -473,34 +484,9 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         if hi != h0 or wi != w0:
             raise RuntimeError(f"Batch has inconsistent HW: sample0=({h0},{w0}), sample{i}=({hi},{wi})")
 
-    # k 的上限必须受“样本真实视图数”约束，避免 k > v 导致后续字段维度错配。
-    k_upper = int(
-        min(
-            min(int(x["images"].shape[0]), int(x.get("max_view_num", x["images"].shape[0])))
-            for x in batch
-        )
-    )
-    if k_upper <= 0:
-        raise RuntimeError("effective view upper bound must be > 0 for collate")
-
-    k_lower = int(min(max(int(x.get("min_view_num", 1)), 1) for x in batch))
-    k_lower = min(k_lower, k_upper)
-    k = int(torch.randint(low=k_lower, high=k_upper + 1, size=(1,)).item())
-
-    def _pick_indices(v: int) -> torch.Tensor:
-        if k == 1:
-            return torch.tensor([0], dtype=torch.long)
-        if v == 1:
-            return torch.zeros((k,), dtype=torch.long)
-        candidate = torch.arange(1, v, dtype=torch.long)
-        need = k - 1
-        if candidate.numel() >= need:
-            perm = torch.randperm(candidate.numel())[:need]
-            others = candidate[perm]
-        else:
-            rep = torch.randint(low=0, high=candidate.numel(), size=(need,), dtype=torch.long)
-            others = candidate[rep]
-        return torch.cat([torch.tensor([0], dtype=torch.long), others], dim=0)
+    v_out = int(min(int(sample["images"].shape[0]) for sample in batch))
+    if v_out <= 0:
+        raise RuntimeError("effective output view number must be > 0 for collate")
 
     images_b, height_b, mask_b = [], [], []
     aff_fwd_b, aff_cor_b, href_b = [], [], []
@@ -512,8 +498,7 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     anchor_ls_b, anchor_h_b = [], []
 
     for sample in batch:
-        v = sample["images"].shape[0]
-        idx = _pick_indices(v)
+        idx = torch.arange(v_out, dtype=torch.long)
 
         images_b.append(sample["images"][idx])
         height_b.append(sample["height_gt"][idx])
@@ -578,14 +563,14 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     if len(anchor_h_b) > 0:
         out["anchor_height_true"] = torch.stack(anchor_h_b, dim=0).to(torch.float32)
 
-    v_out = int(out["images"].shape[1])
-    if int(out["affine_gt_forward"].shape[1]) != v_out:
+    v_chk = int(out["images"].shape[1])
+    if int(out["affine_gt_forward"].shape[1]) != v_chk:
         raise RuntimeError(
-            f"collate view mismatch: images V={v_out}, affine_gt_forward V={int(out['affine_gt_forward'].shape[1])}"
+            f"collate view mismatch: images V={v_chk}, affine_gt_forward V={int(out['affine_gt_forward'].shape[1])}"
         )
-    if "anchor_line_samp_true" in out and int(out["anchor_line_samp_true"].shape[1]) != v_out:
+    if "anchor_line_samp_true" in out and int(out["anchor_line_samp_true"].shape[1]) != v_chk:
         raise RuntimeError(
-            f"collate view mismatch: images V={v_out}, anchor_line_samp_true V={int(out['anchor_line_samp_true'].shape[1])}"
+            f"collate view mismatch: images V={v_chk}, anchor_line_samp_true V={int(out['anchor_line_samp_true'].shape[1])}"
         )
     return out
 
