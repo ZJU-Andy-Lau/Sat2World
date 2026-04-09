@@ -375,11 +375,11 @@ def rasterize_projected_gaussians_cuda(
     depth_sort_descending: bool,
     alpha_cov_thresh: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    """CUDA 优化版前向 splatting（张量化实现）。
+    """CUDA 前向 splatting（bbox 级实现）。
 
     说明:
         - 该实现保持与 `rasterize_projected_gaussians` 一致的输入/输出语义；
-        - 通过批量张量运算把“逐高斯逐像素”计算搬到 CUDA kernel（PyTorch）上；
+        - 仅在每个 Gaussian 的 bbox 内进行计算，避免构造 [G,H,W,*] 大张量；
         - 若输入不在 CUDA 上，调用方应自行回退到 torch 参考实现。
     """
     device = mean_2d.device
@@ -411,48 +411,41 @@ def rasterize_projected_gaussians_cuda(
     valid_bbox = (bboxes[:, 1] >= bboxes[:, 0]) & (bboxes[:, 3] >= bboxes[:, 2])
     rasterized = int(valid_bbox.sum().item())
 
-    yy = torch.arange(image_h, device=device, dtype=dtype)
-    xx = torch.arange(image_w, device=device, dtype=dtype)
-    gy, gx = torch.meshgrid(yy, xx, indexing="ij")
-    grid = torch.stack([gy, gx], dim=-1)  # [H,W,2] (line,samp)
-    grid32 = grid.to(torch.float32)
-
+    # 采用 bbox 级 CUDA 计算，避免创建 [G,H,W,*] 级别大张量导致 OOM。
+    # 保持与 torch 参考实现相同的可见性、排序与前向 alpha compositing 语义。
     step = max(int(chunk_size), 1)
-    eye = torch.eye(2, device=device, dtype=torch.float32).view(1, 2, 2)
+    eye = torch.eye(2, device=device, dtype=torch.float32)
     for g0 in range(0, n, step):
         g1 = min(g0 + step, n)
-        m = mean_2d[g0:g1]  # [G,2]
-        c2 = cov_2d[g0:g1]  # [G,2,2]
-        op = opacity[g0:g1]  # [G]
-        col = rgb[g0:g1]  # [G,3]
-        hv = height_value[g0:g1]  # [G]
-        bb = bboxes[g0:g1]  # [G,4]
+        for g in range(g0, g1):
+            l0, l1, s0, s1 = [int(x.item()) for x in bboxes[g]]
+            if l1 < l0 or s1 < s0:
+                continue
 
-        delta = grid32.unsqueeze(0) - m.to(torch.float32)[:, None, None, :]  # [G,H,W,2]
-        inv_cov = torch.linalg.inv(c2.to(torch.float32) + 1e-8 * eye)  # [G,2,2]
-        maha = torch.einsum("ghwi,gij,ghwj->ghw", delta, inv_cov, delta)  # [G,H,W]
-        w = torch.exp(-0.5 * maha).to(dtype=dtype)  # [G,H,W]
+            yy = torch.arange(l0, l1 + 1, device=device, dtype=dtype)
+            xx = torch.arange(s0, s1 + 1, device=device, dtype=dtype)
+            gy, gx = torch.meshgrid(yy, xx, indexing="ij")
 
-        l0 = bb[:, 0].view(-1, 1, 1)
-        l1 = bb[:, 1].view(-1, 1, 1)
-        s0 = bb[:, 2].view(-1, 1, 1)
-        s1 = bb[:, 3].view(-1, 1, 1)
-        in_box = (gy.view(1, image_h, image_w) >= l0) & (gy.view(1, image_h, image_w) <= l1) & (gx.view(1, image_h, image_w) >= s0) & (gx.view(1, image_h, image_w) <= s1)
-        w = w * in_box.to(dtype=dtype)
+            d0 = gy - mean_2d[g, 0]
+            d1 = gx - mean_2d[g, 1]
+            d = torch.stack([d0, d1], dim=-1)  # [ph,pw,2]
 
-        alpha = torch.clamp(op.view(-1, 1, 1) * w, 0.0, alpha_clamp_max)  # [G,H,W]
-        one_minus = (1.0 - alpha).clamp(0.0, 1.0)  # [G,H,W]
-        cum = torch.cumprod(one_minus, dim=0)  # [G,H,W]
-        trans_before = torch.cat(
-            [torch.ones((1, image_h, image_w), device=device, dtype=dtype), cum[:-1]],
-            dim=0,
-        ) * trans  # [G,H,W]
-        contrib = trans_before * alpha  # [G,H,W]
+            inv_cov32 = torch.linalg.inv(cov_2d[g].to(torch.float32) + 1e-8 * eye)
+            m = torch.einsum("...i,ij,...j->...", d.to(torch.float32), inv_cov32, d.to(torch.float32))
+            w = torch.exp(-0.5 * m).to(dtype=dtype)
 
-        canvas_rgb = canvas_rgb + torch.einsum("ghw,gc->chw", contrib, col)
-        canvas_height = canvas_height + torch.einsum("ghw,g->hw", contrib, hv).unsqueeze(0)
-        canvas_alpha = canvas_alpha + contrib.sum(dim=0, keepdim=True)
-        trans = trans * cum[-1:].clamp(0.0, 1.0)
+            alpha = torch.clamp(opacity[g] * w, 0.0, alpha_clamp_max).unsqueeze(0)
+            trans_patch = trans[:, l0 : l1 + 1, s0 : s1 + 1].clone()
+            contrib = trans_patch * alpha
+
+            rgb_patch = canvas_rgb[:, l0 : l1 + 1, s0 : s1 + 1].clone()
+            h_patch = canvas_height[:, l0 : l1 + 1, s0 : s1 + 1].clone()
+            a_patch = canvas_alpha[:, l0 : l1 + 1, s0 : s1 + 1].clone()
+
+            canvas_rgb[:, l0 : l1 + 1, s0 : s1 + 1] = rgb_patch + contrib * rgb[g].view(3, 1, 1)
+            canvas_height[:, l0 : l1 + 1, s0 : s1 + 1] = h_patch + contrib * height_value[g]
+            canvas_alpha[:, l0 : l1 + 1, s0 : s1 + 1] = a_patch + contrib
+            trans[:, l0 : l1 + 1, s0 : s1 + 1] = trans_patch * (1.0 - alpha)
 
     rendered_height = canvas_height / canvas_alpha.clamp_min(1e-8)
     rendered_height = torch.where(canvas_alpha > 1e-6, rendered_height, torch.zeros_like(rendered_height))
