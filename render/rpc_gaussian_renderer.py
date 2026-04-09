@@ -360,6 +360,105 @@ def rasterize_projected_gaussians(
     return canvas_rgb, canvas_alpha, rendered_height, stats
 
 
+def rasterize_projected_gaussians_cuda(
+    mean_2d: torch.Tensor,
+    cov_2d: torch.Tensor,
+    depth_proxy: torch.Tensor,
+    rgb: torch.Tensor,
+    opacity: torch.Tensor,
+    height_value: torch.Tensor,
+    image_h: int,
+    image_w: int,
+    nsigma: float,
+    chunk_size: int,
+    alpha_clamp_max: float,
+    depth_sort_descending: bool,
+    alpha_cov_thresh: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """CUDA 前向 splatting（bbox 级实现）。
+
+    说明:
+        - 该实现保持与 `rasterize_projected_gaussians` 一致的输入/输出语义；
+        - 仅在每个 Gaussian 的 bbox 内进行计算，避免构造 [G,H,W,*] 大张量；
+        - 若输入不在 CUDA 上，调用方应自行回退到 torch 参考实现。
+    """
+    device = mean_2d.device
+    dtype = mean_2d.dtype
+    n = mean_2d.shape[0]
+
+    canvas_rgb = torch.zeros((3, image_h, image_w), device=device, dtype=dtype)
+    canvas_alpha = torch.zeros((1, image_h, image_w), device=device, dtype=dtype)
+    canvas_height = torch.zeros((1, image_h, image_w), device=device, dtype=dtype)
+    trans = torch.ones((1, image_h, image_w), device=device, dtype=dtype)
+
+    if n == 0:
+        stats = {
+            "num_input_gaussians": torch.tensor(0.0, device=device),
+            "num_rasterized_gaussians": torch.tensor(0.0, device=device),
+            "mean_transmittance_final": trans.mean().detach(),
+            "alpha_coverage": torch.tensor(0.0, device=device),
+        }
+        return canvas_rgb, canvas_alpha, canvas_height, stats
+
+    order = torch.argsort(depth_proxy, descending=depth_sort_descending)
+    mean_2d = mean_2d[order]
+    cov_2d = cov_2d[order]
+    rgb = rgb[order]
+    opacity = opacity[order, 0]
+    height_value = height_value[order, 0]
+
+    bboxes = compute_bbox_from_cov2d(mean_2d, cov_2d, image_h, image_w, nsigma)
+    valid_bbox = (bboxes[:, 1] >= bboxes[:, 0]) & (bboxes[:, 3] >= bboxes[:, 2])
+    rasterized = int(valid_bbox.sum().item())
+
+    # 采用 bbox 级 CUDA 计算，避免创建 [G,H,W,*] 级别大张量导致 OOM。
+    # 保持与 torch 参考实现相同的可见性、排序与前向 alpha compositing 语义。
+    step = max(int(chunk_size), 1)
+    eye = torch.eye(2, device=device, dtype=torch.float32)
+    for g0 in range(0, n, step):
+        g1 = min(g0 + step, n)
+        for g in range(g0, g1):
+            l0, l1, s0, s1 = [int(x.item()) for x in bboxes[g]]
+            if l1 < l0 or s1 < s0:
+                continue
+
+            yy = torch.arange(l0, l1 + 1, device=device, dtype=dtype)
+            xx = torch.arange(s0, s1 + 1, device=device, dtype=dtype)
+            gy, gx = torch.meshgrid(yy, xx, indexing="ij")
+
+            d0 = gy - mean_2d[g, 0]
+            d1 = gx - mean_2d[g, 1]
+            d = torch.stack([d0, d1], dim=-1)  # [ph,pw,2]
+
+            inv_cov32 = torch.linalg.inv(cov_2d[g].to(torch.float32) + 1e-8 * eye)
+            m = torch.einsum("...i,ij,...j->...", d.to(torch.float32), inv_cov32, d.to(torch.float32))
+            w = torch.exp(-0.5 * m).to(dtype=dtype)
+
+            alpha = torch.clamp(opacity[g] * w, 0.0, alpha_clamp_max).unsqueeze(0)
+            trans_patch = trans[:, l0 : l1 + 1, s0 : s1 + 1].clone()
+            contrib = trans_patch * alpha
+
+            rgb_patch = canvas_rgb[:, l0 : l1 + 1, s0 : s1 + 1].clone()
+            h_patch = canvas_height[:, l0 : l1 + 1, s0 : s1 + 1].clone()
+            a_patch = canvas_alpha[:, l0 : l1 + 1, s0 : s1 + 1].clone()
+
+            canvas_rgb[:, l0 : l1 + 1, s0 : s1 + 1] = rgb_patch + contrib * rgb[g].view(3, 1, 1)
+            canvas_height[:, l0 : l1 + 1, s0 : s1 + 1] = h_patch + contrib * height_value[g]
+            canvas_alpha[:, l0 : l1 + 1, s0 : s1 + 1] = a_patch + contrib
+            trans[:, l0 : l1 + 1, s0 : s1 + 1] = trans_patch * (1.0 - alpha)
+
+    rendered_height = canvas_height / canvas_alpha.clamp_min(1e-8)
+    rendered_height = torch.where(canvas_alpha > 1e-6, rendered_height, torch.zeros_like(rendered_height))
+
+    stats = {
+        "num_input_gaussians": torch.tensor(float(n), device=device),
+        "num_rasterized_gaussians": torch.tensor(float(rasterized), device=device),
+        "mean_transmittance_final": trans.mean().detach(),
+        "alpha_coverage": (canvas_alpha > alpha_cov_thresh).to(dtype).mean().detach(),
+    }
+    return canvas_rgb, canvas_alpha, rendered_height, stats
+
+
 def project_gaussians_to_view(
     geometry_ops: Any,
     centers_world: torch.Tensor,
@@ -425,6 +524,11 @@ class RPCGaussianRendererCfg:
     render_compute_dtype: str = "fp16"
 
     deterministic_target_selection: bool = True
+    target_selection_mode: str = "random"
+    target_selection_seed_offset: int = 0
+
+    render_backend: str = "torch"  # torch | cuda
+    cuda_backend_allow_fallback: bool = True
 
 
 class RPCGaussianRenderer:
@@ -465,12 +569,43 @@ class RPCGaussianRenderer:
             return torch.float32
         return torch.float16 if device.type == "cuda" else torch.float32
 
+    def _make_target_selection_generator(
+        self,
+        *,
+        batch: dict[str, Any] | None,
+        batch_index: int,
+        global_step: int | None,
+        epoch: int | None,
+        device: torch.device,
+    ) -> torch.Generator:
+        seed_offset = int(getattr(self.cfg, "target_selection_seed_offset", 0))
+        gs = 0 if global_step is None else int(global_step)
+        ep = 0 if epoch is None else int(epoch)
+        scene_id = 0
+        if batch is not None and "scene_id" in batch:
+            sid = batch["scene_id"]
+            if torch.is_tensor(sid):
+                scene_id = int(sid[batch_index].detach().cpu().item()) if sid.numel() > 1 else int(sid.detach().cpu().item())
+            else:
+                try:
+                    scene_id = int(sid[batch_index])
+                except Exception:
+                    scene_id = 0
+        seed = (scene_id * 1000003 + batch_index * 9176 + gs * 1315423911 + ep * 2654435761 + seed_offset) & 0xFFFFFFFF
+        g = torch.Generator(device="cpu")
+        g.manual_seed(seed)
+        return g
+
     def select_target_views(
         self,
         b: int,
         v: int,
         mode: str,
         ref_view_idx: torch.Tensor | None,
+        *,
+        batch: dict[str, Any] | None = None,
+        global_step: int | None = None,
+        epoch: int | None = None,
     ) -> list[list[int]]:
         """选择每个 sample 的 target views。"""
         device = ref_view_idx.device if torch.is_tensor(ref_view_idx) else torch.device("cpu")
@@ -492,7 +627,22 @@ class RPCGaussianRenderer:
                     else:
                         out.append([])
                 else:
-                    out.append(non_ref[:k])
+                    k_eff = min(int(k), len(non_ref))
+                    if str(getattr(self.cfg, "target_selection_mode", "random")).lower() == "random":
+                        if bool(self.cfg.deterministic_target_selection):
+                            g = self._make_target_selection_generator(
+                                batch=batch,
+                                batch_index=bi,
+                                global_step=global_step,
+                                epoch=epoch,
+                                device=device,
+                            )
+                            perm = torch.randperm(len(non_ref), generator=g)[:k_eff].tolist()
+                        else:
+                            perm = torch.randperm(len(non_ref))[:k_eff].tolist()
+                        out.append([non_ref[idx] for idx in perm])
+                    else:
+                        out.append(non_ref[:k_eff])
             else:
                 if self.cfg.use_all_targets_in_val:
                     cand = non_ref
@@ -756,21 +906,59 @@ class RPCGaussianRenderer:
         h_val = c[visible, 2:3]
 
         rdtype = self._get_render_dtype(c.device)
-        rr, ra, rh, stats = rasterize_projected_gaussians(
-            mean_2d=mean_2d.to(rdtype),
-            cov_2d=cov_2d.to(rdtype),
-            depth_proxy=depth_proxy.to(rdtype),
-            rgb=rgb.to(rdtype),
-            opacity=opacity.to(rdtype),
-            height_value=h_val.to(rdtype),
-            image_h=h_out,
-            image_w=w_out,
-            nsigma=self.cfg.nsigma,
-            chunk_size=self.cfg.chunk_size,
-            alpha_clamp_max=self.cfg.alpha_clamp_max,
-            depth_sort_descending=self.cfg.depth_sort_descending,
-            alpha_cov_thresh=self.cfg.alpha_cov_thresh,
-        )
+        backend = str(getattr(self.cfg, "render_backend", "torch")).lower()
+        use_cuda_backend = backend == "cuda" and c.device.type == "cuda"
+        if use_cuda_backend:
+            try:
+                rr, ra, rh, stats = rasterize_projected_gaussians_cuda(
+                    mean_2d=mean_2d.to(rdtype),
+                    cov_2d=cov_2d.to(rdtype),
+                    depth_proxy=depth_proxy.to(rdtype),
+                    rgb=rgb.to(rdtype),
+                    opacity=opacity.to(rdtype),
+                    height_value=h_val.to(rdtype),
+                    image_h=h_out,
+                    image_w=w_out,
+                    nsigma=self.cfg.nsigma,
+                    chunk_size=self.cfg.chunk_size,
+                    alpha_clamp_max=self.cfg.alpha_clamp_max,
+                    depth_sort_descending=self.cfg.depth_sort_descending,
+                    alpha_cov_thresh=self.cfg.alpha_cov_thresh,
+                )
+            except Exception:
+                if not bool(getattr(self.cfg, "cuda_backend_allow_fallback", True)):
+                    raise
+                rr, ra, rh, stats = rasterize_projected_gaussians(
+                    mean_2d=mean_2d.to(rdtype),
+                    cov_2d=cov_2d.to(rdtype),
+                    depth_proxy=depth_proxy.to(rdtype),
+                    rgb=rgb.to(rdtype),
+                    opacity=opacity.to(rdtype),
+                    height_value=h_val.to(rdtype),
+                    image_h=h_out,
+                    image_w=w_out,
+                    nsigma=self.cfg.nsigma,
+                    chunk_size=self.cfg.chunk_size,
+                    alpha_clamp_max=self.cfg.alpha_clamp_max,
+                    depth_sort_descending=self.cfg.depth_sort_descending,
+                    alpha_cov_thresh=self.cfg.alpha_cov_thresh,
+                )
+        else:
+            rr, ra, rh, stats = rasterize_projected_gaussians(
+                mean_2d=mean_2d.to(rdtype),
+                cov_2d=cov_2d.to(rdtype),
+                depth_proxy=depth_proxy.to(rdtype),
+                rgb=rgb.to(rdtype),
+                opacity=opacity.to(rdtype),
+                height_value=h_val.to(rdtype),
+                image_h=h_out,
+                image_w=w_out,
+                nsigma=self.cfg.nsigma,
+                chunk_size=self.cfg.chunk_size,
+                alpha_clamp_max=self.cfg.alpha_clamp_max,
+                depth_sort_descending=self.cfg.depth_sort_descending,
+                alpha_cov_thresh=self.cfg.alpha_cov_thresh,
+            )
 
         target_rgb_out = F.interpolate(target_rgb.unsqueeze(0), size=(h_out, w_out), mode="bilinear", align_corners=False).squeeze(0)
         target_h_out = None if target_h is None else F.interpolate(target_h.unsqueeze(0), size=(h_out, w_out), mode="bilinear", align_corners=False).squeeze(0)
@@ -800,10 +988,21 @@ class RPCGaussianRenderer:
         outputs: dict[str, Any],
         batch: dict[str, Any],
         mode: str,
+        *,
+        global_step: int | None = None,
+        epoch: int | None = None,
     ) -> dict[str, Any]:
         """渲染单一路径在全 batch 的所有目标视图。"""
         b, v = centers_path.shape[:2]
-        target_views = self.select_target_views(b, v, mode, batch.get("ref_view_idx", None))
+        target_views = self.select_target_views(
+            b,
+            v,
+            mode,
+            batch.get("ref_view_idx", None),
+            batch=batch,
+            global_step=global_step,
+            epoch=epoch,
+        )
 
         packs = self.collect_source_gaussians_for_target(
             centers_path=centers_path,
@@ -879,6 +1078,8 @@ class RPCGaussianRenderer:
         outputs: dict[str, Any],
         batch: dict[str, Any],
         mode: str = "train",
+        global_step: int | None = None,
+        epoch: int | None = None,
     ) -> dict[str, dict[str, Any]]:
         """对外主接口：渲染 rpc path 与 point path。
 
@@ -907,6 +1108,8 @@ class RPCGaussianRenderer:
             outputs=outputs,
             batch=batch,
             mode=mode,
+            global_step=global_step,
+            epoch=epoch,
         )
         point_path = self.render_single_path(
             centers_path=outputs["gaussian_centers_point"],
@@ -914,5 +1117,7 @@ class RPCGaussianRenderer:
             outputs=outputs,
             batch=batch,
             mode=mode,
+            global_step=global_step,
+            epoch=epoch,
         )
         return {"rpc": rpc_path, "point": point_path}
