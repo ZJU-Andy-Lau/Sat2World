@@ -309,15 +309,26 @@ class RPCGaussianRenderer:
         t = (t_h[:3] / t_h[3]).reshape(3)
 
         # 修正朝向：确保绝大多数点在相机前方
+<<<<<<< codex/review-sat2world-model-codebase-hibnap
+        fit_dev = xyz.device
+        R = torch.from_numpy(R_np).to(device=fit_dev, dtype=torch.float64)
+        t_t = torch.from_numpy(t).to(device=fit_dev, dtype=torch.float64)
+=======
         R = torch.from_numpy(R_np).to(torch.float64)
         t_t = torch.from_numpy(t).to(torch.float64)
+>>>>>>> main
         z_cam = (R @ xyz.T + t_t[:, None])[2]
         if (z_cam > 0).float().mean().item() < 0.5:
             R = -R
             t_t = -t_t
 
+<<<<<<< codex/review-sat2world-model-codebase-hibnap
+        K = torch.from_numpy(K_np).to(device=fit_dev, dtype=torch.float64)
+        w2c = torch.eye(4, dtype=torch.float64, device=fit_dev)
+=======
         K = torch.from_numpy(K_np).to(torch.float64)
         w2c = torch.eye(4, dtype=torch.float64)
+>>>>>>> main
         w2c[:3, :3] = R
         w2c[:3, 3] = t_t
 
@@ -470,7 +481,7 @@ class RPCGaussianRenderer:
         if c.shape[0] == 0:
             rr = torch.zeros((3, h_out, w_out), device=target_rgb.device, dtype=target_rgb.dtype)
             ra = torch.zeros((1, h_out, w_out), device=target_rgb.device, dtype=target_rgb.dtype)
-            rh = torch.zeros((1, h_out, w_out), device=target_rgb.device, dtype=target_rgb.dtype)
+            rh = None
             return {
                 "rendered_rgb": rr,
                 "rendered_alpha": ra,
@@ -494,6 +505,38 @@ class RPCGaussianRenderer:
                 f"Virtual camera fit too inaccurate for scene={int(batch['scene_id'][bi].item()) if 'scene_id' in batch else bi}, "
                 f"view={tv}: p95={cam.fit_p95:.4f}px > threshold={self.cfg.fit_max_reproj_p95_px:.4f}px"
             )
+<<<<<<< codex/review-sat2world-model-codebase-hibnap
+
+        # 修复: 虚拟相机在 full-res 拟合，渲染分辨率为 downsample 后时必须同步缩放内参。
+        sx = float(w_out) / float(max(w, 1))
+        sy = float(h_out) / float(max(h, 1))
+        K_render = cam.K.clone()
+        K_render[0, 0] = K_render[0, 0] * sx
+        K_render[1, 1] = K_render[1, 1] * sy
+        K_render[0, 2] = K_render[0, 2] * sx
+        K_render[1, 2] = K_render[1, 2] * sy
+        cam_render = VirtualPinholeCamera(
+            K=K_render,
+            w2c=cam.w2c,
+            fit_p50=cam.fit_p50,
+            fit_p95=cam.fit_p95,
+            fit_max=cam.fit_max,
+        )
+
+        rr, ra, _depth_cam = self._render_cuda(
+            centers=c,
+            opacity=(pack["opacity"] * pack["confidence"]).clamp(0.0, 1.0),
+            scale=pack["scale"],
+            rotation=pack["rotation"],
+            rgb=pack["rgb"],
+            cam=cam_render,
+            image_hw=(h_out, w_out),
+        )
+        # 修复: RGB+D 的 D 是相机深度，不等价于世界高程。
+        # 为避免错误监督，当前不返回 rendered_height，RenderPathLoss 将自动跳过 height 项。
+        rh = None
+=======
+>>>>>>> main
 
         rr, ra, rh = self._render_cuda(
             centers=c,
@@ -554,7 +597,7 @@ class RPCGaussianRenderer:
             return {
                 "rendered_rgb": torch.zeros((0, 3, 0, 0), device=dev),
                 "rendered_alpha": torch.zeros((0, 1, 0, 0), device=dev),
-                "rendered_height": torch.zeros((0, 1, 0, 0), device=dev),
+                "rendered_height": None,
                 "target_rgb": torch.zeros((0, 3, 0, 0), device=dev),
                 "target_height": None,
                 "target_valid_mask": None,
@@ -573,7 +616,8 @@ class RPCGaussianRenderer:
 
         rendered_rgb = torch.stack([x["rendered_rgb"] for x in single_results], dim=0)
         rendered_alpha = torch.stack([x["rendered_alpha"] for x in single_results], dim=0)
-        rendered_height = torch.stack([x["rendered_height"] for x in single_results], dim=0)
+        any_render_height = all(x["rendered_height"] is not None for x in single_results)
+        rendered_height = torch.stack([x["rendered_height"] for x in single_results], dim=0) if any_render_height else None
         target_rgb = torch.stack([x["target_rgb"] for x in single_results], dim=0)
         any_height = all(x["target_height"] is not None for x in single_results)
         any_mask = all(x["target_valid_mask"] is not None for x in single_results)
