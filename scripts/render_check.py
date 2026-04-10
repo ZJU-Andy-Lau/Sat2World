@@ -75,10 +75,9 @@ def build_val_batch(cfg: dict[str, Any], scene_index: int) -> dict[str, Any]:
 
 
 def to_device_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for k, v in batch.items():
-        out[k] = v.to(device) if torch.is_tensor(v) else v
-    return out
+    from engine.distributed import move_batch_to_device
+
+    return move_batch_to_device(batch, device)
 
 
 def make_renderer(cfg: dict[str, Any]) -> RPCGaussianRenderer:

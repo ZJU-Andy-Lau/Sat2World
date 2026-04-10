@@ -265,13 +265,14 @@ class RPCGaussianRenderer:
             return self._virtual_cam_cache[cache_key]
 
         rpc_t = batch["rpc_gt"][bi][tv]
+        fit_dev = rpc_t.device
         xyz_local = self._sample_world_grid(batch, bi, tv, h, w)
-        scene_center = batch["scene_xy_center"][bi].to(dtype=torch.double, device=rpc_t.device)
+        scene_center = batch["scene_xy_center"][bi].to(dtype=torch.double, device=fit_dev)
         scene_scale = torch.ones_like(scene_center)
 
-        x = xyz_local[:, 0].to(dtype=torch.double, device=rpc_t.device)
-        y = xyz_local[:, 1].to(dtype=torch.double, device=rpc_t.device)
-        z = xyz_local[:, 2].to(dtype=torch.double, device=rpc_t.device)
+        x = xyz_local[:, 0].to(dtype=torch.double, device=fit_dev)
+        y = xyz_local[:, 1].to(dtype=torch.double, device=fit_dev)
+        z = xyz_local[:, 2].to(dtype=torch.double, device=fit_dev)
         line, samp = rpc_t.RPC_XY2LINESAMP(
             x_in=x,
             y_in=y,
@@ -280,17 +281,16 @@ class RPCGaussianRenderer:
             xy_center=scene_center,
             xy_scale=scene_scale,
         )
-        uv = torch.stack([samp, line], dim=-1).to(dtype=torch.float64)  # x=samp, y=line
+        uv = torch.stack([samp, line], dim=-1).to(dtype=torch.float64, device=fit_dev)  # x=samp, y=line
 
-        xyz = xyz_local.to(torch.float64)
+        xyz = xyz_local.to(dtype=torch.float64, device=fit_dev)
         n = xyz.shape[0]
         ones = torch.ones((n, 1), dtype=torch.float64, device=xyz.device)
         X = torch.cat([xyz, ones], dim=-1)
         u = uv[:, 0:1]
         v = uv[:, 1:2]
 
-        O = torch.zeros_like(X, device=xyz.device)
-        print(X.device,O.device,u.device,rpc_t.device)
+        O = torch.zeros_like(X)
         A1 = torch.cat([X, O, -u * X], dim=-1)
         A2 = torch.cat([O, X, -v * X], dim=-1)
         A = torch.cat([A1, A2], dim=0)
@@ -310,7 +310,6 @@ class RPCGaussianRenderer:
         t = (t_h[:3] / t_h[3]).reshape(3)
 
         # 修正朝向：确保绝大多数点在相机前方
-        fit_dev = xyz.device
         R = torch.from_numpy(R_np).to(device=fit_dev, dtype=torch.float64)
         t_t = torch.from_numpy(t).to(device=fit_dev, dtype=torch.float64)
         z_cam = (R @ xyz.T + t_t[:, None])[2]

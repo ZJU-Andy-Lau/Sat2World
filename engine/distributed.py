@@ -151,15 +151,44 @@ def all_reduce_mean(value: Any) -> Any:
 _RPC_KEYS = {"rpc_gt", "rpc_init", "rpc_corrected"}
 
 
+def _is_rpc_like(obj: Any) -> bool:
+    return hasattr(obj, "to_gpu") and hasattr(obj, "device")
+
+
+def _move_rpc_obj_to_device(rpc_obj: Any, device: torch.device) -> Any:
+    if not _is_rpc_like(rpc_obj):
+        return rpc_obj
+    cur_dev = getattr(rpc_obj, "device", None)
+    if isinstance(cur_dev, torch.device) and cur_dev == device:
+        return rpc_obj
+    if device.type == "cuda":
+        rpc_obj.to_gpu(device)
+    else:
+        rpc_obj.to_gpu("cpu")
+    return rpc_obj
+
+
+def _move_rpc_nested_to_device(obj: Any, device: torch.device) -> Any:
+    if _is_rpc_like(obj):
+        return _move_rpc_obj_to_device(obj, device)
+    if isinstance(obj, list):
+        return [_move_rpc_nested_to_device(v, device) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_move_rpc_nested_to_device(v, device) for v in obj)
+    if isinstance(obj, dict):
+        return {k: _move_rpc_nested_to_device(v, device) for k, v in obj.items()}
+    return obj
+
+
 def move_batch_to_device(batch: Any, device: torch.device, non_blocking: bool = True) -> Any:
-    """递归移动 batch 中 tensor 到 device，并保留 RPC 对象列表不动。"""
+    """递归移动 batch 到 device，并确保 RPC 对象与目标 device 对齐。"""
     if torch.is_tensor(batch):
         return batch.to(device=device, non_blocking=non_blocking)
     if isinstance(batch, dict):
         out = {}
         for k, v in batch.items():
             if k in _RPC_KEYS:
-                out[k] = v
+                out[k] = _move_rpc_nested_to_device(v, device)
             else:
                 out[k] = move_batch_to_device(v, device, non_blocking=non_blocking)
         return out
@@ -183,6 +212,25 @@ def assert_tensor_tree_device(obj: Any, expected_device: torch.device, prefix: s
     if isinstance(obj, (list, tuple)):
         for i, v in enumerate(obj):
             assert_tensor_tree_device(v, expected_device, prefix=f"{prefix}[{i}]")
+        return
+
+
+def assert_rpc_tree_device(obj: Any, expected_device: torch.device, prefix: str = "") -> None:
+    """递归检查嵌套结构中 RPC 对象的 device 一致性。"""
+    if _is_rpc_like(obj):
+        rpc_dev = getattr(obj, "device", None)
+        if not isinstance(rpc_dev, torch.device):
+            raise RuntimeError(f"RPC device invalid at {prefix or '<root>'}: got {rpc_dev}")
+        if rpc_dev != expected_device:
+            raise RuntimeError(f"RPC device mismatch at {prefix or '<root>'}: got {rpc_dev}, expect {expected_device}")
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            assert_rpc_tree_device(v, expected_device, prefix=f"{prefix}.{k}" if prefix else str(k))
+        return
+    if isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            assert_rpc_tree_device(v, expected_device, prefix=f"{prefix}[{i}]")
         return
 
 
