@@ -482,6 +482,72 @@ def _run_gsplat_convention_probe(
     }
 
 
+def _run_camera_variant_projection_probe(
+    cam: VirtualPinholeCamera,
+    xyz_world: np.ndarray,
+    gt_line: np.ndarray,
+    gt_samp: np.ndarray,
+    image_hw: tuple[int, int],
+) -> dict[str, Any]:
+    """不依赖栅格化，仅用投影误差评估相机矩阵约定。"""
+    h, w = image_hw
+    xyz_h = np.concatenate([xyz_world.astype(np.float64), np.ones((xyz_world.shape[0], 1), dtype=np.float64)], axis=1)
+    K = cam.K.detach().cpu().numpy().astype(np.float64)
+    w2c = cam.w2c.detach().cpu().numpy().astype(np.float64)
+
+    I4 = np.eye(4, dtype=np.float64)
+    Fz = I4.copy()
+    Fz[2, 2] = -1.0
+    Fy = I4.copy()
+    Fy[1, 1] = -1.0
+    Fzy = Fy @ Fz
+    variants: dict[str, np.ndarray] = {
+        "current": w2c,
+        "cam_z_flip": Fz @ w2c,
+        "cam_y_flip": Fy @ w2c,
+        "cam_zy_flip": Fzy @ w2c,
+        "w2c_transposed": w2c.T.copy(),
+    }
+
+    gt_uv = np.stack([gt_samp.astype(np.float64), gt_line.astype(np.float64)], axis=-1)
+    metrics: dict[str, dict[str, float]] = {}
+    for name, w2c_var in variants.items():
+        cam_xyz = (w2c_var[:3, :] @ xyz_h.T).T
+        z = cam_xyz[:, 2]
+        proj = (K @ cam_xyz.T).T
+        valid = np.isfinite(z) & (z > 1e-8) & np.isfinite(proj).all(axis=1) & np.isfinite(gt_uv).all(axis=1)
+        if valid.any():
+            uv = proj[valid, :2] / proj[valid, 2:3]
+            err = np.linalg.norm(uv - gt_uv[valid], axis=1)
+            in_frame = (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+            center_err = float(np.linalg.norm(uv.mean(axis=0) - gt_uv[valid].mean(axis=0)))
+            metrics[name] = {
+                "reproj_p50_px": float(np.quantile(err, 0.50)),
+                "reproj_p95_px": float(np.quantile(err, 0.95)),
+                "reproj_max_px": float(err.max()),
+                "positive_depth_ratio": float(valid.mean()),
+                "in_frame_ratio": float(in_frame.mean()),
+                "center_centroid_err_px": center_err,
+            }
+        else:
+            metrics[name] = {
+                "reproj_p50_px": float("inf"),
+                "reproj_p95_px": float("inf"),
+                "reproj_max_px": float("inf"),
+                "positive_depth_ratio": 0.0,
+                "in_frame_ratio": 0.0,
+                "center_centroid_err_px": float("inf"),
+            }
+
+    best_variant = min(metrics.items(), key=lambda kv: kv[1]["reproj_p95_px"])[0]
+    return {
+        "variants": metrics,
+        "best_variant_by_reproj_p95": best_variant,
+        "best_reproj_p95_px": float(metrics[best_variant]["reproj_p95_px"]),
+        "current_reproj_p95_px": float(metrics["current"]["reproj_p95_px"]),
+    }
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
@@ -562,6 +628,13 @@ def main() -> None:
             vi=args.view_i,
             tv=args.view_j,
             cam=cam,
+        )
+        proj_probe = _run_camera_variant_projection_probe(
+            cam=cam,
+            xyz_world=np.stack([x_obj, y_obj, h_obj], axis=-1),
+            gt_line=line_j,
+            gt_samp=samp_j,
+            image_hw=(int(rendered_rgb.shape[-2]), int(rendered_rgb.shape[-1])),
         )
         conv_suspect = (
             conv_probe["current_alpha_max"] < args.convention_probe_alpha_max_threshold
@@ -689,6 +762,34 @@ def main() -> None:
         extra = f" ({r.note})" if r.note else ""
         print(f"[{status}] {r.name}: value={r.value:.6f}, threshold={r.threshold:.6f}{extra}")
         all_pass = all_pass and r.passed
+
+    if "conv_probe" in locals():
+        print("\n-- gsplat convention probe (alpha-based) --")
+        for k, v in conv_probe["alpha_max_by_variant"].items():
+            print(f"  {k:16s}: alpha_max={v:.6f}")
+        print(
+            f"  best_variant={conv_probe['best_variant']}, "
+            f"best_alpha_max={conv_probe['best_alpha_max']:.6f}, "
+            f"current_alpha_max={conv_probe['current_alpha_max']:.6f}"
+        )
+
+    if "proj_probe" in locals():
+        print("\n-- camera variant projection probe (geometry-based) --")
+        for name, m in proj_probe["variants"].items():
+            print(
+                f"  {name:16s}: "
+                f"reproj_p50={m['reproj_p50_px']:.6f}px, "
+                f"reproj_p95={m['reproj_p95_px']:.6f}px, "
+                f"reproj_max={m['reproj_max_px']:.6f}px, "
+                f"center_err={m['center_centroid_err_px']:.6f}px, "
+                f"pos_depth_ratio={m['positive_depth_ratio']:.4f}, "
+                f"in_frame_ratio={m['in_frame_ratio']:.4f}"
+            )
+        print(
+            f"  best_variant_by_reproj_p95={proj_probe['best_variant_by_reproj_p95']}, "
+            f"best_reproj_p95={proj_probe['best_reproj_p95_px']:.6f}px, "
+            f"current_reproj_p95={proj_probe['current_reproj_p95_px']:.6f}px"
+        )
 
     print("------------------------------------------------------")
     print("RESULT:", "PASS" if all_pass else "FAIL")
