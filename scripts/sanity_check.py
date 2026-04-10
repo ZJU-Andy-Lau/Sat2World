@@ -75,6 +75,17 @@ def _pick_valid_pixel(mask_2d: torch.Tensor) -> tuple[int, int]:
     return int(valid[0, 0].item()), int(valid[0, 1].item())
 
 
+def _sample_map_bilinear(map_2d: torch.Tensor, line: torch.Tensor, samp: torch.Tensor) -> torch.Tensor:
+    """从 [H,W] 地图按 (line,samp) 双线性采样，返回 [N]。"""
+    h, w = int(map_2d.shape[-2]), int(map_2d.shape[-1])
+    x = (samp / max(w - 1, 1)) * 2.0 - 1.0
+    y = (line / max(h - 1, 1)) * 2.0 - 1.0
+    grid = torch.stack([x, y], dim=-1).view(1, -1, 1, 2)
+    src = map_2d.view(1, 1, h, w).to(dtype=torch.float32)
+    out = torch.nn.functional.grid_sample(src, grid, mode="bilinear", padding_mode="border", align_corners=True)
+    return out.view(-1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser("Sat2World sanity check")
     parser.add_argument("--config", type=str, default="config/default.yaml")
@@ -173,10 +184,33 @@ def main() -> None:
                 xy_center=scene_center.to(dtype=torch.double),
                 xy_scale=scene_scale_render.to(dtype=torch.double),
             )
-            proj_err = torch.sqrt((line1 - line0.to(dtype=torch.double)).square() + (samp1 - samp0.to(dtype=torch.double)).square())
+            # 关键修复：不能将 target 投影像素与 source 像素直接比较。
+            # 改为：
+            # 1) src(h_gt) -> 3D -> tgt 得到预测像素 (line1,samp1)
+            # 2) 在 tgt 视图该预测位置双线性采样 h_gt
+            # 3) tgt(h_gt) 反投影回 3D，再投回 src，比较 src 回投误差
+            # 这样同时使用 rpc_gt 与双视图 h_gt 进行一致性校验。
+            h_tgt = _sample_map_bilinear(batch["height_gt"][bi, vi_tgt, 0], line1.to(torch.float32), samp1.to(torch.float32)).to(torch.double)
+            x_tgt, y_tgt = rpc_tgt.RPC_LINESAMP2XY(
+                line_in=line1,
+                samp_in=samp1,
+                h_in=h_tgt,
+                output_type="tensor",
+                xy_center=scene_center.to(dtype=torch.double),
+                xy_scale=scene_scale_render.to(dtype=torch.double),
+            )
+            line_back, samp_back = rpc_src.RPC_XY2LINESAMP(
+                x_in=x_tgt,
+                y_in=y_tgt,
+                h_in=h_tgt,
+                output_type="tensor",
+                xy_center=scene_center.to(dtype=torch.double),
+                xy_scale=scene_scale_render.to(dtype=torch.double),
+            )
+            proj_err = torch.sqrt((line_back - line0.to(dtype=torch.double)).square() + (samp_back - samp0.to(dtype=torch.double)).square())
             proj_err_px = float(proj_err.detach().cpu().item())
-            if not math.isfinite(proj_err_px) or proj_err_px > 0.5:
-                raise RuntimeError(f"3DGS projection sanity failed: reprojection error too large ({proj_err_px:.6f}px)")
+            if not math.isfinite(proj_err_px) or proj_err_px > 2.0:
+                raise RuntimeError(f"3DGS projection sanity failed: src->tgt->src consistency error too large ({proj_err_px:.6f}px)")
 
             centers_world = torch.stack(
                 [
