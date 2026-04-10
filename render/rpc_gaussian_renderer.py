@@ -280,7 +280,7 @@ class RPCGaussianRenderer:
             xy_center=scene_center,
             xy_scale=scene_scale,
         )
-        uv = torch.stack([samp, line], dim=-1).to(torch.float64)  # x=samp, y=line
+        uv = torch.stack([samp, line], dim=-1).to(dtype=torch.float64)  # x=samp, y=line
 
         xyz = xyz_local.to(torch.float64)
         n = xyz.shape[0]
@@ -290,6 +290,7 @@ class RPCGaussianRenderer:
         v = uv[:, 1:2]
 
         O = torch.zeros_like(X, device=xyz.device)
+        print(X.device,O.device,u.device,rpc_t.device)
         A1 = torch.cat([X, O, -u * X], dim=-1)
         A2 = torch.cat([O, X, -v * X], dim=-1)
         A = torch.cat([A1, A2], dim=0)
