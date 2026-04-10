@@ -179,6 +179,8 @@ class RPCGaussianRendererCfg:
     fit_height_margin: float = 30.0
     fit_max_reproj_p95_px: float = 1.0
     fit_cache_enable: bool = True
+    fit_z_eps: float = 1.0e-6
+    fit_min_positive_depth_ratio: float = 0.7
 
 
 class RPCGaussianRenderer:
@@ -305,15 +307,17 @@ class RPCGaussianRenderer:
             raise RuntimeError("需要安装opencv-python以完成虚拟相机分解") from e
 
         P_np = P.detach().cpu().numpy()
-        K_np, R_np, t_h = cv2.decomposeProjectionMatrix(P_np)[:3]
+        K_np, R_np, C_h_np = cv2.decomposeProjectionMatrix(P_np)[:3]
         K_np = K_np / max(K_np[2, 2], 1e-8)
-        t = (t_h[:3] / t_h[3]).reshape(3)
+        C_np = (C_h_np[:3] / C_h_np[3]).reshape(3)
+        t_np = -R_np @ C_np
 
         # 修正朝向：确保绝大多数点在相机前方
         R = torch.from_numpy(R_np).to(device=fit_dev, dtype=torch.float64)
-        t_t = torch.from_numpy(t).to(device=fit_dev, dtype=torch.float64)
-        z_cam = (R @ xyz.T + t_t[:, None])[2]
-        if (z_cam > 0).float().mean().item() < 0.5:
+        t_t = torch.from_numpy(t_np).to(device=fit_dev, dtype=torch.float64)
+        z_cam_pos = (R @ xyz.T + t_t[:, None])[2]
+        z_cam_neg = ((-R) @ xyz.T + (-t_t)[:, None])[2]
+        if (z_cam_neg > 0).float().mean().item() > (z_cam_pos > 0).float().mean().item():
             R = -R
             t_t = -t_t
 
@@ -326,8 +330,27 @@ class RPCGaussianRenderer:
         xyz_h = torch.cat([xyz, torch.ones((xyz.shape[0], 1), dtype=xyz.dtype, device=xyz.device)], dim=-1)
         cam = (w2c[:3, :] @ xyz_h.T).T
         proj = (K @ cam.T).T
-        uv_fit = proj[:, :2] / proj[:, 2:3].clamp_min(1e-8)
-        err = torch.linalg.norm(uv_fit - uv, dim=-1)
+        z = proj[:, 2]
+        valid = z > float(self.cfg.fit_z_eps)
+        pos_ratio = float(valid.float().mean().item())
+        if pos_ratio < float(self.cfg.fit_min_positive_depth_ratio):
+            scene_id = int(batch["scene_id"][bi].item()) if torch.is_tensor(batch.get("scene_id", None)) else bi
+            fx, fy = float(K[0, 0].item()), float(K[1, 1].item())
+            cx, cy = float(K[0, 2].item()), float(K[1, 2].item())
+            raise RuntimeError(
+                "Virtual camera fit has too few positive-depth samples: "
+                f"scene={scene_id}, view={tv}, positive_depth_ratio={pos_ratio:.4f}, "
+                f"threshold={float(self.cfg.fit_min_positive_depth_ratio):.4f}, "
+                f"valid_points={int(valid.sum().item())}/{int(valid.numel())}, "
+                f"K=[fx={fx:.3f}, fy={fy:.3f}, cx={cx:.3f}, cy={cy:.3f}]"
+            )
+
+        if not bool(valid.any()):
+            scene_id = int(batch["scene_id"][bi].item()) if torch.is_tensor(batch.get("scene_id", None)) else bi
+            raise RuntimeError(f"Virtual camera fit has no positive-depth samples: scene={scene_id}, view={tv}")
+
+        uv_fit = proj[valid, :2] / proj[valid, 2:3]
+        err = torch.linalg.norm(uv_fit - uv[valid], dim=-1)
         p50 = float(torch.quantile(err, 0.5).item())
         p95 = float(torch.quantile(err, 0.95).item())
         pmax = float(err.max().item())
@@ -524,16 +547,6 @@ class RPCGaussianRenderer:
         # 修复: RGB+D 的 D 是相机深度，不等价于世界高程。
         # 为避免错误监督，当前不返回 rendered_height，RenderPathLoss 将自动跳过 height 项。
         rh = None
-
-        rr, ra, rh = self._render_cuda(
-            centers=c,
-            opacity=(pack["opacity"] * pack["confidence"]).clamp(0.0, 1.0),
-            scale=pack["scale"],
-            rotation=pack["rotation"],
-            rgb=pack["rgb"],
-            cam=cam,
-            image_hw=(h_out, w_out),
-        )
 
         target_rgb_out = F.interpolate(target_rgb.unsqueeze(0), size=(h_out, w_out), mode="bilinear", align_corners=False).squeeze(0)
         target_h_out = None if target_h is None else F.interpolate(target_h.unsqueeze(0), size=(h_out, w_out), mode="bilinear", align_corners=False).squeeze(0)
