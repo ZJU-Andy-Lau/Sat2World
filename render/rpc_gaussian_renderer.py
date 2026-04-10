@@ -387,8 +387,8 @@ class RPCGaussianRenderer:
         rots = normalize_quaternion(rotation.to(torch.float32))
         op = opacity[:, 0].to(torch.float32).clamp(0.0, 1.0)
         colors = rgb.to(torch.float32)
-        # viewmats = cam.w2c.to(torch.float32).unsqueeze(0).to(means.device)
-        viewmats = cam.w2c.to(torch.float32).transpose(0, 1).contiguous().unsqueeze(0).to(means.device)
+        # gsplat 期望输入 world-to-camera（viewmats）矩阵，保持与拟合链路一致，不做转置补丁。
+        viewmats = cam.w2c.to(torch.float32).contiguous().unsqueeze(0).to(means.device)
         Ks = cam.K.to(torch.float32).unsqueeze(0).to(means.device)
         bg = torch.zeros((1, 3), device=means.device, dtype=torch.float32)
 
