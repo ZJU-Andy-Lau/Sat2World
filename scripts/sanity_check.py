@@ -7,10 +7,7 @@ config -> model -> renderer -> objective -> backward。
 from __future__ import annotations
 
 import argparse
-<<<<<<< codex/review-sat2world-model-code-and-third-party-libraries-i1o0jk
 import contextlib
-=======
->>>>>>> main
 import math
 from pathlib import Path
 import sys
@@ -78,7 +75,6 @@ def _pick_valid_pixel(mask_2d: torch.Tensor) -> tuple[int, int]:
     return int(valid[0, 0].item()), int(valid[0, 1].item())
 
 
-<<<<<<< codex/review-sat2world-model-code-and-third-party-libraries-i1o0jk
 def _sample_map_bilinear(map_2d: torch.Tensor, line: torch.Tensor, samp: torch.Tensor) -> torch.Tensor:
     """从 [H,W] 地图按 (line,samp) 双线性采样，返回 [N]。"""
     h, w = int(map_2d.shape[-2]), int(map_2d.shape[-1])
@@ -90,8 +86,6 @@ def _sample_map_bilinear(map_2d: torch.Tensor, line: torch.Tensor, samp: torch.T
     return out.view(-1)
 
 
-=======
->>>>>>> main
 def main() -> None:
     parser = argparse.ArgumentParser("Sat2World sanity check")
     parser.add_argument("--config", type=str, default="config/default.yaml")
@@ -245,106 +239,10 @@ def main() -> None:
             if not math.isfinite(sigma_major_px):
                 raise RuntimeError("3DGS Gaussian size sanity failed: projected sigma is not finite.")
 
-<<<<<<< codex/review-sat2world-model-code-and-third-party-libraries-i1o0jk
         if use_scaler:
             scaler.scale(total_loss).backward()
         else:
             total_loss.backward()
-=======
-        batch = _build_real_batch_from_val(cfg, scene_id=args.scene_id, val_index=args.val_index)
-        batch = move_batch_to_device(batch, device)
-        outputs = model(batch)
-        if "affine_coarse" in outputs:
-            raise RuntimeError("Single-stage model should not output affine_coarse.")
-        required_keys = [
-            "affine_pred",
-            "rpc_corrected",
-            "height_abs",
-            "point_abs",
-            "gaussian_centers_rpc",
-            "gaussian_centers_point",
-        ]
-        missing = [k for k in required_keys if k not in outputs]
-        if missing:
-            raise RuntimeError(f"Missing required single-stage outputs: {missing}")
-        render_outputs = renderer.render_paths(outputs, batch, mode="train")
-        total_loss, scalar_dict, aux_dict = objective(outputs, batch, global_step=0, epoch=0, render_outputs=render_outputs, mode="train")
-
-        # ------------------------------------------------------------------
-        # 额外 3DGS 渲染几何正确性检查：
-        # 1) 选取 source 视图一个像素，用 rpc_gt + h_gt 构造物方点；
-        # 2) 投影到 target 视图，检查投影像素误差；
-        # 3) 用 0.5m 高斯尺度估计投影椭圆主轴像素长度，检查是否在合理范围。
-        # ------------------------------------------------------------------
-        bi = 0
-        v_total = int(batch["images"].shape[1])
-        if v_total < 2:
-            raise RuntimeError(f"Need at least 2 views for sanity projection check, got V={v_total}")
-        vi_src, vi_tgt = 0, 1
-        h_img = int(batch["images"].shape[-2])
-        w_img = int(batch["images"].shape[-1])
-        src_mask = batch["height_valid_mask"][bi, vi_src, 0]
-        py, px = _pick_valid_pixel(src_mask)
-        line0 = torch.tensor([float(py)], dtype=torch.float32, device=device)
-        samp0 = torch.tensor([float(px)], dtype=torch.float32, device=device)
-        h0 = batch["height_gt"][bi, vi_src, 0, py, px].view(1).to(torch.float32)
-
-        rpc_src = batch["rpc_gt"][bi][vi_src]
-        rpc_tgt = batch["rpc_gt"][bi][vi_tgt]
-        scene_center = batch["scene_xy_center"][bi]
-        # 3DGS 渲染语义：局部米制坐标，投影时只做 offset，不做 scale。
-        scene_scale_render = torch.ones_like(scene_center)
-
-        x_obj, y_obj = rpc_src.RPC_LINESAMP2XY(
-            line_in=line0.to(dtype=torch.double),
-            samp_in=samp0.to(dtype=torch.double),
-            h_in=h0.to(dtype=torch.double),
-            output_type="tensor",
-            xy_center=scene_center.to(dtype=torch.double),
-            xy_scale=scene_scale_render.to(dtype=torch.double),
-        )
-        line1, samp1 = rpc_tgt.RPC_XY2LINESAMP(
-            x_in=x_obj,
-            y_in=y_obj,
-            h_in=h0.to(dtype=torch.double),
-            output_type="tensor",
-            xy_center=scene_center.to(dtype=torch.double),
-            xy_scale=scene_scale_render.to(dtype=torch.double),
-        )
-        proj_err = torch.sqrt((line1 - line0.to(dtype=torch.double)).square() + (samp1 - samp0.to(dtype=torch.double)).square())
-        proj_err_px = float(proj_err.detach().cpu().item())
-        if not math.isfinite(proj_err_px) or proj_err_px > 0.5:
-            raise RuntimeError(f"3DGS projection sanity failed: reprojection error too large ({proj_err_px:.6f}px)")
-
-        centers_world = torch.stack(
-            [
-                x_obj.to(dtype=torch.float32),
-                y_obj.to(dtype=torch.float32),
-                h0.to(dtype=torch.float32),
-            ],
-            dim=-1,
-        ).view(1, 3)
-        scale_05m = torch.full((1, 3), 0.5, dtype=torch.float32, device=device)
-        rot_identity = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32, device=device)
-        mean_2d, cov_2d = project_gaussians_to_view(
-            model.rpc_ops,
-            centers_world,
-            scale_05m,
-            rot_identity,
-            rpc_tgt,
-            scene_center,
-            scene_scale_render,
-            eps_xy_fd=float(cfg.get("renderer", {}).get("eps_xy_fd", 1e-2)),
-            eps_h_fd=float(cfg.get("renderer", {}).get("eps_h_fd", 1e-1)),
-            eps_cov=float(cfg.get("renderer", {}).get("eps_cov", 1e-4)),
-        )
-        eig = torch.linalg.eigvalsh(cov_2d[0].to(torch.float64))
-        sigma_major_px = float(torch.sqrt(eig.max().clamp_min(0.0)).detach().cpu().item())
-        if not math.isfinite(sigma_major_px):
-            raise RuntimeError("3DGS Gaussian size sanity failed: projected sigma is not finite.")
-
-        total_loss.backward()
->>>>>>> main
 
         print("[sanity_check] success")
         print("loss_total:", float(total_loss.detach().cpu().item()))
