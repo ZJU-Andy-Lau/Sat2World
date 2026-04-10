@@ -309,26 +309,16 @@ class RPCGaussianRenderer:
         t = (t_h[:3] / t_h[3]).reshape(3)
 
         # 修正朝向：确保绝大多数点在相机前方
-<<<<<<< codex/review-sat2world-model-codebase-hibnap
         fit_dev = xyz.device
         R = torch.from_numpy(R_np).to(device=fit_dev, dtype=torch.float64)
         t_t = torch.from_numpy(t).to(device=fit_dev, dtype=torch.float64)
-=======
-        R = torch.from_numpy(R_np).to(torch.float64)
-        t_t = torch.from_numpy(t).to(torch.float64)
->>>>>>> main
         z_cam = (R @ xyz.T + t_t[:, None])[2]
         if (z_cam > 0).float().mean().item() < 0.5:
             R = -R
             t_t = -t_t
 
-<<<<<<< codex/review-sat2world-model-codebase-hibnap
         K = torch.from_numpy(K_np).to(device=fit_dev, dtype=torch.float64)
         w2c = torch.eye(4, dtype=torch.float64, device=fit_dev)
-=======
-        K = torch.from_numpy(K_np).to(torch.float64)
-        w2c = torch.eye(4, dtype=torch.float64)
->>>>>>> main
         w2c[:3, :3] = R
         w2c[:3, 3] = t_t
 
@@ -505,7 +495,6 @@ class RPCGaussianRenderer:
                 f"Virtual camera fit too inaccurate for scene={int(batch['scene_id'][bi].item()) if 'scene_id' in batch else bi}, "
                 f"view={tv}: p95={cam.fit_p95:.4f}px > threshold={self.cfg.fit_max_reproj_p95_px:.4f}px"
             )
-<<<<<<< codex/review-sat2world-model-codebase-hibnap
 
         # 修复: 虚拟相机在 full-res 拟合，渲染分辨率为 downsample 后时必须同步缩放内参。
         sx = float(w_out) / float(max(w, 1))
@@ -535,8 +524,6 @@ class RPCGaussianRenderer:
         # 修复: RGB+D 的 D 是相机深度，不等价于世界高程。
         # 为避免错误监督，当前不返回 rendered_height，RenderPathLoss 将自动跳过 height 项。
         rh = None
-=======
->>>>>>> main
 
         rr, ra, rh = self._render_cuda(
             centers=c,
