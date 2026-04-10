@@ -20,7 +20,13 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from dataset import build_dataset, rpc_scene_collate_fn
-from render.rpc_gaussian_renderer import RPCGaussianRenderer, RPCGaussianRendererCfg, VirtualPinholeCamera
+from render import (
+    RPCGaussianRenderer,
+    RPCGaussianRendererCfg,
+    RPCGaussianRendererDGR,
+    RPCGaussianRendererDGRCfg,
+    VirtualPinholeCamera,
+)
 
 
 @dataclass
@@ -70,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--convention-probe-alpha-max-threshold", type=float, default=1e-3)
     p.add_argument("--save-images", action="store_true")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--renderer-backend", type=str, default="", help="override renderer backend: gsplat|dgr")
     return p.parse_args()
 
 
@@ -94,9 +101,35 @@ def to_device_batch(batch: dict[str, Any], device: torch.device) -> dict[str, An
     return move_batch_to_device(batch, device)
 
 
-def make_renderer(cfg: dict[str, Any]) -> RPCGaussianRenderer:
+def make_renderer(cfg: dict[str, Any], backend_override: str = "") -> tuple[RPCGaussianRenderer, str]:
+    renderer_cfg = cfg.get("renderer", {})
+    backend = str(
+        backend_override or renderer_cfg.get("backend", renderer_cfg.get("render_backend", "gsplat"))
+    ).lower()
+
+    from geometry import RPCGeometryOps
+
+    if backend in {"dgr", "diff_gaussian_rasterization", "diff-gaussian"}:
+        rcfg = RPCGaussianRendererDGRCfg()
+        for k, v in renderer_cfg.items():
+            if hasattr(rcfg, k):
+                setattr(rcfg, k, v)
+        # 检查时采用较密拟合
+        rcfg.fit_grid_nx = max(int(getattr(rcfg, "fit_grid_nx", 24)), 24)
+        rcfg.fit_grid_ny = max(int(getattr(rcfg, "fit_grid_ny", 24)), 24)
+        rcfg.fit_grid_nz = max(int(getattr(rcfg, "fit_grid_nz", 7)), 7)
+        # correctness 检查时尽量保留全部高斯，避免被筛选影响评估
+        rcfg.source_stride = 1
+        rcfg.confidence_threshold = 0.0
+        rcfg.topk_per_target = None
+        rcfg.exclude_self_source = False
+        rcfg.val_num_target_views = max(int(getattr(rcfg, "val_num_target_views", 1)), 1)
+        rcfg.use_all_targets_in_val = True
+        rcfg.render_downsample_factor_val = 1
+        return RPCGaussianRendererDGR(RPCGeometryOps(rpc_dtype=torch.double, net_dtype=torch.float32), rcfg), "dgr"
+
     rcfg = RPCGaussianRendererCfg()
-    for k, v in cfg.get("renderer", {}).items():
+    for k, v in renderer_cfg.items():
         if hasattr(rcfg, k):
             setattr(rcfg, k, v)
     # 检查时采用较密拟合
@@ -111,9 +144,7 @@ def make_renderer(cfg: dict[str, Any]) -> RPCGaussianRenderer:
     rcfg.val_num_target_views = max(int(getattr(rcfg, "val_num_target_views", 1)), 1)
     rcfg.use_all_targets_in_val = True
     rcfg.render_downsample_factor_val = 1
-    from geometry import RPCGeometryOps
-
-    return RPCGaussianRenderer(RPCGeometryOps(rpc_dtype=torch.double, net_dtype=torch.float32), rcfg)
+    return RPCGaussianRenderer(RPCGeometryOps(rpc_dtype=torch.double, net_dtype=torch.float32), rcfg), "gsplat"
 
 
 def _safe_logit(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
@@ -396,7 +427,7 @@ def _camera_handedness_diagnostics(
     }
 
 
-def _run_gsplat_convention_probe(
+def _run_backend_convention_probe(
     renderer: RPCGaussianRenderer,
     outputs: dict[str, Any],
     batch: dict[str, Any],
@@ -404,7 +435,7 @@ def _run_gsplat_convention_probe(
     tv: int,
     cam: VirtualPinholeCamera,
 ) -> dict[str, Any]:
-    """用多种相机矩阵约定探测“拟合链路 vs gsplat 渲染链路”的不一致。"""
+    """用多种相机矩阵约定探测“拟合链路 vs 渲染后端链路”的不一致。"""
     target_rgb = batch["images"][0, tv]
     h_out, w_out = int(target_rgb.shape[-2]), int(target_rgb.shape[-1])
     dev = target_rgb.device
@@ -565,7 +596,7 @@ def main() -> None:
         raise ValueError("view_i and view_j must be different for cross-view render correctness check")
 
     prog.log("build renderer")
-    renderer = make_renderer(cfg)
+    renderer, renderer_backend = make_renderer(cfg, backend_override=args.renderer_backend)
 
     prog.log("fit virtual camera")
     cam = renderer.fit_virtual_camera_for_target(batch, 0, args.view_j)
@@ -621,7 +652,7 @@ def main() -> None:
             gt_line=line_j,
             gt_samp=samp_j,
         )
-        conv_probe = _run_gsplat_convention_probe(
+        conv_probe = _run_backend_convention_probe(
             renderer=renderer,
             outputs=outputs,
             batch=batch,
@@ -722,7 +753,7 @@ def main() -> None:
                     ),
                 ),
                 CheckResult(
-                    "gsplat_convention_mismatch_suspected",
+                    "backend_convention_mismatch_suspected",
                     1.0 if conv_suspect else 0.0,
                     0.5,
                     not conv_suspect,
@@ -753,6 +784,7 @@ def main() -> None:
     print("\n================ Render Check Summary ================")
     print(f"scene_index={args.scene_index} view_i={args.view_i} view_j={args.view_j}")
     print(f"image_hw={h}x{w}")
+    print(f"renderer_backend={renderer_backend}")
     print(f"fit: p50={cam.fit_p50:.4f}px p95={cam.fit_p95:.4f}px max={cam.fit_max:.4f}px")
     print(f"render_time={dt:.4f}s")
 
@@ -764,7 +796,7 @@ def main() -> None:
         all_pass = all_pass and r.passed
 
     if "conv_probe" in locals():
-        print("\n-- gsplat convention probe (alpha-based) --")
+        print("\n-- backend convention probe (alpha-based) --")
         for k, v in conv_probe["alpha_max_by_variant"].items():
             print(f"  {k:16s}: alpha_max={v:.6f}")
         print(

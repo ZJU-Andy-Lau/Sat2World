@@ -113,10 +113,25 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
 
 
 def build_renderer(cfg: dict[str, Any], geometry_ops: Any) -> RPCGaussianRenderer:
-    from render import RPCGaussianRenderer, RPCGaussianRendererCfg
+    from render import (
+        RPCGaussianRenderer,
+        RPCGaussianRendererCfg,
+        RPCGaussianRendererDGR,
+        RPCGaussianRendererDGRCfg,
+    )
+
+    renderer_cfg = cfg.get("renderer", {})
+    backend = str(renderer_cfg.get("backend", renderer_cfg.get("render_backend", "gsplat"))).lower()
+
+    if backend in {"dgr", "diff_gaussian_rasterization", "diff-gaussian"}:
+        rcfg = RPCGaussianRendererDGRCfg()
+        for k, v in renderer_cfg.items():
+            if hasattr(rcfg, k):
+                setattr(rcfg, k, v)
+        return RPCGaussianRendererDGR(geometry_ops, rcfg)
 
     rcfg = RPCGaussianRendererCfg()
-    for k, v in cfg.get("renderer", {}).items():
+    for k, v in renderer_cfg.items():
         if hasattr(rcfg, k):
             setattr(rcfg, k, v)
     return RPCGaussianRenderer(geometry_ops, rcfg)

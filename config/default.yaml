@@ -126,6 +126,7 @@ model:
   output_raw_logits: true
 
 renderer:
+  backend: gsplat
   train_num_target_views: 1
   val_num_target_views: 1
   use_all_targets_in_val: false

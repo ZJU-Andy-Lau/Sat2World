@@ -168,11 +168,22 @@ def main() -> None:
     )
 
     model = build_model(cfg).to(device)
-    rcfg = RPCGaussianRendererCfg()
-    for k, v in cfg.get("renderer", {}).items():
-        if hasattr(rcfg, k):
-            setattr(rcfg, k, v)
-    renderer = RPCGaussianRenderer(model.rpc_ops, rcfg)
+    renderer_cfg = cfg.get("renderer", {})
+    backend = str(renderer_cfg.get("backend", renderer_cfg.get("render_backend", "gsplat"))).lower()
+    if backend in {"dgr", "diff_gaussian_rasterization", "diff-gaussian"}:
+        from render import RPCGaussianRendererDGR, RPCGaussianRendererDGRCfg
+
+        rcfg = RPCGaussianRendererDGRCfg()
+        for k, v in renderer_cfg.items():
+            if hasattr(rcfg, k):
+                setattr(rcfg, k, v)
+        renderer = RPCGaussianRendererDGR(model.rpc_ops, rcfg)
+    else:
+        rcfg = RPCGaussianRendererCfg()
+        for k, v in renderer_cfg.items():
+            if hasattr(rcfg, k):
+                setattr(rcfg, k, v)
+        renderer = RPCGaussianRenderer(model.rpc_ops, rcfg)
     objective = build_objective(cfg, model.rpc_ops)
     model = wrap_ddp(model, device)
 
