@@ -8,8 +8,10 @@ from pathlib import Path
 import time
 from typing import Any
 
+import numpy as np
 import torch
 import yaml
+from PIL import Image
 
 _ROOT = Path(__file__).resolve().parents[1]
 import sys
@@ -55,6 +57,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fit-p95-threshold", type=float, default=1.0)
     p.add_argument("--fit-max-threshold", type=float, default=3.0)
     p.add_argument("--render-time-threshold-sec", type=float, default=2.0)
+    p.add_argument("--center-centroid-threshold-px", type=float, default=2.0)
+    p.add_argument("--scale-radius-expected-px", type=float, default=1.0)
+    p.add_argument("--scale-radius-threshold-px", type=float, default=0.75)
+    p.add_argument("--visibility-l1-threshold", type=float, default=0.20)
+    p.add_argument("--save-images", action="store_true")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
@@ -89,26 +96,47 @@ def make_renderer(cfg: dict[str, Any]) -> RPCGaussianRenderer:
     rcfg.fit_grid_nx = max(int(getattr(rcfg, "fit_grid_nx", 24)), 24)
     rcfg.fit_grid_ny = max(int(getattr(rcfg, "fit_grid_ny", 24)), 24)
     rcfg.fit_grid_nz = max(int(getattr(rcfg, "fit_grid_nz", 7)), 7)
+    # correctness 检查时尽量保留全部高斯，避免被筛选影响评估
+    rcfg.source_stride = 1
+    rcfg.confidence_threshold = 0.0
+    rcfg.topk_per_target = None
+    rcfg.val_num_target_views = max(int(getattr(rcfg, "val_num_target_views", 1)), 1)
+    rcfg.use_all_targets_in_val = True
+    rcfg.render_downsample_factor_val = 1
     from geometry import RPCGeometryOps
 
     return RPCGaussianRenderer(RPCGeometryOps(rpc_dtype=torch.double, net_dtype=torch.float32), rcfg)
 
 
-def build_synthetic_outputs(batch: dict[str, Any], vi: int, sh_dim: int = 48) -> dict[str, Any]:
+def _safe_logit(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+    x = x.clamp(eps, 1.0 - eps)
+    return torch.log(x / (1.0 - x))
+
+
+def build_dense_anchor_outputs(batch: dict[str, Any], vi: int, sh_dim: int = 48) -> dict[str, Any]:
     b, v, _, h, w = batch["height_gt"].shape
     dev = batch["images"].device
 
     centers_rpc = torch.zeros((b, v, 3, h, w), device=dev, dtype=torch.float32)
     centers_point = torch.zeros((b, v, 3, h, w), device=dev, dtype=torch.float32)
 
-    # 构造一个规则局部米制网格作为测试中心
-    ys = torch.linspace(-100.0, 100.0, h, device=dev)
-    xs = torch.linspace(-100.0, 100.0, w, device=dev)
-    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-    gz = batch["height_gt"][0, vi, 0]
-    centers_rpc[0, vi, 0] = gx
-    centers_rpc[0, vi, 1] = gy
-    centers_rpc[0, vi, 2] = gz
+    rpc_i = batch["rpc_gt"][0][vi]
+    scene_center = batch["scene_xy_center"][0].to(dtype=torch.double, device=rpc_i.device)
+    scene_scale = torch.ones_like(scene_center)
+    lines = torch.arange(h, device=rpc_i.device, dtype=torch.double).view(-1, 1).expand(h, w).reshape(-1)
+    samps = torch.arange(w, device=rpc_i.device, dtype=torch.double).view(1, -1).expand(h, w).reshape(-1)
+    hs = batch["height_gt"][0, vi, 0].to(dtype=torch.double, device=rpc_i.device).reshape(-1)
+    x, y = rpc_i.RPC_LINESAMP2XY(
+        line_in=lines,
+        samp_in=samps,
+        h_in=hs,
+        output_type="tensor",
+        xy_center=scene_center,
+        xy_scale=scene_scale,
+    )
+    centers_rpc[0, vi, 0] = x.view(h, w).to(torch.float32, non_blocking=True)
+    centers_rpc[0, vi, 1] = y.view(h, w).to(torch.float32, non_blocking=True)
+    centers_rpc[0, vi, 2] = hs.view(h, w).to(torch.float32, non_blocking=True)
     centers_point.copy_(centers_rpc)
 
     opacity = torch.zeros((b, v, 1, h, w), device=dev, dtype=torch.float32)
@@ -120,7 +148,8 @@ def build_synthetic_outputs(batch: dict[str, Any], vi: int, sh_dim: int = 48) ->
     rotation[:, :, 0] = 1.0
 
     sh = torch.zeros((b, v, sh_dim, h, w), device=dev, dtype=torch.float32)
-    sh[0, vi, 0:3] = 1.0
+    rgb_i = batch["images"][0, vi].clamp(0.0, 1.0)
+    sh[0, vi, 0:3] = _safe_logit(rgb_i)
 
     conf = torch.zeros((b, v, 1, h, w), device=dev, dtype=torch.float32)
     conf[0, vi] = 1.0
@@ -135,6 +164,152 @@ def build_synthetic_outputs(batch: dict[str, Any], vi: int, sh_dim: int = 48) ->
         "gaussian_confidence_rpc": conf,
         "gaussian_confidence_point": conf,
         "rpc_corrected": batch["rpc_gt"],
+    }
+
+
+def _save_chw_rgb(path: Path, chw: torch.Tensor) -> None:
+    arr = chw.detach().cpu().clamp(0.0, 1.0).permute(1, 2, 0).numpy()
+    arr_u8 = (arr * 255.0 + 0.5).astype(np.uint8)
+    Image.fromarray(arr_u8).save(path)
+
+
+def _save_chw_gray(path: Path, chw: torch.Tensor) -> None:
+    arr = chw.detach().cpu().squeeze(0).clamp(0.0, 1.0).numpy()
+    arr_u8 = (arr * 255.0 + 0.5).astype(np.uint8)
+    Image.fromarray(arr_u8).save(path)
+
+
+def _project_anchor_to_view_j(
+    batch: dict[str, Any],
+    vi: int,
+    vj: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    h, w = batch["height_gt"].shape[-2:]
+    rpc_i = batch["rpc_gt"][0][vi]
+    rpc_j = batch["rpc_gt"][0][vj]
+    dev = rpc_i.device
+    scene_center_i = batch["scene_xy_center"][0].to(dtype=torch.double, device=dev)
+    scene_scale_i = torch.ones_like(scene_center_i)
+    scene_center_j = batch["scene_xy_center"][0].to(dtype=torch.double, device=rpc_j.device)
+    scene_scale_j = torch.ones_like(scene_center_j)
+
+    lines = torch.arange(h, device=dev, dtype=torch.double).view(-1, 1).expand(h, w).reshape(-1)
+    samps = torch.arange(w, device=dev, dtype=torch.double).view(1, -1).expand(h, w).reshape(-1)
+    hs = batch["height_gt"][0, vi, 0].to(dtype=torch.double, device=dev).reshape(-1)
+    rgb = batch["images"][0, vi].permute(1, 2, 0).reshape(-1, 3).detach().cpu().numpy().astype(np.float32)
+
+    x, y = rpc_i.RPC_LINESAMP2XY(
+        line_in=lines,
+        samp_in=samps,
+        h_in=hs,
+        output_type="tensor",
+        xy_center=scene_center_i,
+        xy_scale=scene_scale_i,
+    )
+    line_j, samp_j = rpc_j.RPC_XY2LINESAMP(
+        x_in=x.to(device=rpc_j.device),
+        y_in=y.to(device=rpc_j.device),
+        h_in=hs.to(device=rpc_j.device),
+        output_type="tensor",
+        xy_center=scene_center_j,
+        xy_scale=scene_scale_j,
+    )
+    return (
+        line_j.detach().cpu().numpy().astype(np.float32),
+        samp_j.detach().cpu().numpy().astype(np.float32),
+        hs.detach().cpu().numpy().astype(np.float32),
+        rgb,
+    )
+
+
+def _build_expected_maps_from_projection(
+    line_j: np.ndarray,
+    samp_j: np.ndarray,
+    depth_like: np.ndarray,
+    rgb: np.ndarray,
+    h: int,
+    w: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    l_int = np.rint(line_j).astype(np.int64)
+    s_int = np.rint(samp_j).astype(np.int64)
+    valid = (l_int >= 0) & (l_int < h) & (s_int >= 0) & (s_int < w) & np.isfinite(depth_like)
+    expected_rgb = np.zeros((h, w, 3), dtype=np.float32)
+    expected_depth = np.full((h, w), np.inf, dtype=np.float32)
+    expected_occ = np.zeros((h, w), dtype=np.float32)
+
+    idxs = np.nonzero(valid)[0]
+    for idx in idxs:
+        li = l_int[idx]
+        si = s_int[idx]
+        d = depth_like[idx]
+        if d < expected_depth[li, si]:
+            expected_depth[li, si] = d
+            expected_rgb[li, si] = rgb[idx]
+        expected_occ[li, si] += 1.0
+    return expected_rgb, expected_depth, expected_occ
+
+
+def _compute_correctness_metrics(
+    rendered_rgb: torch.Tensor,
+    rendered_alpha: torch.Tensor,
+    expected_rgb: np.ndarray,
+    expected_occ: np.ndarray,
+    expected_line: np.ndarray,
+    expected_samp: np.ndarray,
+    scale_expected_px: float,
+) -> dict[str, float]:
+    h, w = rendered_rgb.shape[-2:]
+    rr = rendered_rgb.detach().cpu().permute(1, 2, 0).numpy().astype(np.float32)
+    ra = rendered_alpha.detach().cpu().squeeze(0).numpy().astype(np.float32)
+
+    valid_occ = expected_occ > 0
+    if valid_occ.any():
+        color_l1 = np.abs(rr[valid_occ] - expected_rgb[valid_occ]).mean()
+    else:
+        color_l1 = float("inf")
+
+    # 中心正确性：比较投影点质心与渲染 alpha 质心
+    l_int = np.rint(expected_line).astype(np.int64)
+    s_int = np.rint(expected_samp).astype(np.int64)
+    valid = (l_int >= 0) & (l_int < h) & (s_int >= 0) & (s_int < w)
+    if valid.any():
+        gt_cy = float(expected_line[valid].mean())
+        gt_cx = float(expected_samp[valid].mean())
+    else:
+        gt_cy, gt_cx = 0.0, 0.0
+
+    yy, xx = np.meshgrid(np.arange(h, dtype=np.float32), np.arange(w, dtype=np.float32), indexing="ij")
+    a_sum = float(np.maximum(ra, 0.0).sum())
+    if a_sum > 1e-8:
+        rd_cy = float((yy * ra).sum() / a_sum)
+        rd_cx = float((xx * ra).sum() / a_sum)
+    else:
+        rd_cy, rd_cx = 0.0, 0.0
+    center_centroid_err = float(np.sqrt((gt_cy - rd_cy) ** 2 + (gt_cx - rd_cx) ** 2))
+
+    # 尺度正确性：把 alpha mask 视作所有基元叠加后的覆盖，折算“每个高斯平均等效半径”
+    valid_num = int(valid.sum())
+    area = float((ra > 0.05).sum())
+    if valid_num > 0:
+        area_per = area / float(valid_num)
+        radius_obs = float(np.sqrt(max(area_per, 0.0) / np.pi))
+    else:
+        radius_obs = 0.0
+    radius_bias = abs(radius_obs - float(scale_expected_px))
+
+    # 可见性（深度排序）近似正确性：在期望有投影的像素处，颜色接近比例
+    if valid_occ.any():
+        pix_l1 = np.abs(rr[valid_occ] - expected_rgb[valid_occ]).mean(axis=1)
+        visibility_ok_ratio = float((pix_l1 < 0.10).mean())
+    else:
+        visibility_ok_ratio = 0.0
+
+    return {
+        "center_centroid_err_px": center_centroid_err,
+        "scale_radius_obs_px": radius_obs,
+        "scale_radius_bias_px": radius_bias,
+        "visibility_color_l1": float(color_l1),
+        "visibility_ok_ratio": visibility_ok_ratio,
     }
 
 
@@ -164,7 +339,7 @@ def main() -> None:
     ]
 
     prog.log("prepare synthetic outputs")
-    outputs = build_synthetic_outputs(batch, args.view_i)
+    outputs = build_dense_anchor_outputs(batch, args.view_i)
 
     prog.log("render paths")
     t0 = time.perf_counter()
@@ -176,6 +351,75 @@ def main() -> None:
     point_path = render_out["point"]
     if int(rpc_path.get("num_targets", 0)) <= 0 or int(point_path.get("num_targets", 0)) <= 0:
         checks.append(CheckResult("num_targets", 0.0, 1.0, False, "render output has no targets"))
+
+    # 在 rpc path 中选择目标 view_j 对应的渲染结果
+    tv = rpc_path["target_view_indices"].detach().cpu()
+    match = (tv == int(args.view_j)).nonzero(as_tuple=False).view(-1)
+    if match.numel() == 0:
+        checks.append(CheckResult("target_view_present", 0.0, 1.0, False, f"view_j={args.view_j} not rendered"))
+    else:
+        ridx = int(match[0].item())
+        rendered_rgb = rpc_path["rendered_rgb"][ridx]
+        rendered_alpha = rpc_path["rendered_alpha"][ridx]
+        target_rgb = rpc_path["target_rgb"][ridx]
+
+        # 构建期望投影（用于中心/尺度/可见性检查）
+        line_j, samp_j, depth_like, src_rgb = _project_anchor_to_view_j(batch, args.view_i, args.view_j)
+        exp_rgb, _exp_depth, exp_occ = _build_expected_maps_from_projection(
+            line_j,
+            samp_j,
+            depth_like,
+            src_rgb,
+            int(rendered_rgb.shape[-2]),
+            int(rendered_rgb.shape[-1]),
+        )
+        metrics = _compute_correctness_metrics(
+            rendered_rgb,
+            rendered_alpha,
+            exp_rgb,
+            exp_occ,
+            line_j,
+            samp_j,
+            scale_expected_px=float(args.scale_radius_expected_px),
+        )
+
+        checks.extend(
+            [
+                CheckResult(
+                    "center_centroid_err_px",
+                    metrics["center_centroid_err_px"],
+                    args.center_centroid_threshold_px,
+                    metrics["center_centroid_err_px"] <= args.center_centroid_threshold_px,
+                ),
+                CheckResult(
+                    "scale_radius_bias_px",
+                    metrics["scale_radius_bias_px"],
+                    args.scale_radius_threshold_px,
+                    metrics["scale_radius_bias_px"] <= args.scale_radius_threshold_px,
+                    note=f"obs={metrics['scale_radius_obs_px']:.4f}px expected={args.scale_radius_expected_px:.4f}px",
+                ),
+                CheckResult(
+                    "visibility_color_l1",
+                    metrics["visibility_color_l1"],
+                    args.visibility_l1_threshold,
+                    metrics["visibility_color_l1"] <= args.visibility_l1_threshold,
+                    note=f"ok_ratio={metrics['visibility_ok_ratio']:.4f}",
+                ),
+            ]
+        )
+
+        if args.save_images:
+            work_dir = Path(cfg.get("system", {}).get("work_dir", "work_dirs/sat2world_default"))
+            out_dir = work_dir / "render_check" / f"scene_{int(batch['scene_id'][0].item())}" / f"vi_{args.view_i}_vj_{args.view_j}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            _save_chw_rgb(out_dir / "rendered_rgb.png", rendered_rgb)
+            _save_chw_rgb(out_dir / "target_rgb.png", target_rgb)
+            _save_chw_gray(out_dir / "rendered_alpha.png", rendered_alpha)
+            _save_chw_rgb(out_dir / "expected_rgb_nearest_depth.png", torch.from_numpy(exp_rgb).permute(2, 0, 1))
+            abs_err = (rendered_rgb.detach().cpu() - torch.from_numpy(exp_rgb).permute(2, 0, 1)).abs().clamp(0.0, 1.0)
+            _save_chw_rgb(out_dir / "abs_error_render_vs_expected.png", abs_err)
+            occ_norm = torch.from_numpy(exp_occ / max(float(exp_occ.max()), 1.0)).unsqueeze(0)
+            _save_chw_gray(out_dir / "expected_occupancy.png", occ_norm)
 
     print("\n================ Render Check Summary ================")
     print(f"scene_index={args.scene_index} view_i={args.view_i} view_j={args.view_j}")
