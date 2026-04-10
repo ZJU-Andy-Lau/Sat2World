@@ -203,6 +203,32 @@ class Sat2World(nn.Module):
         """把 [B*V,C,H,W] 整理为 [B,V,C,H,W]。"""
         return reshape_bv_to_bvchw(x, b, v)
 
+    def _point_map_norm_to_local_meter(
+        self,
+        point_map: torch.Tensor,
+        scene_xy_scale: Any,
+    ) -> torch.Tensor:
+        """把点云从 (x_norm,y_norm,h_m) 转为局部米制 (x_l,y_l,h_m)。
+
+        约定：
+        - 局部米制定义为相对 scene center 的 ENU/墨卡托局部平面坐标，不含平移项；
+        - 仅对 x/y 乘以 scene scale（顺序为 [y, x]），z 保持不变。
+        """
+        if scene_xy_scale is None:
+            return point_map
+        if not torch.is_tensor(scene_xy_scale):
+            return point_map
+        if scene_xy_scale.ndim != 2 or scene_xy_scale.shape[-1] != 2:
+            return point_map
+
+        out = point_map.clone()
+        b = int(point_map.shape[0])
+        sx = scene_xy_scale[:, 1].to(device=point_map.device, dtype=point_map.dtype).view(b, 1, 1, 1, 1)
+        sy = scene_xy_scale[:, 0].to(device=point_map.device, dtype=point_map.dtype).view(b, 1, 1, 1, 1)
+        out[:, :, 0:1] = out[:, :, 0:1] * sx
+        out[:, :, 1:2] = out[:, :, 1:2] * sy
+        return out
+
     def forward(self, batch: dict[str, Any]) -> dict[str, Any]:
         """执行 Sat2World 前向。
 
@@ -370,15 +396,21 @@ class Sat2World(nn.Module):
             gaussian_conf_point = self._reshape_logits_to_bv(gauss_pred["confidence_point"], b, v)
 
             # 10) 双路径中心
+            # 3DGS 坐标语义统一为“局部米制”：
+            # - rpc+height 路径：仅做 offset（scene center），不做 scale；
+            # - point 路径：x/y 从归一化域乘回米制 scale，不反加 offset。
+            scene_scale_for_rpc = None
+            if scene_xy_center is not None and torch.is_tensor(scene_xy_center):
+                scene_scale_for_rpc = torch.ones_like(scene_xy_center)
             centers_rpc = self.rpc_ops.centers_from_rpc_and_height_batch(
                 corrected_rpc_batch=rpc_corrected,
                 pixel_grid=image_grid,
                 height_abs=height_abs,
                 scene_xy_center=scene_xy_center,
-                scene_xy_scale=scene_xy_scale,
+                scene_xy_scale=scene_scale_for_rpc,
                 downsample_factor=self._current_center_downsample(),
             )
-            centers_point = point_abs
+            centers_point = self._point_map_norm_to_local_meter(point_abs, scene_xy_scale)
             out.update(
                 {
                     "gaussian_opacity": gaussian_opacity,
