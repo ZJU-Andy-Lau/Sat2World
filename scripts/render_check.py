@@ -63,6 +63,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--visibility-l1-threshold", type=float, default=0.20)
     p.add_argument("--alpha-max-min-threshold", type=float, default=1e-3)
     p.add_argument("--alpha-coverage-min-threshold", type=float, default=1e-4)
+    p.add_argument("--cam-det-min-threshold", type=float, default=0.5)
+    p.add_argument("--cam-orthogonality-max-threshold", type=float, default=1e-2)
+    p.add_argument("--cam-source-positive-depth-ratio-min-threshold", type=float, default=0.5)
+    p.add_argument("--cam-reproj-gap-min-threshold-px", type=float, default=1e-3)
     p.add_argument("--save-images", action="store_true")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -325,6 +329,72 @@ def _compute_correctness_metrics(
     }
 
 
+def _camera_handedness_diagnostics(
+    cam: Any,
+    xyz_local: np.ndarray,
+    gt_line: np.ndarray,
+    gt_samp: np.ndarray,
+) -> dict[str, float]:
+    """诊断虚拟相机是否存在“手性错误但重投影可通过”的问题。"""
+    if xyz_local.ndim != 2 or xyz_local.shape[1] != 3:
+        raise ValueError(f"xyz_local must be [N,3], got {xyz_local.shape}")
+    n = xyz_local.shape[0]
+    xyz_h = np.concatenate([xyz_local.astype(np.float64), np.ones((n, 1), dtype=np.float64)], axis=1)
+    K = cam.K.detach().cpu().numpy().astype(np.float64)
+    w2c = cam.w2c.detach().cpu().numpy().astype(np.float64)
+    R = w2c[:3, :3]
+    t = w2c[:3, 3]
+
+    det_r = float(np.linalg.det(R))
+    orth_err = float(np.linalg.norm(R.T @ R - np.eye(3, dtype=np.float64), ord="fro"))
+
+    cam_xyz = (w2c[:3, :] @ xyz_h.T).T
+    z = cam_xyz[:, 2]
+    pos_ratio = float((z > 1e-6).mean())
+
+    # 与当前代码中的符号翻转保持一致：R,t 同时乘 -1。
+    R_neg = -R
+    t_neg = -t
+    w2c_neg = np.eye(4, dtype=np.float64)
+    w2c_neg[:3, :3] = R_neg
+    w2c_neg[:3, 3] = t_neg
+    cam_xyz_neg = (w2c_neg[:3, :] @ xyz_h.T).T
+    z_neg = cam_xyz_neg[:, 2]
+    pos_ratio_neg = float((z_neg > 1e-6).mean())
+
+    proj = (K @ cam_xyz.T).T
+    proj_neg = (K @ cam_xyz_neg.T).T
+    valid = np.isfinite(proj[:, 2]) & (np.abs(proj[:, 2]) > 1e-8)
+    valid_neg = np.isfinite(proj_neg[:, 2]) & (np.abs(proj_neg[:, 2]) > 1e-8)
+    uv = np.zeros((n, 2), dtype=np.float64)
+    uv_neg = np.zeros((n, 2), dtype=np.float64)
+    uv[valid] = proj[valid, :2] / proj[valid, 2:3]
+    uv_neg[valid_neg] = proj_neg[valid_neg, :2] / proj_neg[valid_neg, 2:3]
+
+    gt_uv = np.stack([gt_samp.astype(np.float64), gt_line.astype(np.float64)], axis=-1)
+    both = valid & valid_neg & np.isfinite(gt_uv).all(axis=1)
+    if both.any():
+        err = np.linalg.norm(uv[both] - gt_uv[both], axis=1)
+        err_neg = np.linalg.norm(uv_neg[both] - gt_uv[both], axis=1)
+        reproj_p95 = float(np.quantile(err, 0.95))
+        reproj_p95_neg = float(np.quantile(err_neg, 0.95))
+        reproj_gap = abs(reproj_p95 - reproj_p95_neg)
+    else:
+        reproj_p95 = float("inf")
+        reproj_p95_neg = float("inf")
+        reproj_gap = float("inf")
+
+    return {
+        "cam_det_r": det_r,
+        "cam_orthogonality_err": orth_err,
+        "cam_source_positive_depth_ratio": pos_ratio,
+        "cam_source_positive_depth_ratio_if_negated": pos_ratio_neg,
+        "cam_reproj_p95_current_px": reproj_p95,
+        "cam_reproj_p95_negated_px": reproj_p95_neg,
+        "cam_reproj_p95_gap_px": reproj_gap,
+    }
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
@@ -392,6 +462,12 @@ def main() -> None:
             int(rendered_rgb.shape[-2]),
             int(rendered_rgb.shape[-1]),
         )
+        cam_diag = _camera_handedness_diagnostics(
+            cam=cam,
+            xyz_local=np.stack([x_obj, y_obj, h_obj], axis=-1),
+            gt_line=line_j,
+            gt_samp=samp_j,
+        )
         metrics = _compute_correctness_metrics(
             rendered_rgb,
             rendered_alpha,
@@ -440,6 +516,37 @@ def main() -> None:
                     args.visibility_l1_threshold,
                     metrics["visibility_color_l1"] <= args.visibility_l1_threshold,
                     note=f"ok_ratio={metrics['visibility_ok_ratio']:.4f}, alpha_max={metrics['alpha_max']:.6f}",
+                ),
+                CheckResult(
+                    "cam_det_r",
+                    cam_diag["cam_det_r"],
+                    args.cam_det_min_threshold,
+                    cam_diag["cam_det_r"] >= args.cam_det_min_threshold,
+                    note=f"det should be close to +1; negated_depth_ratio={cam_diag['cam_source_positive_depth_ratio_if_negated']:.4f}",
+                ),
+                CheckResult(
+                    "cam_orthogonality_err",
+                    cam_diag["cam_orthogonality_err"],
+                    args.cam_orthogonality_max_threshold,
+                    cam_diag["cam_orthogonality_err"] <= args.cam_orthogonality_max_threshold,
+                ),
+                CheckResult(
+                    "cam_source_positive_depth_ratio",
+                    cam_diag["cam_source_positive_depth_ratio"],
+                    args.cam_source_positive_depth_ratio_min_threshold,
+                    cam_diag["cam_source_positive_depth_ratio"] >= args.cam_source_positive_depth_ratio_min_threshold,
+                    note=f"if negated={cam_diag['cam_source_positive_depth_ratio_if_negated']:.4f}",
+                ),
+                CheckResult(
+                    "cam_reproj_gap_current_vs_negated_p95_px",
+                    cam_diag["cam_reproj_p95_gap_px"],
+                    args.cam_reproj_gap_min_threshold_px,
+                    cam_diag["cam_reproj_p95_gap_px"] >= args.cam_reproj_gap_min_threshold_px,
+                    note=(
+                        f"curr_p95={cam_diag['cam_reproj_p95_current_px']:.6f}, "
+                        f"neg_p95={cam_diag['cam_reproj_p95_negated_px']:.6f}; "
+                        "gap too small indicates sign ambiguity"
+                    ),
                 ),
             ]
         )
