@@ -21,6 +21,7 @@ from torch import nn
 from engine.checkpoint import save_checkpoint
 from engine.distributed import (
     all_reduce_mean,
+    assert_rpc_tree_device,
     assert_tensor_tree_device,
     barrier,
     get_cuda_memory_stats,
@@ -175,12 +176,17 @@ class Trainer:
         """统一前向：model -> renderer(optional) -> objective。"""
         if self.device_sanity_check:
             assert_tensor_tree_device(batch_dev, self.device, prefix="batch")
+            for k in ("rpc_gt", "rpc_init", "rpc_corrected"):
+                if k in batch_dev:
+                    assert_rpc_tree_device(batch_dev[k], self.device, prefix=f"batch.{k}")
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
         if hasattr(model_ref, "set_runtime_context"):
             model_ref.set_runtime_context(global_step=self.global_step, mode=mode)
         outputs = self.model(batch_dev)
         if self.device_sanity_check:
             assert_tensor_tree_device(outputs, self.device, prefix="outputs")
+            if "rpc_corrected" in outputs:
+                assert_rpc_tree_device(outputs["rpc_corrected"], self.device, prefix="outputs.rpc_corrected")
         use_render = (mode == "train" and self.enable_render_train) or (mode != "train" and self.enable_render_val)
         render_outputs = (
             self.renderer.render_paths(
