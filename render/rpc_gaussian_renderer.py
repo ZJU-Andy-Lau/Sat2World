@@ -289,7 +289,7 @@ class RPCGaussianRenderer:
         u = uv[:, 0:1]
         v = uv[:, 1:2]
 
-        O = torch.zeros_like(X)
+        O = torch.zeros_like(X, device=xyz.device)
         A1 = torch.cat([X, O, -u * X], dim=-1)
         A2 = torch.cat([O, X, -v * X], dim=-1)
         A = torch.cat([A1, A2], dim=0)
