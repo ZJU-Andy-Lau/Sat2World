@@ -20,7 +20,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from dataset import build_dataset, rpc_scene_collate_fn
-from render.rpc_gaussian_renderer import RPCGaussianRenderer, RPCGaussianRendererCfg
+from render.rpc_gaussian_renderer import RPCGaussianRenderer, RPCGaussianRendererCfg, VirtualPinholeCamera
 
 
 @dataclass
@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--visibility-l1-threshold", type=float, default=0.20)
     p.add_argument("--alpha-max-min-threshold", type=float, default=1e-3)
     p.add_argument("--alpha-coverage-min-threshold", type=float, default=1e-4)
+    p.add_argument("--cam-det-min-threshold", type=float, default=0.5)
+    p.add_argument("--cam-orthogonality-max-threshold", type=float, default=1e-2)
+    p.add_argument("--cam-source-positive-depth-ratio-min-threshold", type=float, default=0.5)
+    p.add_argument("--cam-reproj-gap-min-threshold-px", type=float, default=1e-3)
+    p.add_argument("--convention-probe-alpha-max-threshold", type=float, default=1e-3)
     p.add_argument("--save-images", action="store_true")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -325,6 +330,158 @@ def _compute_correctness_metrics(
     }
 
 
+def _camera_handedness_diagnostics(
+    cam: Any,
+    xyz_local: np.ndarray,
+    gt_line: np.ndarray,
+    gt_samp: np.ndarray,
+) -> dict[str, float]:
+    """诊断虚拟相机是否存在“手性错误但重投影可通过”的问题。"""
+    if xyz_local.ndim != 2 or xyz_local.shape[1] != 3:
+        raise ValueError(f"xyz_local must be [N,3], got {xyz_local.shape}")
+    n = xyz_local.shape[0]
+    xyz_h = np.concatenate([xyz_local.astype(np.float64), np.ones((n, 1), dtype=np.float64)], axis=1)
+    K = cam.K.detach().cpu().numpy().astype(np.float64)
+    w2c = cam.w2c.detach().cpu().numpy().astype(np.float64)
+    R = w2c[:3, :3]
+    t = w2c[:3, 3]
+
+    det_r = float(np.linalg.det(R))
+    orth_err = float(np.linalg.norm(R.T @ R - np.eye(3, dtype=np.float64), ord="fro"))
+
+    cam_xyz = (w2c[:3, :] @ xyz_h.T).T
+    z = cam_xyz[:, 2]
+    pos_ratio = float((z > 1e-6).mean())
+
+    # 与当前代码中的符号翻转保持一致：R,t 同时乘 -1。
+    R_neg = -R
+    t_neg = -t
+    w2c_neg = np.eye(4, dtype=np.float64)
+    w2c_neg[:3, :3] = R_neg
+    w2c_neg[:3, 3] = t_neg
+    cam_xyz_neg = (w2c_neg[:3, :] @ xyz_h.T).T
+    z_neg = cam_xyz_neg[:, 2]
+    pos_ratio_neg = float((z_neg > 1e-6).mean())
+
+    proj = (K @ cam_xyz.T).T
+    proj_neg = (K @ cam_xyz_neg.T).T
+    valid = np.isfinite(proj[:, 2]) & (np.abs(proj[:, 2]) > 1e-8)
+    valid_neg = np.isfinite(proj_neg[:, 2]) & (np.abs(proj_neg[:, 2]) > 1e-8)
+    uv = np.zeros((n, 2), dtype=np.float64)
+    uv_neg = np.zeros((n, 2), dtype=np.float64)
+    uv[valid] = proj[valid, :2] / proj[valid, 2:3]
+    uv_neg[valid_neg] = proj_neg[valid_neg, :2] / proj_neg[valid_neg, 2:3]
+
+    gt_uv = np.stack([gt_samp.astype(np.float64), gt_line.astype(np.float64)], axis=-1)
+    both = valid & valid_neg & np.isfinite(gt_uv).all(axis=1)
+    if both.any():
+        err = np.linalg.norm(uv[both] - gt_uv[both], axis=1)
+        err_neg = np.linalg.norm(uv_neg[both] - gt_uv[both], axis=1)
+        reproj_p95 = float(np.quantile(err, 0.95))
+        reproj_p95_neg = float(np.quantile(err_neg, 0.95))
+        reproj_gap = abs(reproj_p95 - reproj_p95_neg)
+    else:
+        reproj_p95 = float("inf")
+        reproj_p95_neg = float("inf")
+        reproj_gap = float("inf")
+
+    return {
+        "cam_det_r": det_r,
+        "cam_orthogonality_err": orth_err,
+        "cam_source_positive_depth_ratio": pos_ratio,
+        "cam_source_positive_depth_ratio_if_negated": pos_ratio_neg,
+        "cam_reproj_p95_current_px": reproj_p95,
+        "cam_reproj_p95_negated_px": reproj_p95_neg,
+        "cam_reproj_p95_gap_px": reproj_gap,
+    }
+
+
+def _run_gsplat_convention_probe(
+    renderer: RPCGaussianRenderer,
+    outputs: dict[str, Any],
+    batch: dict[str, Any],
+    vi: int,
+    tv: int,
+    cam: VirtualPinholeCamera,
+) -> dict[str, Any]:
+    """用多种相机矩阵约定探测“拟合链路 vs gsplat 渲染链路”的不一致。"""
+    target_rgb = batch["images"][0, tv]
+    h_out, w_out = int(target_rgb.shape[-2]), int(target_rgb.shape[-1])
+    dev = target_rgb.device
+
+    centers = outputs["gaussian_centers_rpc"][0].permute(0, 2, 3, 1).reshape(-1, 3)
+    opacity = outputs["gaussian_opacity"][0].permute(0, 2, 3, 1).reshape(-1, 1)
+    conf = outputs["gaussian_confidence_rpc"][0].permute(0, 2, 3, 1).reshape(-1, 1)
+    scale = outputs["gaussian_scale"][0].permute(0, 2, 3, 1).reshape(-1, 3)
+    rotation = outputs["gaussian_rotation"][0].permute(0, 2, 3, 1).reshape(-1, 4)
+    sh = outputs["gaussian_sh"][0].permute(0, 2, 3, 1).reshape(-1, outputs["gaussian_sh"].shape[2])
+    rgb = torch.sigmoid(sh[:, :3])
+
+    op_eff = (opacity * conf).clamp(0.0, 1.0).squeeze(1)
+    keep = op_eff > 1.0e-6
+    if not bool(keep.any()):
+        return {
+            "num_probe_gaussians": 0,
+            "alpha_max_by_variant": {},
+            "best_variant": "none",
+            "best_alpha_max": 0.0,
+            "current_alpha_max": 0.0,
+            "suspect_convention_mismatch": False,
+        }
+
+    centers = centers[keep].to(device=dev, dtype=torch.float32)
+    scale = scale[keep].to(device=dev, dtype=torch.float32)
+    rotation = rotation[keep].to(device=dev, dtype=torch.float32)
+    rgb = rgb[keep].to(device=dev, dtype=torch.float32)
+    op_eff = op_eff[keep].unsqueeze(1).to(device=dev, dtype=torch.float32)
+
+    I4 = torch.eye(4, dtype=torch.float32, device=dev)
+    Fz = I4.clone()
+    Fz[2, 2] = -1.0
+    Fy = I4.clone()
+    Fy[1, 1] = -1.0
+    Fzy = Fy @ Fz
+
+    variants: dict[str, torch.Tensor] = {
+        "current": cam.w2c.to(device=dev, dtype=torch.float32),
+        "cam_z_flip": Fz @ cam.w2c.to(device=dev, dtype=torch.float32),
+        "cam_y_flip": Fy @ cam.w2c.to(device=dev, dtype=torch.float32),
+        "cam_zy_flip": Fzy @ cam.w2c.to(device=dev, dtype=torch.float32),
+        "w2c_transposed": cam.w2c.to(device=dev, dtype=torch.float32).transpose(0, 1).contiguous(),
+    }
+
+    alpha_max_by_variant: dict[str, float] = {}
+    for name, w2c_var in variants.items():
+        cam_var = VirtualPinholeCamera(
+            K=cam.K.to(device=dev, dtype=torch.float32),
+            w2c=w2c_var,
+            fit_p50=cam.fit_p50,
+            fit_p95=cam.fit_p95,
+            fit_max=cam.fit_max,
+        )
+        _, ra_var, _ = renderer._render_cuda(
+            centers=centers,
+            opacity=op_eff,
+            scale=scale,
+            rotation=rotation,
+            rgb=rgb,
+            cam=cam_var,
+            image_hw=(h_out, w_out),
+        )
+        alpha_max_by_variant[name] = float(torch.maximum(ra_var, torch.zeros_like(ra_var)).max().item())
+
+    best_variant = max(alpha_max_by_variant.items(), key=lambda kv: kv[1])[0]
+    best_alpha = float(alpha_max_by_variant[best_variant])
+    cur_alpha = float(alpha_max_by_variant.get("current", 0.0))
+    return {
+        "num_probe_gaussians": int(keep.sum().item()),
+        "alpha_max_by_variant": alpha_max_by_variant,
+        "best_variant": best_variant,
+        "best_alpha_max": best_alpha,
+        "current_alpha_max": cur_alpha,
+    }
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
@@ -392,6 +549,25 @@ def main() -> None:
             int(rendered_rgb.shape[-2]),
             int(rendered_rgb.shape[-1]),
         )
+        cam_diag = _camera_handedness_diagnostics(
+            cam=cam,
+            xyz_local=np.stack([x_obj, y_obj, h_obj], axis=-1),
+            gt_line=line_j,
+            gt_samp=samp_j,
+        )
+        conv_probe = _run_gsplat_convention_probe(
+            renderer=renderer,
+            outputs=outputs,
+            batch=batch,
+            vi=args.view_i,
+            tv=args.view_j,
+            cam=cam,
+        )
+        conv_suspect = (
+            conv_probe["current_alpha_max"] < args.convention_probe_alpha_max_threshold
+            and conv_probe["best_alpha_max"] >= args.convention_probe_alpha_max_threshold
+            and conv_probe["best_variant"] != "current"
+        )
         metrics = _compute_correctness_metrics(
             rendered_rgb,
             rendered_alpha,
@@ -440,6 +616,50 @@ def main() -> None:
                     args.visibility_l1_threshold,
                     metrics["visibility_color_l1"] <= args.visibility_l1_threshold,
                     note=f"ok_ratio={metrics['visibility_ok_ratio']:.4f}, alpha_max={metrics['alpha_max']:.6f}",
+                ),
+                CheckResult(
+                    "cam_det_r",
+                    cam_diag["cam_det_r"],
+                    args.cam_det_min_threshold,
+                    cam_diag["cam_det_r"] >= args.cam_det_min_threshold,
+                    note=f"det should be close to +1; negated_depth_ratio={cam_diag['cam_source_positive_depth_ratio_if_negated']:.4f}",
+                ),
+                CheckResult(
+                    "cam_orthogonality_err",
+                    cam_diag["cam_orthogonality_err"],
+                    args.cam_orthogonality_max_threshold,
+                    cam_diag["cam_orthogonality_err"] <= args.cam_orthogonality_max_threshold,
+                ),
+                CheckResult(
+                    "cam_source_positive_depth_ratio",
+                    cam_diag["cam_source_positive_depth_ratio"],
+                    args.cam_source_positive_depth_ratio_min_threshold,
+                    cam_diag["cam_source_positive_depth_ratio"] >= args.cam_source_positive_depth_ratio_min_threshold,
+                    note=f"if negated={cam_diag['cam_source_positive_depth_ratio_if_negated']:.4f}",
+                ),
+                CheckResult(
+                    "cam_reproj_gap_current_vs_negated_p95_px",
+                    cam_diag["cam_reproj_p95_gap_px"],
+                    args.cam_reproj_gap_min_threshold_px,
+                    cam_diag["cam_reproj_p95_gap_px"] >= args.cam_reproj_gap_min_threshold_px,
+                    note=(
+                        f"curr_p95={cam_diag['cam_reproj_p95_current_px']:.6f}, "
+                        f"neg_p95={cam_diag['cam_reproj_p95_negated_px']:.6f}; "
+                        "gap too small indicates sign ambiguity"
+                    ),
+                ),
+                CheckResult(
+                    "gsplat_convention_mismatch_suspected",
+                    1.0 if conv_suspect else 0.0,
+                    0.5,
+                    not conv_suspect,
+                    note=(
+                        f"probeN={conv_probe['num_probe_gaussians']}, "
+                        f"current_alpha_max={conv_probe['current_alpha_max']:.6f}, "
+                        f"best_variant={conv_probe['best_variant']}, "
+                        f"best_alpha_max={conv_probe['best_alpha_max']:.6f}, "
+                        f"threshold={args.convention_probe_alpha_max_threshold:.6f}"
+                    ),
                 ),
             ]
         )
