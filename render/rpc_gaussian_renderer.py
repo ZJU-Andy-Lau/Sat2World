@@ -323,7 +323,7 @@ class RPCGaussianRenderer:
         w2c[:3, 3] = t_t
 
         # 误差评估
-        xyz_h = torch.cat([xyz, torch.ones((xyz.shape[0], 1), dtype=xyz.dtype)], dim=-1)
+        xyz_h = torch.cat([xyz, torch.ones((xyz.shape[0], 1), dtype=xyz.dtype, device=xyz.device)], dim=-1)
         cam = (w2c[:3, :] @ xyz_h.T).T
         proj = (K @ cam.T).T
         uv_fit = proj[:, :2] / proj[:, 2:3].clamp_min(1e-8)
