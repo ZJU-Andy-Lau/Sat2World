@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Any
 
 import torch
@@ -45,6 +46,23 @@ class CheckResult:
     threshold: float
     passed: bool
     note: str = ""
+
+
+class ProgressLogger:
+    """轻量进度日志器，打印步骤编号与耗时。"""
+
+    def __init__(self) -> None:
+        self.t0 = time.perf_counter()
+        self.t_last = self.t0
+        self.step = 0
+
+    def log(self, message: str) -> None:
+        self.step += 1
+        now = time.perf_counter()
+        step_sec = now - self.t_last
+        total_sec = now - self.t0
+        print(f"[render_check][step={self.step:02d}] {message} | step={step_sec:.2f}s total={total_sec:.2f}s", flush=True)
+        self.t_last = now
 
 
 def parse_args() -> argparse.Namespace:
@@ -373,12 +391,19 @@ def _run_visibility_probe(
 
 
 def main() -> None:
+    prog = ProgressLogger()
+    prog.log("startup")
+
     args = parse_args()
+    prog.log("arguments parsed")
     cfg = load_cfg(args.config)
+    prog.log(f"config loaded: {args.config}")
 
     device = torch.device(args.device)
     batch_cpu = build_val_batch(cfg, scene_index=int(args.scene_index))
+    prog.log(f"val scene loaded and collated: scene_index={args.scene_index}")
     batch = _to_device_batch(batch_cpu, device)
+    prog.log(f"batch moved to device: {device}")
 
     b, v, _, h, w = batch["images"].shape
     if b != 1:
@@ -394,9 +419,11 @@ def main() -> None:
         raise ValueError("view_i 与 view_j 不能相同")
 
     renderer = _make_renderer(cfg)
+    prog.log("renderer created with deterministic/no-filter overrides")
 
     # ---------- 1) 构建 synthetic anchors/world ----------
     anchor = _build_anchor_world_from_view_i(batch, vi)
+    prog.log(f"anchor world built from view_i={vi} with full pixels ({h}x{w})")
     raw_world = anchor["raw_world"]
 
     # point path 输入中心语义由参数控制：
@@ -418,13 +445,18 @@ def main() -> None:
         radius_meter=float(args.radius_meter),
         sh_dim=sh_dim,
     )
+    prog.log("synthetic outputs assembled")
 
     # ---------- 2) 调 renderer 全链路 ----------
+    prog.log("calling renderer.render_paths (this may take long for full-pixel anchors)")
     render_out = renderer.render_paths(outputs, batch, mode="val", global_step=0, epoch=0)
+    prog.log("renderer.render_paths finished")
 
     # ---------- 3) 中心投影正确性（投影层） ----------
     rpc_j = batch["rpc_gt"][0][vj]
+    prog.log(f"projecting GT anchors from view_i={vi} to view_j={vj} using rpc_gt")
     anchor_i2j = _project_anchor_to_view_j(raw_world, rpc_j)
+    prog.log("anchor_i2j projection finished")
 
     # 取与 point/rpc path 输入一致的一组中心做投影。
     # 注意：renderer 的投影统一使用 scene_center + scene_scale=ones。
@@ -450,6 +482,7 @@ def main() -> None:
         renderer.cfg.eps_h_fd,
         renderer.cfg.eps_cov,
     )
+    prog.log("point path projection and covariance finished")
     rpc_mean_2d, rpc_cov_2d = project_gaussians_to_view(
         renderer.geometry_ops,
         rpc_centers_flat,
@@ -462,6 +495,7 @@ def main() -> None:
         renderer.cfg.eps_h_fd,
         renderer.cfg.eps_cov,
     )
+    prog.log("rpc path projection and covariance finished")
 
     point_mean_hw2 = point_mean_2d.view(h, w, 2)
     rpc_mean_hw2 = rpc_mean_2d.view(h, w, 2)
@@ -472,6 +506,7 @@ def main() -> None:
     # ---------- 4) 尺度正确性 ----------
     metric_point_scale = _scale_metrics_from_cov(point_cov_2d)
     metric_rpc_scale = _scale_metrics_from_cov(rpc_cov_2d)
+    prog.log("center/scale metrics computed")
 
     # ---------- 5) 可见性(深度排序)检查 ----------
     c0 = centers_rpc[h // 2, w // 2].clone()  # 用中心像素附近的局部米制中心
@@ -484,6 +519,7 @@ def main() -> None:
         dh=float(args.visibility_dh),
         radius_meter=float(args.radius_meter),
     )
+    prog.log("visibility probe finished")
 
     # ---------- 6) 输出报告 ----------
     checks: list[CheckResult] = []
@@ -588,6 +624,7 @@ def main() -> None:
     if num_pass < len(checks):
         print("WARNING: 检查未全部通过，请优先关注 center/scale/visibility 的失败项。")
     print("==============================================================\n")
+    prog.log("done")
 
 
 if __name__ == "__main__":
