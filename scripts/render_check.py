@@ -61,11 +61,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scale-radius-expected-px", type=float, default=1.0)
     p.add_argument("--scale-radius-threshold-px", type=float, default=0.75)
     p.add_argument("--visibility-l1-threshold", type=float, default=0.20)
-<<<<<<< codex/investigate-runtimeerror-in-rpc_gaussian_renderer-3bbskl
     p.add_argument("--alpha-max-min-threshold", type=float, default=1e-3)
     p.add_argument("--alpha-coverage-min-threshold", type=float, default=1e-4)
-=======
->>>>>>> main
     p.add_argument("--save-images", action="store_true")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -105,10 +102,7 @@ def make_renderer(cfg: dict[str, Any]) -> RPCGaussianRenderer:
     rcfg.source_stride = 1
     rcfg.confidence_threshold = 0.0
     rcfg.topk_per_target = None
-<<<<<<< codex/investigate-runtimeerror-in-rpc_gaussian_renderer-3bbskl
     rcfg.exclude_self_source = False
-=======
->>>>>>> main
     rcfg.val_num_target_views = max(int(getattr(rcfg, "val_num_target_views", 1)), 1)
     rcfg.use_all_targets_in_val = True
     rcfg.render_downsample_factor_val = 1
@@ -192,11 +186,7 @@ def _project_anchor_to_view_j(
     batch: dict[str, Any],
     vi: int,
     vj: int,
-<<<<<<< codex/investigate-runtimeerror-in-rpc_gaussian_renderer-3bbskl
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-=======
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
->>>>>>> main
     h, w = batch["height_gt"].shape[-2:]
     rpc_i = batch["rpc_gt"][0][vi]
     rpc_j = batch["rpc_gt"][0][vj]
@@ -230,11 +220,8 @@ def _project_anchor_to_view_j(
     return (
         line_j.detach().cpu().numpy().astype(np.float32),
         samp_j.detach().cpu().numpy().astype(np.float32),
-<<<<<<< codex/investigate-runtimeerror-in-rpc_gaussian_renderer-3bbskl
         x.detach().cpu().numpy().astype(np.float32),
         y.detach().cpu().numpy().astype(np.float32),
-=======
->>>>>>> main
         hs.detach().cpu().numpy().astype(np.float32),
         rgb,
     )
@@ -286,13 +273,10 @@ def _compute_correctness_metrics(
     else:
         color_l1 = float("inf")
 
-<<<<<<< codex/investigate-runtimeerror-in-rpc_gaussian_renderer-3bbskl
     alpha_max = float(np.maximum(ra, 0.0).max())
     alpha_thr = max(0.01, alpha_max * 0.1)
     alpha_cov = float((ra > alpha_thr).mean())
 
-=======
->>>>>>> main
     # 中心正确性：比较投影点质心与渲染 alpha 质心
     l_int = np.rint(expected_line).astype(np.int64)
     s_int = np.rint(expected_samp).astype(np.int64)
@@ -309,21 +293,12 @@ def _compute_correctness_metrics(
         rd_cy = float((yy * ra).sum() / a_sum)
         rd_cx = float((xx * ra).sum() / a_sum)
     else:
-<<<<<<< codex/investigate-runtimeerror-in-rpc_gaussian_renderer-3bbskl
         rd_cy, rd_cx = float("inf"), float("inf")
     center_centroid_err = float(np.sqrt((gt_cy - rd_cy) ** 2 + (gt_cx - rd_cx) ** 2)) if np.isfinite(rd_cy) else float("inf")
 
     # 尺度正确性：把 alpha mask 视作所有基元叠加后的覆盖，折算“每个高斯平均等效半径”
     valid_num = int(valid.sum())
     area = float((ra > alpha_thr).sum())
-=======
-        rd_cy, rd_cx = 0.0, 0.0
-    center_centroid_err = float(np.sqrt((gt_cy - rd_cy) ** 2 + (gt_cx - rd_cx) ** 2))
-
-    # 尺度正确性：把 alpha mask 视作所有基元叠加后的覆盖，折算“每个高斯平均等效半径”
-    valid_num = int(valid.sum())
-    area = float((ra > 0.05).sum())
->>>>>>> main
     if valid_num > 0:
         area_per = area / float(valid_num)
         radius_obs = float(np.sqrt(max(area_per, 0.0) / np.pi))
@@ -344,12 +319,9 @@ def _compute_correctness_metrics(
         "scale_radius_bias_px": radius_bias,
         "visibility_color_l1": float(color_l1),
         "visibility_ok_ratio": visibility_ok_ratio,
-<<<<<<< codex/investigate-runtimeerror-in-rpc_gaussian_renderer-3bbskl
         "alpha_max": alpha_max,
         "alpha_thr": float(alpha_thr),
         "alpha_coverage": alpha_cov,
-=======
->>>>>>> main
     }
 
 
@@ -406,16 +378,12 @@ def main() -> None:
         target_rgb = rpc_path["target_rgb"][ridx]
 
         # 构建期望投影（用于中心/尺度/可见性检查）
-<<<<<<< codex/investigate-runtimeerror-in-rpc_gaussian_renderer-3bbskl
         line_j, samp_j, x_obj, y_obj, h_obj, src_rgb = _project_anchor_to_view_j(batch, args.view_i, args.view_j)
         # 可见性期望图应使用 target 相机深度，而非直接使用高程值。
         xyz_h = np.stack([x_obj, y_obj, h_obj, np.ones_like(h_obj)], axis=-1)  # [N,4]
         cam_np = cam.w2c.detach().cpu().numpy().astype(np.float64)
         cam_xyz = (cam_np @ xyz_h.T).T
         depth_like = cam_xyz[:, 2].astype(np.float32)
-=======
-        line_j, samp_j, depth_like, src_rgb = _project_anchor_to_view_j(batch, args.view_i, args.view_j)
->>>>>>> main
         exp_rgb, _exp_depth, exp_occ = _build_expected_maps_from_projection(
             line_j,
             samp_j,
@@ -433,7 +401,6 @@ def main() -> None:
             samp_j,
             scale_expected_px=float(args.scale_radius_expected_px),
         )
-<<<<<<< codex/investigate-runtimeerror-in-rpc_gaussian_renderer-3bbskl
         checks.extend(
             [
                 CheckResult(
@@ -451,8 +418,6 @@ def main() -> None:
                 ),
             ]
         )
-=======
->>>>>>> main
 
         checks.extend(
             [
@@ -474,11 +439,7 @@ def main() -> None:
                     metrics["visibility_color_l1"],
                     args.visibility_l1_threshold,
                     metrics["visibility_color_l1"] <= args.visibility_l1_threshold,
-<<<<<<< codex/investigate-runtimeerror-in-rpc_gaussian_renderer-3bbskl
                     note=f"ok_ratio={metrics['visibility_ok_ratio']:.4f}, alpha_max={metrics['alpha_max']:.6f}",
-=======
-                    note=f"ok_ratio={metrics['visibility_ok_ratio']:.4f}",
->>>>>>> main
                 ),
             ]
         )
