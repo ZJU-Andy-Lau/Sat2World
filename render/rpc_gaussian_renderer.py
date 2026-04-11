@@ -43,6 +43,24 @@ def quaternion_to_matrix(q: torch.Tensor) -> torch.Tensor:
     )
 
 
+def axis_angle_to_matrix(rvec: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Rodrigues axis-angle -> rotation matrix."""
+    theta = torch.linalg.norm(rvec).clamp_min(eps)
+    k = rvec / theta
+    kx, ky, kz = k[0], k[1], k[2]
+    K = torch.stack(
+        [
+            torch.stack([torch.zeros_like(kx), -kz, ky]),
+            torch.stack([kz, torch.zeros_like(kx), -kx]),
+            torch.stack([-ky, kx, torch.zeros_like(kx)]),
+        ]
+    )
+    I = torch.eye(3, dtype=rvec.dtype, device=rvec.device)
+    ct = torch.cos(theta)
+    st = torch.sin(theta)
+    return I + st * K + (1.0 - ct) * (K @ K)
+
+
 def cov3d_from_scale_rotation(scale: torch.Tensor, quaternion: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     s = scale.clamp_min(eps)
     r = quaternion_to_matrix(quaternion)
@@ -181,6 +199,15 @@ class RPCGaussianRendererCfg:
     fit_cache_enable: bool = True
     fit_z_eps: float = 1.0e-6
     fit_min_positive_depth_ratio: float = 0.7
+    fit_constrained_enable: bool = True
+    fit_constrained_iters: int = 250
+    fit_constrained_lr: float = 5.0e-2
+    fit_constrained_huber_delta: float = 1.0
+    fit_constrained_lambda_fxy: float = 1.0e-2
+    fit_constrained_lambda_depth: float = 5.0e-2
+    fit_constrained_lambda_center: float = 2.0e-3
+    fit_constrained_min_depth: float = 1.0e-2
+    fit_constrained_accept_p95_ratio: float = 1.05
 
 
 class RPCGaussianRenderer:
@@ -260,6 +287,132 @@ class RPCGaussianRenderer:
         # 局部米制坐标（与renderer centers一致）
         return torch.stack([xx.reshape(-1), yy.reshape(-1), zz.reshape(-1)], dim=-1)
 
+    def _refine_camera_constrained(
+        self,
+        *,
+        xyz: torch.Tensor,
+        uv: torch.Tensor,
+        R_init: torch.Tensor,
+        t_init: torch.Tensor,
+        K_init: torch.Tensor,
+        image_hw: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Constrained camera refinement with skew=0 and soft-centered principal point."""
+        h, w = image_hw
+        cx_center = torch.tensor((float(w) - 1.0) * 0.5, dtype=xyz.dtype, device=xyz.device)
+        cy_center = torch.tensor((float(h) - 1.0) * 0.5, dtype=xyz.dtype, device=xyz.device)
+
+        fx0 = float(abs(float(K_init[0, 0].item())))
+        fy0 = float(abs(float(K_init[1, 1].item())))
+        fx0 = max(fx0, 1.0)
+        fy0 = max(fy0, 1.0)
+
+        try:
+            import cv2  # type: ignore
+
+            rvec0_np, _ = cv2.Rodrigues(R_init.detach().cpu().numpy())
+            rvec0 = torch.from_numpy(rvec0_np.reshape(3)).to(device=xyz.device, dtype=xyz.dtype)
+        except Exception:
+            rvec0 = torch.zeros((3,), device=xyz.device, dtype=xyz.dtype)
+
+        log_fx = torch.tensor(np.log(fx0), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
+        log_fy = torch.tensor(np.log(fy0), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
+        cx = torch.tensor(float(K_init[0, 2].item()), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
+        cy = torch.tensor(float(K_init[1, 2].item()), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
+        rvec = rvec0.detach().clone().requires_grad_(True)
+        tvec = t_init.detach().clone().requires_grad_(True)
+        params = [log_fx, log_fy, cx, cy, rvec, tvec]
+        opt = torch.optim.Adam(params, lr=float(self.cfg.fit_constrained_lr))
+
+        delta = float(self.cfg.fit_constrained_huber_delta)
+        lam_fxy = float(self.cfg.fit_constrained_lambda_fxy)
+        lam_depth = float(self.cfg.fit_constrained_lambda_depth)
+        lam_center = float(self.cfg.fit_constrained_lambda_center)
+        min_depth = float(self.cfg.fit_constrained_min_depth)
+        z_eps = float(self.cfg.fit_z_eps)
+        n_iter = max(int(self.cfg.fit_constrained_iters), 1)
+        best_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        best_loss = float("inf")
+
+        for _ in range(n_iter):
+            opt.zero_grad(set_to_none=True)
+            R = axis_angle_to_matrix(rvec)
+            cam = (R @ xyz.T + tvec[:, None]).T
+            z = cam[:, 2]
+            z_safe = z.clamp_min(z_eps)
+            fx = torch.exp(log_fx)
+            fy = torch.exp(log_fy)
+            u = fx * (cam[:, 0] / z_safe) + cx
+            v = fy * (cam[:, 1] / z_safe) + cy
+            pred = torch.stack([u, v], dim=-1)
+            err = pred - uv
+            abs_err = err.abs()
+            quad = torch.minimum(abs_err, torch.full_like(abs_err, delta))
+            lin = abs_err - quad
+            huber = 0.5 * quad.square() + delta * lin
+            reproj_loss = huber.sum(dim=-1).mean()
+            depth_penalty = torch.relu(min_depth - z).square().mean()
+            ratio_penalty = (log_fx - log_fy).square()
+            center_penalty = (cx - cx_center).square() + (cy - cy_center).square()
+            loss = reproj_loss + lam_fxy * ratio_penalty + lam_depth * depth_penalty + lam_center * center_penalty
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, max_norm=10.0)
+            opt.step()
+            cur_loss = float(loss.detach().item())
+            if np.isfinite(cur_loss) and cur_loss < best_loss:
+                best_loss = cur_loss
+                best_state = (
+                    log_fx.detach().clone(),
+                    log_fy.detach().clone(),
+                    cx.detach().clone(),
+                    cy.detach().clone(),
+                    rvec.detach().clone(),
+                    tvec.detach().clone(),
+                )
+
+        if best_state is not None:
+            log_fx, log_fy, cx, cy, rvec, tvec = best_state
+
+        R_out = axis_angle_to_matrix(rvec.detach())
+        t_out = tvec.detach()
+        fx_out = torch.exp(log_fx.detach()).clamp_min(1.0)
+        fy_out = torch.exp(log_fy.detach()).clamp_min(1.0)
+        K_out = torch.zeros((3, 3), dtype=xyz.dtype, device=xyz.device)
+        K_out[0, 0] = fx_out
+        K_out[1, 1] = fy_out
+        K_out[0, 2] = cx.detach()
+        K_out[1, 2] = cy.detach()
+        K_out[2, 2] = 1.0
+        return K_out, R_out, t_out
+
+    def _evaluate_camera_fit(
+        self,
+        *,
+        xyz: torch.Tensor,
+        uv: torch.Tensor,
+        K: torch.Tensor,
+        R: torch.Tensor,
+        t_t: torch.Tensor,
+    ) -> tuple[float, float, float, float]:
+        xyz_h = torch.cat([xyz, torch.ones((xyz.shape[0], 1), dtype=xyz.dtype, device=xyz.device)], dim=-1)
+        w2c = torch.eye(4, dtype=xyz.dtype, device=xyz.device)
+        w2c[:3, :3] = R
+        w2c[:3, 3] = t_t
+        cam = (w2c[:3, :] @ xyz_h.T).T
+        proj = (K @ cam.T).T
+        z = proj[:, 2]
+        valid = z > float(self.cfg.fit_z_eps)
+        if not bool(valid.any()):
+            return 0.0, float("inf"), float("inf"), float("inf")
+        uv_fit = proj[valid, :2] / proj[valid, 2:3]
+        err = torch.linalg.norm(uv_fit - uv[valid], dim=-1)
+        return (
+            float(valid.float().mean().item()),
+            float(torch.quantile(err, 0.5).item()),
+            float(torch.quantile(err, 0.95).item()),
+            float(err.max().item()),
+        )
+
     def _fit_virtual_camera(self, batch: dict[str, Any], bi: int, tv: int, image_hw: tuple[int, int]) -> VirtualPinholeCamera:
         h, w = image_hw
         cache_key = (int(batch["scene_id"][bi].item()) if torch.is_tensor(batch.get("scene_id", None)) else bi, tv, h, w)
@@ -322,17 +475,38 @@ class RPCGaussianRenderer:
             t_t = -t_t
 
         K = torch.from_numpy(K_np).to(device=fit_dev, dtype=torch.float64)
+        pos_ratio_init, p50_init, p95_init, pmax_init = self._evaluate_camera_fit(xyz=xyz, uv=uv, K=K, R=R, t_t=t_t)
+
+        if bool(self.cfg.fit_constrained_enable):
+            K_refine, R_refine, t_refine = self._refine_camera_constrained(
+                xyz=xyz,
+                uv=uv,
+                R_init=R,
+                t_init=t_t,
+                K_init=K,
+                image_hw=(h, w),
+            )
+            pos_ratio_refine, p50_refine, p95_refine, pmax_refine = self._evaluate_camera_fit(
+                xyz=xyz, uv=uv, K=K_refine, R=R_refine, t_t=t_refine
+            )
+            p95_ratio = float(self.cfg.fit_constrained_accept_p95_ratio)
+            refine_ok = (
+                pos_ratio_refine >= float(self.cfg.fit_min_positive_depth_ratio)
+                and np.isfinite(p95_refine)
+                and p95_refine <= p95_init * p95_ratio
+            )
+            if refine_ok:
+                K, R, t_t = K_refine, R_refine, t_refine
+                pos_ratio, p50, p95, pmax = pos_ratio_refine, p50_refine, p95_refine, pmax_refine
+            else:
+                pos_ratio, p50, p95, pmax = pos_ratio_init, p50_init, p95_init, pmax_init
+        else:
+            pos_ratio, p50, p95, pmax = pos_ratio_init, p50_init, p95_init, pmax_init
+
         w2c = torch.eye(4, dtype=torch.float64, device=fit_dev)
         w2c[:3, :3] = R
         w2c[:3, 3] = t_t
 
-        # 误差评估
-        xyz_h = torch.cat([xyz, torch.ones((xyz.shape[0], 1), dtype=xyz.dtype, device=xyz.device)], dim=-1)
-        cam = (w2c[:3, :] @ xyz_h.T).T
-        proj = (K @ cam.T).T
-        z = proj[:, 2]
-        valid = z > float(self.cfg.fit_z_eps)
-        pos_ratio = float(valid.float().mean().item())
         if pos_ratio < float(self.cfg.fit_min_positive_depth_ratio):
             scene_id = int(batch["scene_id"][bi].item()) if torch.is_tensor(batch.get("scene_id", None)) else bi
             fx, fy = float(K[0, 0].item()), float(K[1, 1].item())
@@ -341,19 +515,8 @@ class RPCGaussianRenderer:
                 "Virtual camera fit has too few positive-depth samples: "
                 f"scene={scene_id}, view={tv}, positive_depth_ratio={pos_ratio:.4f}, "
                 f"threshold={float(self.cfg.fit_min_positive_depth_ratio):.4f}, "
-                f"valid_points={int(valid.sum().item())}/{int(valid.numel())}, "
                 f"K=[fx={fx:.3f}, fy={fy:.3f}, cx={cx:.3f}, cy={cy:.3f}]"
             )
-
-        if not bool(valid.any()):
-            scene_id = int(batch["scene_id"][bi].item()) if torch.is_tensor(batch.get("scene_id", None)) else bi
-            raise RuntimeError(f"Virtual camera fit has no positive-depth samples: scene={scene_id}, view={tv}")
-
-        uv_fit = proj[valid, :2] / proj[valid, 2:3]
-        err = torch.linalg.norm(uv_fit - uv[valid], dim=-1)
-        p50 = float(torch.quantile(err, 0.5).item())
-        p95 = float(torch.quantile(err, 0.95).item())
-        pmax = float(err.max().item())
 
         cam_obj = VirtualPinholeCamera(
             K=K.to(torch.float32),
