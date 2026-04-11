@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import scipy.linalg
+import scipy.optimize
+import scipy.spatial.transform
 import torch
 import torch.nn.functional as F
 
@@ -87,6 +90,36 @@ def _normalize_points_3d(xyz: torch.Tensor, eps: float = 1e-12) -> tuple[torch.T
     U[1, 3] = -s * mu[1]
     U[2, 3] = -s * mu[2]
     xyz_h = torch.cat([xyz, torch.ones((xyz.shape[0], 1), dtype=xyz.dtype, device=xyz.device)], dim=-1)
+    xyz_n = (U @ xyz_h.T).T[:, :3]
+    return xyz_n, U
+
+
+def _normalize_points_2d_np(uv: np.ndarray, eps: float = 1e-12) -> tuple[np.ndarray, np.ndarray]:
+    mu = uv.mean(axis=0)
+    d = np.linalg.norm(uv - mu[None, :], axis=1)
+    scale = np.sqrt(2.0) / max(float(d.mean()), eps)
+    T = np.eye(3, dtype=np.float64)
+    T[0, 0] = scale
+    T[1, 1] = scale
+    T[0, 2] = -scale * mu[0]
+    T[1, 2] = -scale * mu[1]
+    uv_h = np.concatenate([uv, np.ones((uv.shape[0], 1), dtype=np.float64)], axis=1)
+    uv_n = (T @ uv_h.T).T[:, :2]
+    return uv_n, T
+
+
+def _normalize_points_3d_np(xyz: np.ndarray, eps: float = 1e-12) -> tuple[np.ndarray, np.ndarray]:
+    mu = xyz.mean(axis=0)
+    d = np.linalg.norm(xyz - mu[None, :], axis=1)
+    scale = np.sqrt(3.0) / max(float(d.mean()), eps)
+    U = np.eye(4, dtype=np.float64)
+    U[0, 0] = scale
+    U[1, 1] = scale
+    U[2, 2] = scale
+    U[0, 3] = -scale * mu[0]
+    U[1, 3] = -scale * mu[1]
+    U[2, 3] = -scale * mu[2]
+    xyz_h = np.concatenate([xyz, np.ones((xyz.shape[0], 1), dtype=np.float64)], axis=1)
     xyz_n = (U @ xyz_h.T).T[:, :3]
     return xyz_n, U
 
@@ -199,6 +232,7 @@ class VirtualPinholeCamera:
     fit_p50: float
     fit_p95: float
     fit_max: float
+    diagnostics: dict[str, Any] | None = None
 
 
 @dataclass
@@ -237,6 +271,34 @@ class RPCGaussianRendererCfg:
     fit_constrained_lambda_depth: float = 5.0e-2
     fit_constrained_lambda_center: float = 1.0e-2
     fit_constrained_min_depth: float = 1.0e-2
+    # 像方采样式 RPC->3D-2D 对应构建
+    fit_pixel_inner_nx: int = 32
+    fit_pixel_inner_ny: int = 32
+    fit_pixel_edge_per_side: int = 64
+    fit_pixel_center_dense_n: int = 128
+    fit_pixel_center_dense_radius_ratio: float = 0.15
+    fit_pixel_jitter_px: float = 0.25
+    fit_pixel_random_state: int = 42
+    fit_height_quantile_low: float = 0.01
+    fit_height_quantile_high: float = 0.99
+    fit_train_ratio: float = 0.8
+    fit_random_state: int = 12345
+    fit_enable_validation: bool = True
+    fit_robust_loss: str = "huber"  # huber | soft_l1
+    fit_robust_f_scale: float = 1.0
+    fit_stage_a_max_nfev: int = 200
+    fit_stage_b_max_nfev: int = 220
+    fit_stage_c_max_nfev: int = 250
+    fit_gamma_x: float = 0.5
+    fit_gamma_y: float = 0.5
+    fit_lambda_pp_center: float = 2.0
+    fit_lambda_focal_ratio: float = 1.0
+    fit_lambda_depth_barrier: float = 1.0
+    fit_depth_barrier_k: float = 20.0
+    fit_lambda_center_prior: float = 1.0e-3
+    fit_max_focal_ratio: float = 1.5
+    fit_rotation_orth_tol: float = 1.0e-4
+    fit_det_tol: float = 1.0e-4
 
 
 class RPCGaussianRenderer:
@@ -284,141 +346,248 @@ class RPCGaussianRenderer:
                 out.append(cand if cand else [int(ref[bi])])
         return out
 
-    def _sample_world_grid(self, batch: dict[str, Any], bi: int, tv: int, h: int, w: int) -> torch.Tensor:
-        center_yx = batch["scene_xy_center"][bi].to(torch.float32)
-        scale_yx = batch["scene_xy_scale"][bi].to(torch.float32)
-        cy, cx = center_yx[0], center_yx[1]
-        sy, sx = scale_yx[0].abs().clamp_min(1e-6), scale_yx[1].abs().clamp_min(1e-6)
+    def _sample_pixels_for_view(self, h: int, w: int, device: torch.device) -> torch.Tensor:
+        """采样像素点（四角/边缘/中心/内部），用于RPC反投影构建3D-2D对应。"""
+        pts: list[torch.Tensor] = []
+        # 锚点：中心 + 四角 + 四边中点
+        anchor = torch.tensor(
+            [
+                [0.5 * (w - 1), 0.5 * (h - 1)],
+                [0.0, 0.0],
+                [float(w - 1), 0.0],
+                [0.0, float(h - 1)],
+                [float(w - 1), float(h - 1)],
+                [0.5 * (w - 1), 0.0],
+                [0.5 * (w - 1), float(h - 1)],
+                [0.0, 0.5 * (h - 1)],
+                [float(w - 1), 0.5 * (h - 1)],
+            ],
+            dtype=torch.float64,
+            device=device,
+        )
+        pts.append(anchor)
+        edge_n = max(int(self.cfg.fit_pixel_edge_per_side), 2)
+        u_edge = torch.linspace(0.0, float(w - 1), edge_n, dtype=torch.float64, device=device)
+        v_edge = torch.linspace(0.0, float(h - 1), edge_n, dtype=torch.float64, device=device)
+        top = torch.stack([u_edge, torch.zeros_like(u_edge)], dim=-1)
+        bottom = torch.stack([u_edge, torch.full_like(u_edge, float(h - 1))], dim=-1)
+        left = torch.stack([torch.zeros_like(v_edge), v_edge], dim=-1)
+        right = torch.stack([torch.full_like(v_edge, float(w - 1)), v_edge], dim=-1)
+        pts.extend([top, bottom, left, right])
+        # 内部均匀网格
+        nx = max(int(self.cfg.fit_pixel_inner_nx), 2)
+        ny = max(int(self.cfg.fit_pixel_inner_ny), 2)
+        uu = torch.linspace(0.0, float(w - 1), nx, dtype=torch.float64, device=device)
+        vv = torch.linspace(0.0, float(h - 1), ny, dtype=torch.float64, device=device)
+        gv, gu = torch.meshgrid(vv, uu, indexing="ij")
+        pts.append(torch.stack([gu.reshape(-1), gv.reshape(-1)], dim=-1))
+        # 中心加密
+        n_center = max(int(self.cfg.fit_pixel_center_dense_n), 0)
+        if n_center > 0:
+            g = torch.Generator(device="cpu")
+            g.manual_seed(int(self.cfg.fit_pixel_random_state))
+            radius_u = float(self.cfg.fit_pixel_center_dense_radius_ratio) * float(w)
+            radius_v = float(self.cfg.fit_pixel_center_dense_radius_ratio) * float(h)
+            rand = torch.rand((n_center, 2), generator=g, dtype=torch.float64)
+            rand = 2.0 * rand - 1.0
+            center = torch.tensor([0.5 * (w - 1), 0.5 * (h - 1)], dtype=torch.float64)
+            dense = torch.stack([center[0] + rand[:, 0] * radius_u, center[1] + rand[:, 1] * radius_v], dim=-1).to(device=device)
+            pts.append(dense)
+        uv = torch.cat(pts, dim=0)
+        # 抖动（锚点保留，其他抖动）
+        jitter = float(self.cfg.fit_pixel_jitter_px)
+        if jitter > 0 and uv.shape[0] > anchor.shape[0]:
+            g = torch.Generator(device="cpu")
+            g.manual_seed(int(self.cfg.fit_pixel_random_state) + 17)
+            noise = (torch.rand((uv.shape[0] - anchor.shape[0], 2), generator=g, dtype=torch.float64) * 2.0 - 1.0) * jitter
+            uv[anchor.shape[0] :] += noise.to(device=device)
+        uv[:, 0] = uv[:, 0].clamp(0.0, float(w - 1))
+        uv[:, 1] = uv[:, 1].clamp(0.0, float(h - 1))
+        # 去重
+        uv_q = (torch.round(uv * 1000.0) / 1000.0).detach().cpu().numpy()
+        _, idx = np.unique(uv_q, axis=0, return_index=True)
+        idx_t = torch.from_numpy(np.sort(idx)).to(device=device, dtype=torch.long)
+        return uv[idx_t]
 
+    def _make_height_levels(self, batch: dict[str, Any], bi: int, tv: int, device: torch.device) -> torch.Tensor:
         h_ref = float(batch["height_ref"][bi, tv].item()) if "height_ref" in batch else 0.0
+        h_min = h_ref - float(self.cfg.fit_height_margin)
+        h_max = h_ref + float(self.cfg.fit_height_margin)
         if "height_gt" in batch:
-            hv = batch["height_gt"][bi, tv, 0]
+            hv = batch["height_gt"][bi, tv, 0].to(dtype=torch.float64, device=device)
             mv = batch.get("height_valid_mask", None)
             if mv is not None:
-                m = mv[bi, tv, 0] > 0.5
-                if m.any():
-                    h_min = float(hv[m].min().item())
-                    h_max = float(hv[m].max().item())
-                else:
-                    h_min = h_ref - self.cfg.fit_height_margin
-                    h_max = h_ref + self.cfg.fit_height_margin
-            else:
-                h_min = float(hv.min().item())
-                h_max = float(hv.max().item())
-        else:
-            h_min = h_ref - self.cfg.fit_height_margin
-            h_max = h_ref + self.cfg.fit_height_margin
+                m = mv[bi, tv, 0].to(device=device) > 0.5
+                hv = hv[m] if bool(m.any()) else hv
+            if hv.numel() > 0:
+                ql = float(self.cfg.fit_height_quantile_low)
+                qh = float(self.cfg.fit_height_quantile_high)
+                h_min = float(torch.quantile(hv, ql).item())
+                h_max = float(torch.quantile(hv, qh).item())
+        if not np.isfinite(h_min) or not np.isfinite(h_max) or h_max <= h_min:
+            h_min, h_max = h_ref - float(self.cfg.fit_height_margin), h_ref + float(self.cfg.fit_height_margin)
+        return torch.linspace(h_min, h_max, max(int(self.cfg.fit_grid_nz), 3), dtype=torch.float64, device=device)
 
-        x = torch.linspace(-float(sx), float(sx), int(self.cfg.fit_grid_nx), device=center_yx.device)
-        y = torch.linspace(-float(sy), float(sy), int(self.cfg.fit_grid_ny), device=center_yx.device)
-        z = torch.linspace(float(h_min), float(h_max), int(self.cfg.fit_grid_nz), device=center_yx.device)
-        yy, xx, zz = torch.meshgrid(y, x, z, indexing="ij")
-        # 局部米制坐标（与renderer centers一致）
-        return torch.stack([xx.reshape(-1), yy.reshape(-1), zz.reshape(-1)], dim=-1)
+    def _build_correspondence_from_view_pixels(
+        self, batch: dict[str, Any], bi: int, tv: int, image_hw: tuple[int, int], fit_dev: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        h, w = image_hw
+        rpc_t = batch["rpc_gt"][bi][tv]
+        scene_center = batch["scene_xy_center"][bi].to(dtype=torch.float64, device=fit_dev)
+        scene_scale = torch.ones_like(scene_center)
+        uv = self._sample_pixels_for_view(h=h, w=w, device=fit_dev)
+        heights = self._make_height_levels(batch=batch, bi=bi, tv=tv, device=fit_dev)
+        nu = uv.shape[0]
+        nh = heights.shape[0]
+        u_rep = uv[:, 0].repeat_interleave(nh)
+        v_rep = uv[:, 1].repeat_interleave(nh)
+        h_rep = heights.repeat(nu)
+        x, y = rpc_t.RPC_LINESAMP2XY(
+            line_in=v_rep,
+            samp_in=u_rep,
+            h_in=h_rep,
+            output_type="tensor",
+            xy_center=scene_center,
+            xy_scale=scene_scale,
+        )
+        xyz = torch.stack([x, y, h_rep], dim=-1).to(dtype=torch.float64, device=fit_dev)
+        uv_rep = torch.stack([u_rep, v_rep], dim=-1).to(dtype=torch.float64, device=fit_dev)
+        finite = torch.isfinite(xyz).all(dim=-1) & torch.isfinite(uv_rep).all(dim=-1)
+        if not bool(finite.any()):
+            raise RuntimeError("No finite 3D-2D correspondences from RPC_LINESAMP2XY")
+        return xyz[finite], uv_rep[finite]
 
-    def _refine_camera_constrained(
+    def _precheck_correspondence_np(self, xyz: np.ndarray, uv: np.ndarray) -> list[str]:
+        warn: list[str] = []
+        if xyz.ndim != 2 or xyz.shape[1] != 3:
+            raise ValueError(f"xyz must be [N,3], got {xyz.shape}")
+        if uv.ndim != 2 or uv.shape[1] != 2:
+            raise ValueError(f"uv must be [N,2], got {uv.shape}")
+        if xyz.shape[0] != uv.shape[0]:
+            raise ValueError("xyz and uv size mismatch")
+        if xyz.shape[0] < 20:
+            raise ValueError(f"Need at least 20 correspondences, got {xyz.shape[0]}")
+        if not np.isfinite(xyz).all() or not np.isfinite(uv).all():
+            raise ValueError("Non-finite values detected in correspondence")
+        centered = xyz - xyz.mean(axis=0, keepdims=True)
+        rank = int(np.linalg.matrix_rank(centered))
+        if rank < 3:
+            raise ValueError(f"3D points are degenerate (rank={rank})")
+        cov = np.cov(centered.T)
+        eig = np.sort(np.linalg.eigvalsh(cov))[::-1]
+        if eig[0] <= 1e-12:
+            raise ValueError("3D spread is too small")
+        if eig[2] / eig[0] < 1e-4:
+            warn.append("3D points are near-coplanar")
+        return warn
+
+    def _split_train_val_indices(self, n: int) -> tuple[np.ndarray, np.ndarray]:
+        if not bool(self.cfg.fit_enable_validation):
+            idx = np.arange(n, dtype=np.int64)
+            return idx, np.empty((0,), dtype=np.int64)
+        ratio = float(np.clip(self.cfg.fit_train_ratio, 0.5, 0.95))
+        rng = np.random.default_rng(int(self.cfg.fit_random_state))
+        perm = rng.permutation(n)
+        n_train = int(max(16, min(n - 4, round(n * ratio))))
+        return perm[:n_train], perm[n_train:]
+
+    def _dlt_init_np(self, xyz: np.ndarray, uv: np.ndarray) -> np.ndarray:
+        xyz_n, U = _normalize_points_3d_np(xyz)
+        uv_n, T = _normalize_points_2d_np(uv)
+        n = xyz.shape[0]
+        X = np.concatenate([xyz_n, np.ones((n, 1), dtype=np.float64)], axis=1)
+        u = uv_n[:, 0:1]
+        v = uv_n[:, 1:2]
+        O = np.zeros_like(X)
+        A1 = np.concatenate([X, O, -u * X], axis=1)
+        A2 = np.concatenate([O, X, -v * X], axis=1)
+        A = np.concatenate([A1, A2], axis=0)
+        _, _, vh = np.linalg.svd(A, full_matrices=False)
+        p = vh[-1]
+        Pn = p.reshape(3, 4)
+        P = np.linalg.inv(T) @ Pn @ U
+        return P / max(np.linalg.norm(P), 1e-12)
+
+    def _decompose_projection_np(self, P: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        M = P[:, :3]
+        K, R = scipy.linalg.rq(M)
+        diag = np.diag(K).copy()
+        sign = np.where(diag >= 0, 1.0, -1.0)
+        D = np.diag(sign)
+        K = K @ D
+        R = D @ R
+        if np.linalg.det(R) < 0:
+            K[:, 2] *= -1.0
+            R[2, :] *= -1.0
+        K = K / max(K[2, 2], 1e-12)
+        _, _, vh = np.linalg.svd(P)
+        C_h = vh[-1]
+        C = C_h[:3] / max(C_h[3], 1e-12)
+        return K, R, C
+
+    @staticmethod
+    def _project_np(xyz: np.ndarray, R: np.ndarray, C: np.ndarray, fx: float, fy: float, cx: float, cy: float, z_eps: float) -> tuple[np.ndarray, np.ndarray]:
+        t = -R @ C
+        cam = (R @ xyz.T).T + t[None, :]
+        z = cam[:, 2]
+        z_safe = np.maximum(z, z_eps)
+        u = fx * (cam[:, 0] / z_safe) + cx
+        v = fy * (cam[:, 1] / z_safe) + cy
+        return np.stack([u, v], axis=1), z
+
+    @staticmethod
+    def _reproj_metrics_np(err_xy: np.ndarray) -> tuple[float, float, float, float]:
+        if err_xy.size == 0:
+            return float("inf"), float("inf"), float("inf"), float("inf")
+        e = np.linalg.norm(err_xy, axis=1)
+        rmse = float(np.sqrt(np.mean(e**2)))
+        p50 = float(np.quantile(e, 0.5))
+        p95 = float(np.quantile(e, 0.95))
+        pmax = float(np.max(e))
+        return rmse, p50, p95, pmax
+
+    def _health_check_np(
         self,
         *,
-        xyz: torch.Tensor,
-        uv: torch.Tensor,
-        R_init: torch.Tensor,
-        t_init: torch.Tensor,
-        K_init: torch.Tensor,
+        K: np.ndarray,
+        R: np.ndarray,
+        z_train: np.ndarray,
+        z_val: np.ndarray | None,
+        train_p95: float,
+        val_p95: float | None,
         image_hw: tuple[int, int],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Constrained camera refinement with skew=0 and soft-centered principal point."""
+    ) -> tuple[bool, list[str]]:
         h, w = image_hw
-        cx_center = torch.tensor((float(w) - 1.0) * 0.5, dtype=xyz.dtype, device=xyz.device)
-        cy_center = torch.tensor((float(h) - 1.0) * 0.5, dtype=xyz.dtype, device=xyz.device)
-
-        fx0 = float(abs(float(K_init[0, 0].item())))
-        fy0 = float(abs(float(K_init[1, 1].item())))
-        fx0 = max(fx0, 1.0)
-        fy0 = max(fy0, 1.0)
-
-        try:
-            import cv2  # type: ignore
-
-            rvec0_np, _ = cv2.Rodrigues(R_init.detach().cpu().numpy())
-            rvec0 = torch.from_numpy(rvec0_np.reshape(3)).to(device=xyz.device, dtype=xyz.dtype)
-        except Exception:
-            rvec0 = torch.zeros((3,), device=xyz.device, dtype=xyz.dtype)
-
-        log_fx = torch.tensor(np.log(fx0), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
-        log_fy = torch.tensor(np.log(fy0), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
-        cx0 = float(np.clip(float(K_init[0, 2].item()), 0.0, max(float(w) - 1.0, 1.0)))
-        cy0 = float(np.clip(float(K_init[1, 2].item()), 0.0, max(float(h) - 1.0, 1.0)))
-        cx_raw = torch.tensor(np.log((cx0 + 1.0) / max(float(w) - cx0, 1.0)), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
-        cy_raw = torch.tensor(np.log((cy0 + 1.0) / max(float(h) - cy0, 1.0)), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
-        rvec = rvec0.detach().clone().requires_grad_(True)
-        tvec = t_init.detach().clone().requires_grad_(True)
-        params = [log_fx, log_fy, cx_raw, cy_raw, rvec, tvec]
-        opt = torch.optim.Adam(params, lr=float(self.cfg.fit_constrained_lr))
-
-        delta = float(self.cfg.fit_constrained_huber_delta)
-        lam_fxy = float(self.cfg.fit_constrained_lambda_fxy)
-        lam_depth = float(self.cfg.fit_constrained_lambda_depth)
-        lam_center = float(self.cfg.fit_constrained_lambda_center)
-        min_depth = float(self.cfg.fit_constrained_min_depth)
-        z_eps = float(self.cfg.fit_z_eps)
-        n_iter = max(int(self.cfg.fit_constrained_iters), 1)
-        best_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
-        best_loss = float("inf")
-
-        for _ in range(n_iter):
-            opt.zero_grad(set_to_none=True)
-            R = axis_angle_to_matrix(rvec)
-            cam = (R @ xyz.T + tvec[:, None]).T
-            z = cam[:, 2]
-            z_safe = z.clamp_min(z_eps)
-            fx = torch.exp(log_fx)
-            fy = torch.exp(log_fy)
-            cx = (float(w) - 1.0) * torch.sigmoid(cx_raw)
-            cy = (float(h) - 1.0) * torch.sigmoid(cy_raw)
-            u = fx * (cam[:, 0] / z_safe) + cx
-            v = fy * (cam[:, 1] / z_safe) + cy
-            pred = torch.stack([u, v], dim=-1)
-            err = pred - uv
-            abs_err = err.abs()
-            quad = torch.minimum(abs_err, torch.full_like(abs_err, delta))
-            lin = abs_err - quad
-            huber = 0.5 * quad.square() + delta * lin
-            reproj_loss = huber.sum(dim=-1).mean()
-            depth_penalty = torch.relu(min_depth - z).square().mean()
-            ratio_penalty = (log_fx - log_fy).square()
-            center_penalty = (cx - cx_center).square() + (cy - cy_center).square()
-            loss = reproj_loss + lam_fxy * ratio_penalty + lam_depth * depth_penalty + lam_center * center_penalty
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, max_norm=10.0)
-            opt.step()
-            cur_loss = float(loss.detach().item())
-            if np.isfinite(cur_loss) and cur_loss < best_loss:
-                best_loss = cur_loss
-                best_state = (
-                    log_fx.detach().clone(),
-                    log_fy.detach().clone(),
-                    cx_raw.detach().clone(),
-                    cy_raw.detach().clone(),
-                    rvec.detach().clone(),
-                    tvec.detach().clone(),
-                )
-
-        if best_state is not None:
-            log_fx, log_fy, cx_raw, cy_raw, rvec, tvec = best_state
-
-        R_out = axis_angle_to_matrix(rvec.detach())
-        t_out = tvec.detach()
-        fx_out = torch.exp(log_fx.detach()).clamp_min(1.0)
-        fy_out = torch.exp(log_fy.detach()).clamp_min(1.0)
-        cx_out = (float(w) - 1.0) * torch.sigmoid(cx_raw.detach())
-        cy_out = (float(h) - 1.0) * torch.sigmoid(cy_raw.detach())
-        K_out = torch.zeros((3, 3), dtype=xyz.dtype, device=xyz.device)
-        K_out[0, 0] = fx_out
-        K_out[1, 1] = fy_out
-        K_out[0, 2] = cx_out
-        K_out[1, 2] = cy_out
-        K_out[2, 2] = 1.0
-        return K_out, R_out, t_out
+        fx, fy = float(K[0, 0]), float(K[1, 1])
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+        reasons: list[str] = []
+        if fx <= 0 or fy <= 0:
+            reasons.append("fx/fy must be positive")
+        rot_err = np.linalg.norm(R.T @ R - np.eye(3))
+        if rot_err > float(self.cfg.fit_rotation_orth_tol):
+            reasons.append(f"R is not orthonormal (err={rot_err:.3e})")
+        det_r = float(np.linalg.det(R))
+        if abs(det_r - 1.0) > float(self.cfg.fit_det_tol):
+            reasons.append(f"det(R) not close to +1 (det={det_r:.6f})")
+        gamma_x = float(self.cfg.fit_gamma_x) * float(w)
+        gamma_y = float(self.cfg.fit_gamma_y) * float(h)
+        if abs(cx - 0.5 * w) > 1.05 * gamma_x or abs(cy - 0.5 * h) > 1.05 * gamma_y:
+            reasons.append("principal point out of bounded range")
+        ratio = max(fx, fy) / max(min(fx, fy), 1e-12)
+        if ratio > float(self.cfg.fit_max_focal_ratio):
+            reasons.append(f"fx/fy too imbalanced (ratio={ratio:.3f})")
+        pos_train = float(np.mean(z_train > float(self.cfg.fit_z_eps)))
+        if pos_train < float(self.cfg.fit_min_positive_depth_ratio):
+            reasons.append(f"train positive depth ratio too low ({pos_train:.4f})")
+        if z_val is not None and z_val.size > 0:
+            pos_val = float(np.mean(z_val > float(self.cfg.fit_z_eps)))
+            if pos_val < float(self.cfg.fit_min_positive_depth_ratio):
+                reasons.append(f"val positive depth ratio too low ({pos_val:.4f})")
+        if train_p95 > float(self.cfg.fit_max_reproj_p95_px):
+            reasons.append(f"train p95 too high ({train_p95:.4f})")
+        if val_p95 is not None and val_p95 > float(self.cfg.fit_max_reproj_p95_px):
+            reasons.append(f"val p95 too high ({val_p95:.4f})")
+        return (len(reasons) == 0), reasons
 
     def _evaluate_camera_fit(
         self,
@@ -454,97 +623,280 @@ class RPCGaussianRenderer:
         if self.cfg.fit_cache_enable and cache_key in self._virtual_cam_cache:
             return self._virtual_cam_cache[cache_key]
 
-        rpc_t = batch["rpc_gt"][bi][tv]
-        fit_dev = rpc_t.device
-        xyz_local = self._sample_world_grid(batch, bi, tv, h, w)
-        scene_center = batch["scene_xy_center"][bi].to(dtype=torch.double, device=fit_dev)
-        scene_scale = torch.ones_like(scene_center)
+        fit_dev = batch["rpc_gt"][bi][tv].device
+        xyz_t, uv_t = self._build_correspondence_from_view_pixels(batch=batch, bi=bi, tv=tv, image_hw=image_hw, fit_dev=fit_dev)
+        xyz_np = xyz_t.detach().cpu().numpy().astype(np.float64)
+        uv_np = uv_t.detach().cpu().numpy().astype(np.float64)
+        pre_warn = self._precheck_correspondence_np(xyz_np, uv_np)
+        train_idx, val_idx = self._split_train_val_indices(xyz_np.shape[0])
+        xyz_train, uv_train = xyz_np[train_idx], uv_np[train_idx]
+        xyz_val = xyz_np[val_idx] if val_idx.size > 0 else np.empty((0, 3), dtype=np.float64)
+        uv_val = uv_np[val_idx] if val_idx.size > 0 else np.empty((0, 2), dtype=np.float64)
 
-        x = xyz_local[:, 0].to(dtype=torch.double, device=fit_dev)
-        y = xyz_local[:, 1].to(dtype=torch.double, device=fit_dev)
-        z = xyz_local[:, 2].to(dtype=torch.double, device=fit_dev)
-        line, samp = rpc_t.RPC_XY2LINESAMP(
-            x_in=x,
-            y_in=y,
-            h_in=z,
-            output_type="tensor",
-            xy_center=scene_center,
-            xy_scale=scene_scale,
+        P0 = self._dlt_init_np(xyz_train, uv_train)
+        K0, R0, C0 = self._decompose_projection_np(P0)
+        # 朝向修正：优先让训练点正深度比例更高
+        _, z_pos = self._project_np(
+            xyz_train,
+            R=R0,
+            C=C0,
+            fx=max(abs(float(K0[0, 0])), 1.0),
+            fy=max(abs(float(K0[1, 1])), 1.0),
+            cx=float(K0[0, 2]),
+            cy=float(K0[1, 2]),
+            z_eps=float(self.cfg.fit_z_eps),
         )
-        uv = torch.stack([samp, line], dim=-1).to(dtype=torch.float64, device=fit_dev)  # x=samp, y=line
+        _, z_neg = self._project_np(
+            xyz_train,
+            R=-R0,
+            C=C0,
+            fx=max(abs(float(K0[0, 0])), 1.0),
+            fy=max(abs(float(K0[1, 1])), 1.0),
+            cx=float(K0[0, 2]),
+            cy=float(K0[1, 2]),
+            z_eps=float(self.cfg.fit_z_eps),
+        )
+        if np.mean(z_neg > float(self.cfg.fit_z_eps)) > np.mean(z_pos > float(self.cfg.fit_z_eps)):
+            R0 = -R0
 
-        xyz = xyz_local.to(dtype=torch.float64, device=fit_dev)
-        xyz_n, U = _normalize_points_3d(xyz)
-        uv_n, T = _normalize_points_2d(uv)
-        n = xyz_n.shape[0]
-        ones = torch.ones((n, 1), dtype=torch.float64, device=xyz.device)
-        X = torch.cat([xyz_n, ones], dim=-1)
-        u = uv_n[:, 0:1]
-        v = uv_n[:, 1:2]
+        rot0 = scipy.spatial.transform.Rotation.from_matrix(R0)
+        rvec0 = rot0.as_rotvec()
+        f0 = max(1.0, float(0.5 * (abs(K0[0, 0]) + abs(K0[1, 1]))))
+        cx0 = float(K0[0, 2])
+        cy0 = float(K0[1, 2])
+        gamma_x = float(self.cfg.fit_gamma_x)
+        gamma_y = float(self.cfg.fit_gamma_y)
 
-        O = torch.zeros_like(X)
-        A1 = torch.cat([X, O, -u * X], dim=-1)
-        A2 = torch.cat([O, X, -v * X], dim=-1)
-        A = torch.cat([A1, A2], dim=0)
-        _, _, Vh = torch.linalg.svd(A)
-        p = Vh[-1]
-        Pn = p.view(3, 4)
-        P = torch.linalg.inv(T) @ Pn @ U
+        scene_scale = max(float(np.std(xyz_train[:, 0])), float(np.std(xyz_train[:, 1])), float(np.std(xyz_train[:, 2])), 1.0)
 
-        # 用 OpenCV 分解 P -> K,R,t
-        try:
-            import cv2  # type: ignore
-        except Exception as e:  # pragma: no cover
-            raise RuntimeError("需要安装opencv-python以完成虚拟相机分解") from e
+        f_min = 10.0
+        f_max = 1.0e5
+        log_f_min = float(np.log(f_min))
+        log_f_max = float(np.log(f_max))
+        center_bound = float(scene_scale) * 20.0
+        beta_bound = 6.0
+        rot_bound = np.pi * 2.0
 
-        P_np = P.detach().cpu().numpy()
-        K_np, R_np, C_h_np = cv2.decomposeProjectionMatrix(P_np)[:3]
-        K_np = K_np / max(K_np[2, 2], 1e-8)
-        C_np = (C_h_np[:3] / C_h_np[3]).reshape(3)
-        t_np = -R_np @ C_np
+        def _safe_exp(v: float) -> float:
+            return float(np.exp(np.clip(v, log_f_min, log_f_max)))
 
-        # 修正朝向：确保绝大多数点在相机前方
-        R = torch.from_numpy(R_np).to(device=fit_dev, dtype=torch.float64)
-        t_t = torch.from_numpy(t_np).to(device=fit_dev, dtype=torch.float64)
-        z_cam_pos = (R @ xyz.T + t_t[:, None])[2]
-        z_cam_neg = ((-R) @ xyz.T + (-t_t)[:, None])[2]
-        if (z_cam_neg > 0).float().mean().item() > (z_cam_pos > 0).float().mean().item():
-            R = -R
-            t_t = -t_t
+        def _solve_stage(stage: str, x0: np.ndarray, max_nfev: int) -> tuple[scipy.optimize.OptimizeResult, dict[str, float]]:
+            def unpack(params: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float, float, float]:
+                if stage == "A":
+                    rvec = params[:3]
+                    C = params[3:6]
+                    f = _safe_exp(float(params[6]))
+                    cx, cy = 0.5 * w, 0.5 * h
+                    return rvec, C, f, f, cx, cy
+                if stage == "B":
+                    rvec = params[:3]
+                    C = params[3:6]
+                    f = _safe_exp(float(params[6]))
+                    bx, by = float(params[7]), float(params[8])
+                    cx = 0.5 * w + gamma_x * w * np.tanh(bx)
+                    cy = 0.5 * h + gamma_y * h * np.tanh(by)
+                    return rvec, C, f, f, cx, cy
+                rvec = params[:3]
+                C = params[3:6]
+                ax, ay = float(params[6]), float(params[7])
+                bx, by = float(params[8]), float(params[9])
+                fx, fy = _safe_exp(ax), _safe_exp(ay)
+                cx = 0.5 * w + gamma_x * w * np.tanh(bx)
+                cy = 0.5 * h + gamma_y * h * np.tanh(by)
+                return rvec, C, fx, fy, cx, cy
 
-        K = torch.from_numpy(K_np).to(device=fit_dev, dtype=torch.float64)
-        if bool(self.cfg.fit_constrained_enable):
-            K, R, t_t = self._refine_camera_constrained(
-                xyz=xyz,
-                uv=uv,
-                R_init=R,
-                t_init=t_t,
-                K_init=K,
-                image_hw=(h, w),
+            def residual(params: np.ndarray) -> np.ndarray:
+                rvec, C, fx, fy, cx, cy = unpack(params)
+                R = scipy.spatial.transform.Rotation.from_rotvec(rvec).as_matrix()
+                pred, z = self._project_np(
+                    xyz_train,
+                    R=R,
+                    C=C,
+                    fx=fx,
+                    fy=fy,
+                    cx=cx,
+                    cy=cy,
+                    z_eps=float(self.cfg.fit_z_eps),
+                )
+                data = (pred - uv_train).reshape(-1)
+                residuals: list[np.ndarray] = [data]
+                lam_pp = float(self.cfg.fit_lambda_pp_center)
+                if stage in ("B", "C"):
+                    residuals.append(np.array([lam_pp * (cx - 0.5 * w) / max(float(w), 1.0), lam_pp * (cy - 0.5 * h) / max(float(h), 1.0)], dtype=np.float64))
+                lam_fd = float(self.cfg.fit_lambda_depth_barrier)
+                k = float(self.cfg.fit_depth_barrier_k)
+                eps_d = float(self.cfg.fit_constrained_min_depth)
+                depth_soft = np.logaddexp(0.0, k * (eps_d - z)) / max(k, 1e-6)
+                residuals.append(np.sqrt(lam_fd) * np.sqrt(np.maximum(depth_soft, 0.0)))
+                lam_cp = float(self.cfg.fit_lambda_center_prior)
+                residuals.append(np.sqrt(lam_cp) * ((C - C0) / scene_scale))
+                if stage == "C":
+                    lam_fr = float(self.cfg.fit_lambda_focal_ratio)
+                    residuals.append(np.array([np.sqrt(lam_fr) * np.log(max(fx, 1e-12) / max(fy, 1e-12))], dtype=np.float64))
+                out = np.concatenate(residuals, axis=0)
+                if not np.isfinite(out).all():
+                    out = np.nan_to_num(out, nan=1e6, posinf=1e6, neginf=-1e6)
+                return out
+
+            if stage == "A":
+                lb = np.array([-rot_bound, -rot_bound, -rot_bound, C0[0] - center_bound, C0[1] - center_bound, C0[2] - center_bound, log_f_min], dtype=np.float64)
+                ub = np.array([rot_bound, rot_bound, rot_bound, C0[0] + center_bound, C0[1] + center_bound, C0[2] + center_bound, log_f_max], dtype=np.float64)
+            elif stage == "B":
+                lb = np.array(
+                    [-rot_bound, -rot_bound, -rot_bound, C0[0] - center_bound, C0[1] - center_bound, C0[2] - center_bound, log_f_min, -beta_bound, -beta_bound],
+                    dtype=np.float64,
+                )
+                ub = np.array(
+                    [rot_bound, rot_bound, rot_bound, C0[0] + center_bound, C0[1] + center_bound, C0[2] + center_bound, log_f_max, beta_bound, beta_bound],
+                    dtype=np.float64,
+                )
+            else:
+                lb = np.array(
+                    [-rot_bound, -rot_bound, -rot_bound, C0[0] - center_bound, C0[1] - center_bound, C0[2] - center_bound, log_f_min, log_f_min, -beta_bound, -beta_bound],
+                    dtype=np.float64,
+                )
+                ub = np.array(
+                    [rot_bound, rot_bound, rot_bound, C0[0] + center_bound, C0[1] + center_bound, C0[2] + center_bound, log_f_max, log_f_max, beta_bound, beta_bound],
+                    dtype=np.float64,
+                )
+            x0_local = np.clip(x0.astype(np.float64), lb + 1e-9, ub - 1e-9)
+
+            result = scipy.optimize.least_squares(
+                residual,
+                x0_local,
+                method="trf",
+                loss=str(self.cfg.fit_robust_loss),
+                f_scale=float(self.cfg.fit_robust_f_scale),
+                max_nfev=max_nfev,
+                bounds=(lb, ub),
+                x_scale="jac",
             )
-        pos_ratio, p50, p95, pmax = self._evaluate_camera_fit(xyz=xyz, uv=uv, K=K, R=R, t_t=t_t)
+            rvec, C, fx, fy, cx, cy = unpack(result.x)
+            return result, {"fx": fx, "fy": fy, "cx": cx, "cy": cy, "rvec0": rvec[0], "rvec1": rvec[1], "rvec2": rvec[2], "C0": C[0], "C1": C[1], "C2": C[2]}
 
+        # 初始化阶段参数
+        x0_a = np.concatenate([rvec0, C0, np.array([np.log(f0)], dtype=np.float64)], axis=0)
+        res_a, params_a = _solve_stage("A", x0_a, max_nfev=int(self.cfg.fit_stage_a_max_nfev))
+        cx_anchor = np.clip((cx0 - 0.5 * w) / max(gamma_x * w, 1e-6), -0.999, 0.999)
+        cy_anchor = np.clip((cy0 - 0.5 * h) / max(gamma_y * h, 1e-6), -0.999, 0.999)
+        x0_b = np.concatenate([res_a.x[:7], np.array([np.arctanh(cx_anchor), np.arctanh(cy_anchor)], dtype=np.float64)], axis=0)
+        res_b, params_b = _solve_stage("B", x0_b, max_nfev=int(self.cfg.fit_stage_b_max_nfev))
+        x0_c = np.concatenate([res_b.x[:6], np.array([res_b.x[6], res_b.x[6], res_b.x[7], res_b.x[8]], dtype=np.float64)], axis=0)
+        res_c, params_c = _solve_stage("C", x0_c, max_nfev=int(self.cfg.fit_stage_c_max_nfev))
+
+        stage_pack = [("A", res_a, params_a), ("B", res_b, params_b), ("C", res_c, params_c)]
+        diagnostics_stages: list[dict[str, Any]] = []
+        chosen_pass: tuple[str, dict[str, Any], np.ndarray, np.ndarray, np.ndarray] | None = None
+        chosen_best_effort: tuple[str, dict[str, Any], np.ndarray, np.ndarray, np.ndarray] | None = None
+        best_effort_score = float("inf")
+
+        for name, res, p in stage_pack:
+            rvec = np.array([p["rvec0"], p["rvec1"], p["rvec2"]], dtype=np.float64)
+            C = np.array([p["C0"], p["C1"], p["C2"]], dtype=np.float64)
+            R = scipy.spatial.transform.Rotation.from_rotvec(rvec).as_matrix()
+            pred_train, z_train = self._project_np(
+                xyz_train,
+                R=R,
+                C=C,
+                fx=float(p["fx"]),
+                fy=float(p["fy"]),
+                cx=float(p["cx"]),
+                cy=float(p["cy"]),
+                z_eps=float(self.cfg.fit_z_eps),
+            )
+            train_rmse, train_p50, train_p95, train_max = self._reproj_metrics_np(pred_train - uv_train)
+            if xyz_val.shape[0] > 0:
+                pred_val, z_val = self._project_np(
+                    xyz_val,
+                    R=R,
+                    C=C,
+                    fx=float(p["fx"]),
+                    fy=float(p["fy"]),
+                    cx=float(p["cx"]),
+                    cy=float(p["cy"]),
+                    z_eps=float(self.cfg.fit_z_eps),
+                )
+                val_rmse, val_p50, val_p95, val_max = self._reproj_metrics_np(pred_val - uv_val)
+            else:
+                z_val = np.empty((0,), dtype=np.float64)
+                val_rmse = val_p50 = val_p95 = val_max = None
+            K_np = np.array([[p["fx"], 0.0, p["cx"]], [0.0, p["fy"], p["cy"]], [0.0, 0.0, 1.0]], dtype=np.float64)
+            ok, reasons = self._health_check_np(
+                K=K_np,
+                R=R,
+                z_train=z_train,
+                z_val=z_val if z_val.size > 0 else None,
+                train_p95=train_p95,
+                val_p95=val_p95,
+                image_hw=image_hw,
+            )
+            stage_diag = {
+                "stage": name,
+                "optimizer_success": bool(res.success),
+                "optimizer_message": str(res.message),
+                "nfev": int(res.nfev),
+                "train_rmse": train_rmse,
+                "train_p50": train_p50,
+                "train_p95": train_p95,
+                "train_max": train_max,
+                "train_pos_ratio": float(np.mean(z_train > float(self.cfg.fit_z_eps))),
+                "val_rmse": val_rmse,
+                "val_p50": val_p50,
+                "val_p95": val_p95,
+                "val_max": val_max,
+                "val_pos_ratio": None if z_val.size == 0 else float(np.mean(z_val > float(self.cfg.fit_z_eps))),
+                "health_pass": ok,
+                "health_reasons": reasons,
+            }
+            diagnostics_stages.append(stage_diag)
+            target_p95 = val_p95 if val_p95 is not None else train_p95
+            if ok and target_p95 <= float(self.cfg.fit_max_reproj_p95_px):
+                candidate = (name, stage_diag, K_np, R, -R @ C)
+                if chosen_pass is None or target_p95 < (chosen_pass[1]["val_p95"] if chosen_pass[1]["val_p95"] is not None else chosen_pass[1]["train_p95"]):
+                    chosen_pass = candidate
+            # 未达标时，选择最小target_p95的兜底解
+            fail_count = float(len(reasons))
+            score = target_p95 + 1e3 * fail_count
+            if score < best_effort_score:
+                best_effort_score = score
+                chosen_best_effort = (name, stage_diag, K_np, R, -R @ C)
+
+        chosen = chosen_pass if chosen_pass is not None else chosen_best_effort
+        assert chosen is not None
+        chosen_name, chosen_diag, K_best, R_best, t_best = chosen
+        if not bool(chosen_diag["health_pass"]) or (
+            (chosen_diag["val_p95"] is not None and float(chosen_diag["val_p95"]) > float(self.cfg.fit_max_reproj_p95_px))
+            or (chosen_diag["val_p95"] is None and float(chosen_diag["train_p95"]) > float(self.cfg.fit_max_reproj_p95_px))
+        ):
+            import warnings
+
+            warnings.warn(
+                "该数据不适合用单个健康针孔模型在当前误差阈值下拟合；已返回最优阶段结果。",
+                RuntimeWarning,
+            )
+
+        K = torch.from_numpy(K_best).to(dtype=torch.float64, device=fit_dev)
+        R = torch.from_numpy(R_best).to(dtype=torch.float64, device=fit_dev)
+        t_t = torch.from_numpy(t_best).to(dtype=torch.float64, device=fit_dev)
+        pos_ratio, p50, p95, pmax = self._evaluate_camera_fit(xyz=xyz_t, uv=uv_t, K=K, R=R, t_t=t_t)
         w2c = torch.eye(4, dtype=torch.float64, device=fit_dev)
         w2c[:3, :3] = R
         w2c[:3, 3] = t_t
-
-        if pos_ratio < float(self.cfg.fit_min_positive_depth_ratio):
-            scene_id = int(batch["scene_id"][bi].item()) if torch.is_tensor(batch.get("scene_id", None)) else bi
-            fx, fy = float(K[0, 0].item()), float(K[1, 1].item())
-            cx, cy = float(K[0, 2].item()), float(K[1, 2].item())
-            raise RuntimeError(
-                "Virtual camera fit has too few positive-depth samples: "
-                f"scene={scene_id}, view={tv}, positive_depth_ratio={pos_ratio:.4f}, "
-                f"threshold={float(self.cfg.fit_min_positive_depth_ratio):.4f}, "
-                f"K=[fx={fx:.3f}, fy={fy:.3f}, cx={cx:.3f}, cy={cy:.3f}]"
-            )
-
+        diagnostics = {
+            "precheck_warnings": pre_warn,
+            "selected_stage": chosen_name,
+            "stages": diagnostics_stages,
+            "num_correspondences_total": int(xyz_np.shape[0]),
+            "num_train": int(train_idx.shape[0]),
+            "num_val": int(val_idx.shape[0]),
+        }
         cam_obj = VirtualPinholeCamera(
             K=K.to(torch.float32),
             w2c=w2c.to(torch.float32),
             fit_p50=p50,
             fit_p95=p95,
             fit_max=pmax,
+            diagnostics=diagnostics,
         )
         if self.cfg.fit_cache_enable:
             self._virtual_cam_cache[cache_key] = cam_obj
