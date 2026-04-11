@@ -74,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--enable-cover-to-fit-sweep", action="store_true")
     p.add_argument("--sweep-num-cameras", type=int, default=15)
     p.add_argument("--sweep-min-scene-dist-ratio", type=float, default=0.15)
+    p.add_argument("--enable-factorized-2x2-probe", action="store_true")
     p.add_argument("--root-cause-alpha-ratio-threshold", type=float, default=10.0)
     p.add_argument("--root-cause-reproj-threshold-px", type=float, default=2.0)
     p.add_argument("--save-images", action="store_true")
@@ -582,6 +583,15 @@ def _k_ablation_render_probe(
     return out
 
 
+def _render_alpha_metrics(alpha_chw: torch.Tensor) -> dict[str, float]:
+    a = alpha_chw.detach().cpu().numpy().squeeze(0).astype(np.float32)
+    amax = float(np.maximum(a, 0.0).max())
+    athr = max(0.01, amax * 0.1)
+    acov = float((a > athr).mean())
+    amass = float(np.maximum(a, 0.0).sum())
+    return {"alpha_max": amax, "alpha_cov": acov, "alpha_thr": float(athr), "alpha_mass": amass}
+
+
 def _camera_handedness_diagnostics(
     cam: Any,
     xyz_local: np.ndarray,
@@ -953,6 +963,105 @@ def main() -> None:
                         ),
                     ]
                 )
+        factorized_2x2: dict[str, dict[str, float]] | None = None
+        factorized_root: str | None = None
+        if args.enable_factorized_2x2_probe and gauss["centers"].shape[0] > 0:
+            xyz_np = gauss["centers"].detach().cpu().numpy().astype(np.float64)
+            scene_center = xyz_np.mean(axis=0)
+            fit_w2c_np = cam.w2c.detach().cpu().numpy().astype(np.float64)
+            fit_center = _camera_center_from_w2c(fit_w2c_np)
+
+            # W_cov: 与 fit center 共中心的 look-at 姿态
+            cam_wcov = _build_cover_camera_from_eye(
+                eye_world=fit_center,
+                target_world=scene_center,
+                points_xyz=xyz_np,
+                image_hw=(int(rendered_rgb.shape[-2]), int(rendered_rgb.shape[-1])),
+                device=target_rgb.device,
+                margin_ratio=float(args.cover_camera_margin_ratio),
+            )
+            # K_cov under W_fit: 在固定拟合姿态下重估 coverage 内参
+            K_cov_fitW = _fit_intrinsics_cover_points_np(
+                xyz_np,
+                fit_w2c_np,
+                int(rendered_rgb.shape[-1]),
+                int(rendered_rgb.shape[-2]),
+                float(args.cover_camera_margin_ratio),
+            )
+            combos: dict[str, VirtualPinholeCamera] = {
+                "Wfit_Kfit": cam,
+                "Wfit_Kcov": VirtualPinholeCamera(
+                    K=torch.from_numpy(K_cov_fitW).to(device=target_rgb.device, dtype=torch.float32),
+                    w2c=cam.w2c,
+                    fit_p50=cam.fit_p50,
+                    fit_p95=cam.fit_p95,
+                    fit_max=cam.fit_max,
+                ),
+                "Wcov_Kfit": VirtualPinholeCamera(
+                    K=cam.K,
+                    w2c=cam_wcov.w2c,
+                    fit_p50=cam.fit_p50,
+                    fit_p95=cam.fit_p95,
+                    fit_max=cam.fit_max,
+                ),
+                "Wcov_Kcov": cam_wcov,
+            }
+            factorized_2x2 = {}
+            for name, cam_v in combos.items():
+                rr_v, ra_v, _ = renderer._render_cuda(
+                    centers=gauss["centers"],
+                    opacity=gauss["opacity"],
+                    scale=gauss["scale"],
+                    rotation=gauss["rotation"],
+                    rgb=gauss["rgb"],
+                    cam=cam_v,
+                    image_hw=(int(rendered_rgb.shape[-2]), int(rendered_rgb.shape[-1])),
+                )
+                alpha_v = _render_alpha_metrics(ra_v)
+                proj_v = _project_with_camera_np(
+                    cam_v,
+                    xyz_np,
+                    (int(rendered_rgb.shape[-2]), int(rendered_rgb.shape[-1])),
+                )
+                factorized_2x2[name] = {
+                    **alpha_v,
+                    "in_frame_ratio": float(proj_v["in_frame_ratio"]),
+                    "z_p50": float(proj_v["z_p50"]),
+                }
+                if args.save_images:
+                    work_dir = Path(cfg.get("system", {}).get("work_dir", "work_dirs/sat2world_default"))
+                    out_dir = work_dir / "render_check" / f"scene_{int(batch['scene_id'][0].item())}" / f"vi_{args.view_i}_vj_{args.view_j}" / "factorized_2x2"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    _save_chw_rgb(out_dir / f"{name}_rgb.png", rr_v)
+                    _save_chw_gray(out_dir / f"{name}_alpha.png", ra_v)
+
+            def _ok(d: dict[str, float]) -> bool:
+                return d["alpha_max"] >= args.alpha_max_min_threshold and d["alpha_cov"] >= args.alpha_coverage_min_threshold
+
+            a = _ok(factorized_2x2["Wfit_Kfit"])
+            b = _ok(factorized_2x2["Wfit_Kcov"])
+            c = _ok(factorized_2x2["Wcov_Kfit"])
+            d = _ok(factorized_2x2["Wcov_Kcov"])
+            if (not a) and b and (not c) and d:
+                factorized_root = "K_fit_dominant"
+            elif (not a) and (not b) and c and d:
+                factorized_root = "W_fit_dominant"
+            elif (not a) and b and c and d:
+                factorized_root = "Wfit_Kfit_coupled_issue"
+            elif (not a) and (not b) and (not c) and d:
+                factorized_root = "strong_coupled_or_backend_limit"
+            else:
+                factorized_root = "inconclusive"
+
+            checks.append(
+                CheckResult(
+                    "factorized_2x2_probe_executed",
+                    1.0,
+                    0.5,
+                    True,
+                    note=factorized_root,
+                )
+            )
         sweep_records: list[dict[str, Any]] = []
         if args.enable_cover_to_fit_sweep and gauss["centers"].shape[0] > 0:
             xyz_np = gauss["centers"].detach().cpu().numpy().astype(np.float64)
@@ -1136,6 +1245,11 @@ def main() -> None:
 
                 with open(out_dir / "sweep_cover_to_fit_report.json", "w", encoding="utf-8") as f:
                     json.dump(sweep_records, f, ensure_ascii=False, indent=2)
+            if "factorized_2x2" in locals() and factorized_2x2 is not None:
+                import json
+
+                with open(out_dir / "factorized_2x2_report.json", "w", encoding="utf-8") as f:
+                    json.dump({"results": factorized_2x2, "inferred_root": factorized_root}, f, ensure_ascii=False, indent=2)
 
     print("\n================ Render Check Summary ================")
     print(f"scene_index={args.scene_index} view_i={args.view_i} view_j={args.view_j}")
@@ -1243,6 +1357,14 @@ def main() -> None:
                 f"idx={first_fail['index']} lam={first_fail['lambda']:.3f} "
                 f"alpha_max={first_fail['alpha_max']:.6f} alpha_cov={first_fail['alpha_cov']:.6f}"
             )
+    if "factorized_2x2" in locals() and factorized_2x2 is not None:
+        print("\n-- factorized 2x2 probe (W x K) --")
+        for name, d in factorized_2x2.items():
+            print(
+                f"  {name:10s}: alpha_max={d['alpha_max']:.6f} alpha_cov={d['alpha_cov']:.6f} "
+                f"alpha_mass={d['alpha_mass']:.3f} in_frame={d['in_frame_ratio']:.4f} z50={d['z_p50']:.3f}"
+            )
+        print(f"  inferred_root={factorized_root}")
 
     print("------------------------------------------------------")
     print("RESULT:", "PASS" if all_pass else "FAIL")
