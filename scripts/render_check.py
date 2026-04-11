@@ -66,12 +66,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cam-det-min-threshold", type=float, default=0.5)
     p.add_argument("--cam-orthogonality-max-threshold", type=float, default=1e-2)
     p.add_argument("--cam-source-positive-depth-ratio-min-threshold", type=float, default=0.5)
-    p.add_argument("--cam-reproj-gap-min-threshold-px", type=float, default=1e-3)
     p.add_argument("--convention-probe-alpha-max-threshold", type=float, default=1e-3)
     p.add_argument("--enable-cover-camera-probe", action="store_true")
     p.add_argument("--cover-camera-margin-ratio", type=float, default=0.05)
     p.add_argument("--cover-camera-distance-factor", type=float, default=3.0)
     p.add_argument("--cover-camera-max-retries", type=int, default=8)
+    p.add_argument("--enable-cover-to-fit-sweep", action="store_true")
+    p.add_argument("--sweep-num-cameras", type=int, default=15)
+    p.add_argument("--sweep-min-scene-dist-ratio", type=float, default=0.15)
     p.add_argument("--root-cause-alpha-ratio-threshold", type=float, default=10.0)
     p.add_argument("--root-cause-reproj-threshold-px", type=float, default=2.0)
     p.add_argument("--save-images", action="store_true")
@@ -420,6 +422,33 @@ def _build_cover_camera_from_points(
     raise RuntimeError(f"failed to build cover camera after {max_retries} retries: {last_err}")
 
 
+def _camera_center_from_w2c(w2c: np.ndarray) -> np.ndarray:
+    R = w2c[:3, :3]
+    t = w2c[:3, 3]
+    return (-R.T @ t).reshape(3)
+
+
+def _build_cover_camera_from_eye(
+    *,
+    eye_world: np.ndarray,
+    target_world: np.ndarray,
+    points_xyz: np.ndarray,
+    image_hw: tuple[int, int],
+    device: torch.device,
+    margin_ratio: float,
+) -> VirtualPinholeCamera:
+    h, w = image_hw
+    w2c = _look_at_w2c_np(eye=eye_world, target=target_world, up_hint=np.array([0.0, 1.0, 0.0], dtype=np.float64))
+    K = _fit_intrinsics_cover_points_np(points_xyz, w2c, w, h, margin_ratio)
+    return VirtualPinholeCamera(
+        K=torch.from_numpy(K).to(device=device, dtype=torch.float32),
+        w2c=torch.from_numpy(w2c).to(device=device, dtype=torch.float32),
+        fit_p50=float("nan"),
+        fit_p95=float("nan"),
+        fit_max=float("nan"),
+    )
+
+
 def _extract_probe_gaussians(outputs: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
     centers = outputs["gaussian_centers_rpc"][0].permute(0, 2, 3, 1).reshape(-1, 3)
     opacity = outputs["gaussian_opacity"][0].permute(0, 2, 3, 1).reshape(-1, 1)
@@ -559,7 +588,7 @@ def _camera_handedness_diagnostics(
     gt_line: np.ndarray,
     gt_samp: np.ndarray,
 ) -> dict[str, float]:
-    """诊断虚拟相机是否存在“手性错误但重投影可通过”的问题。"""
+    """诊断虚拟相机旋转矩阵与深度方向是否合理。"""
     if xyz_local.ndim != 2 or xyz_local.shape[1] != 3:
         raise ValueError(f"xyz_local must be [N,3], got {xyz_local.shape}")
     n = xyz_local.shape[0]
@@ -576,46 +605,21 @@ def _camera_handedness_diagnostics(
     z = cam_xyz[:, 2]
     pos_ratio = float((z > 1e-6).mean())
 
-    # 与当前代码中的符号翻转保持一致：R,t 同时乘 -1。
-    R_neg = -R
-    t_neg = -t
-    w2c_neg = np.eye(4, dtype=np.float64)
-    w2c_neg[:3, :3] = R_neg
-    w2c_neg[:3, 3] = t_neg
-    cam_xyz_neg = (w2c_neg[:3, :] @ xyz_h.T).T
-    z_neg = cam_xyz_neg[:, 2]
-    pos_ratio_neg = float((z_neg > 1e-6).mean())
-
     proj = (K @ cam_xyz.T).T
-    proj_neg = (K @ cam_xyz_neg.T).T
-    valid = np.isfinite(proj[:, 2]) & (np.abs(proj[:, 2]) > 1e-8)
-    valid_neg = np.isfinite(proj_neg[:, 2]) & (np.abs(proj_neg[:, 2]) > 1e-8)
-    uv = np.zeros((n, 2), dtype=np.float64)
-    uv_neg = np.zeros((n, 2), dtype=np.float64)
-    uv[valid] = proj[valid, :2] / proj[valid, 2:3]
-    uv_neg[valid_neg] = proj_neg[valid_neg, :2] / proj_neg[valid_neg, 2:3]
-
-    gt_uv = np.stack([gt_samp.astype(np.float64), gt_line.astype(np.float64)], axis=-1)
-    both = valid & valid_neg & np.isfinite(gt_uv).all(axis=1)
-    if both.any():
-        err = np.linalg.norm(uv[both] - gt_uv[both], axis=1)
-        err_neg = np.linalg.norm(uv_neg[both] - gt_uv[both], axis=1)
+    valid = np.isfinite(proj[:, 2]) & (np.abs(proj[:, 2]) > 1e-8) & np.isfinite(gt_line) & np.isfinite(gt_samp)
+    if valid.any():
+        uv = proj[valid, :2] / proj[valid, 2:3]
+        gt_uv = np.stack([gt_samp.astype(np.float64), gt_line.astype(np.float64)], axis=-1)[valid]
+        err = np.linalg.norm(uv - gt_uv, axis=1)
         reproj_p95 = float(np.quantile(err, 0.95))
-        reproj_p95_neg = float(np.quantile(err_neg, 0.95))
-        reproj_gap = abs(reproj_p95 - reproj_p95_neg)
     else:
         reproj_p95 = float("inf")
-        reproj_p95_neg = float("inf")
-        reproj_gap = float("inf")
 
     return {
         "cam_det_r": det_r,
         "cam_orthogonality_err": orth_err,
         "cam_source_positive_depth_ratio": pos_ratio,
-        "cam_source_positive_depth_ratio_if_negated": pos_ratio_neg,
         "cam_reproj_p95_current_px": reproj_p95,
-        "cam_reproj_p95_negated_px": reproj_p95_neg,
-        "cam_reproj_p95_gap_px": reproj_gap,
     }
 
 
@@ -949,6 +953,67 @@ def main() -> None:
                         ),
                     ]
                 )
+        sweep_records: list[dict[str, Any]] = []
+        if args.enable_cover_to_fit_sweep and gauss["centers"].shape[0] > 0:
+            xyz_np = gauss["centers"].detach().cpu().numpy().astype(np.float64)
+            scene_center = xyz_np.mean(axis=0)
+            fit_w2c_np = cam.w2c.detach().cpu().numpy().astype(np.float64)
+            fit_center = _camera_center_from_w2c(fit_w2c_np)
+            vec = fit_center - scene_center
+            vec_norm = float(np.linalg.norm(vec) + 1e-12)
+            min_dist = max(float(np.linalg.norm(xyz_np.max(axis=0) - xyz_np.min(axis=0))) * float(args.sweep_min_scene_dist_ratio), 1.0)
+            for si in range(max(int(args.sweep_num_cameras), 2)):
+                lam = float(si) / float(max(int(args.sweep_num_cameras) - 1, 1))
+                eye = (1.0 - lam) * scene_center + lam * fit_center
+                cur_dist = float(np.linalg.norm(eye - scene_center))
+                if cur_dist < min_dist:
+                    eye = scene_center + vec / max(vec_norm, 1e-12) * min_dist
+                    cur_dist = min_dist
+                cam_s = _build_cover_camera_from_eye(
+                    eye_world=eye,
+                    target_world=scene_center,
+                    points_xyz=xyz_np,
+                    image_hw=(int(rendered_rgb.shape[-2]), int(rendered_rgb.shape[-1])),
+                    device=target_rgb.device,
+                    margin_ratio=float(args.cover_camera_margin_ratio),
+                )
+                rr_s, ra_s, _ = renderer._render_cuda(
+                    centers=gauss["centers"],
+                    opacity=gauss["opacity"],
+                    scale=gauss["scale"],
+                    rotation=gauss["rotation"],
+                    rgb=gauss["rgb"],
+                    cam=cam_s,
+                    image_hw=(int(rendered_rgb.shape[-2]), int(rendered_rgb.shape[-1])),
+                )
+                a = ra_s.detach().cpu().numpy().squeeze(0).astype(np.float32)
+                amax = float(np.maximum(a, 0.0).max())
+                athr = max(0.01, amax * 0.1)
+                acov = float((a > athr).mean())
+                proj_s = _project_with_camera_np(
+                    cam_s,
+                    xyz_np,
+                    (int(rendered_rgb.shape[-2]), int(rendered_rgb.shape[-1])),
+                )
+                rec = {
+                    "index": int(si),
+                    "lambda": lam,
+                    "distance_to_scene_center": cur_dist,
+                    "distance_to_fit_center": float(np.linalg.norm(eye - fit_center)),
+                    "alpha_max": amax,
+                    "alpha_cov": acov,
+                    "alpha_thr": float(athr),
+                    "proj": proj_s,
+                    "K": cam_s.K.detach().cpu().numpy().astype(np.float64).tolist(),
+                    "w2c": cam_s.w2c.detach().cpu().numpy().astype(np.float64).tolist(),
+                }
+                sweep_records.append(rec)
+                if args.save_images:
+                    work_dir = Path(cfg.get("system", {}).get("work_dir", "work_dirs/sat2world_default"))
+                    out_dir = work_dir / "render_check" / f"scene_{int(batch['scene_id'][0].item())}" / f"vi_{args.view_i}_vj_{args.view_j}" / "sweep_cover_to_fit"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    _save_chw_rgb(out_dir / f"sweep_{si:03d}_rgb.png", rr_s)
+                    _save_chw_gray(out_dir / f"sweep_{si:03d}_alpha.png", ra_s)
         root_cause_note = "insufficient evidence"
         if cover_metrics is not None and fit_render_domain_diag is not None:
             alpha_ratio = float(cover_metrics["alpha_max"] / max(float(metrics["alpha_max"]), 1e-12))
@@ -1020,7 +1085,7 @@ def main() -> None:
                     cam_diag["cam_det_r"],
                     args.cam_det_min_threshold,
                     cam_diag["cam_det_r"] >= args.cam_det_min_threshold,
-                    note=f"det should be close to +1; negated_depth_ratio={cam_diag['cam_source_positive_depth_ratio_if_negated']:.4f}",
+                    note="det should be close to +1",
                 ),
                 CheckResult(
                     "cam_orthogonality_err",
@@ -1033,18 +1098,7 @@ def main() -> None:
                     cam_diag["cam_source_positive_depth_ratio"],
                     args.cam_source_positive_depth_ratio_min_threshold,
                     cam_diag["cam_source_positive_depth_ratio"] >= args.cam_source_positive_depth_ratio_min_threshold,
-                    note=f"if negated={cam_diag['cam_source_positive_depth_ratio_if_negated']:.4f}",
-                ),
-                CheckResult(
-                    "cam_reproj_gap_current_vs_negated_p95_px",
-                    cam_diag["cam_reproj_p95_gap_px"],
-                    args.cam_reproj_gap_min_threshold_px,
-                    cam_diag["cam_reproj_p95_gap_px"] >= args.cam_reproj_gap_min_threshold_px,
-                    note=(
-                        f"curr_p95={cam_diag['cam_reproj_p95_current_px']:.6f}, "
-                        f"neg_p95={cam_diag['cam_reproj_p95_negated_px']:.6f}; "
-                        "gap too small indicates sign ambiguity"
-                    ),
+                    note=f"reproj_p95={cam_diag['cam_reproj_p95_current_px']:.6f}",
                 ),
                 CheckResult(
                     "gsplat_convention_mismatch_suspected",
@@ -1077,6 +1131,11 @@ def main() -> None:
             if cover_rr is not None and cover_ra is not None:
                 _save_chw_rgb(out_dir / "cover_cam_rendered_rgb.png", cover_rr)
                 _save_chw_gray(out_dir / "cover_cam_rendered_alpha.png", cover_ra)
+            if "sweep_records" in locals() and len(sweep_records) > 0:
+                import json
+
+                with open(out_dir / "sweep_cover_to_fit_report.json", "w", encoding="utf-8") as f:
+                    json.dump(sweep_records, f, ensure_ascii=False, indent=2)
 
     print("\n================ Render Check Summary ================")
     print(f"scene_index={args.scene_index} view_i={args.view_i} view_j={args.view_j}")
@@ -1163,6 +1222,26 @@ def main() -> None:
             print(
                 f"  {name:16s}: alpha_max={d['alpha_max']:.6f}, "
                 f"alpha_cov={d['alpha_cov']:.6f}, alpha_thr={d['alpha_thr']:.6f}"
+            )
+    if "sweep_records" in locals() and len(sweep_records) > 0:
+        print("\n-- cover->fit sweep probe --")
+        first_fail = None
+        for r in sweep_records:
+            if first_fail is None and (r["alpha_max"] < args.alpha_max_min_threshold or r["alpha_cov"] < args.alpha_coverage_min_threshold):
+                first_fail = r
+            print(
+                f"  idx={r['index']:02d} lam={r['lambda']:.3f} "
+                f"d_scene={r['distance_to_scene_center']:.2f} d_fit={r['distance_to_fit_center']:.2f} "
+                f"alpha_max={r['alpha_max']:.6f} alpha_cov={r['alpha_cov']:.6f} "
+                f"in_frame={r['proj']['in_frame_ratio']:.4f} z50={r['proj']['z_p50']:.3f}"
+            )
+        if first_fail is None:
+            print("  first_fail: none")
+        else:
+            print(
+                "  first_fail: "
+                f"idx={first_fail['index']} lam={first_fail['lambda']:.3f} "
+                f"alpha_max={first_fail['alpha_max']:.6f} alpha_cov={first_fail['alpha_cov']:.6f}"
             )
 
     print("------------------------------------------------------")
