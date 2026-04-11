@@ -61,6 +61,36 @@ def axis_angle_to_matrix(rvec: torch.Tensor, eps: float = 1e-12) -> torch.Tensor
     return I + st * K + (1.0 - ct) * (K @ K)
 
 
+def _normalize_points_2d(uv: torch.Tensor, eps: float = 1e-12) -> tuple[torch.Tensor, torch.Tensor]:
+    mu = uv.mean(dim=0)
+    d = torch.linalg.norm(uv - mu[None, :], dim=-1)
+    s = torch.sqrt(torch.tensor(2.0, dtype=uv.dtype, device=uv.device)) / d.mean().clamp_min(eps)
+    T = torch.eye(3, dtype=uv.dtype, device=uv.device)
+    T[0, 0] = s
+    T[1, 1] = s
+    T[0, 2] = -s * mu[0]
+    T[1, 2] = -s * mu[1]
+    uv_h = torch.cat([uv, torch.ones((uv.shape[0], 1), dtype=uv.dtype, device=uv.device)], dim=-1)
+    uv_n = (T @ uv_h.T).T[:, :2]
+    return uv_n, T
+
+
+def _normalize_points_3d(xyz: torch.Tensor, eps: float = 1e-12) -> tuple[torch.Tensor, torch.Tensor]:
+    mu = xyz.mean(dim=0)
+    d = torch.linalg.norm(xyz - mu[None, :], dim=-1)
+    s = torch.sqrt(torch.tensor(3.0, dtype=xyz.dtype, device=xyz.device)) / d.mean().clamp_min(eps)
+    U = torch.eye(4, dtype=xyz.dtype, device=xyz.device)
+    U[0, 0] = s
+    U[1, 1] = s
+    U[2, 2] = s
+    U[0, 3] = -s * mu[0]
+    U[1, 3] = -s * mu[1]
+    U[2, 3] = -s * mu[2]
+    xyz_h = torch.cat([xyz, torch.ones((xyz.shape[0], 1), dtype=xyz.dtype, device=xyz.device)], dim=-1)
+    xyz_n = (U @ xyz_h.T).T[:, :3]
+    return xyz_n, U
+
+
 def cov3d_from_scale_rotation(scale: torch.Tensor, quaternion: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     s = scale.clamp_min(eps)
     r = quaternion_to_matrix(quaternion)
@@ -205,9 +235,8 @@ class RPCGaussianRendererCfg:
     fit_constrained_huber_delta: float = 1.0
     fit_constrained_lambda_fxy: float = 1.0e-2
     fit_constrained_lambda_depth: float = 5.0e-2
-    fit_constrained_lambda_center: float = 2.0e-3
+    fit_constrained_lambda_center: float = 1.0e-2
     fit_constrained_min_depth: float = 1.0e-2
-    fit_constrained_accept_p95_ratio: float = 1.05
 
 
 class RPCGaussianRenderer:
@@ -317,11 +346,13 @@ class RPCGaussianRenderer:
 
         log_fx = torch.tensor(np.log(fx0), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
         log_fy = torch.tensor(np.log(fy0), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
-        cx = torch.tensor(float(K_init[0, 2].item()), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
-        cy = torch.tensor(float(K_init[1, 2].item()), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
+        cx0 = float(np.clip(float(K_init[0, 2].item()), 0.0, max(float(w) - 1.0, 1.0)))
+        cy0 = float(np.clip(float(K_init[1, 2].item()), 0.0, max(float(h) - 1.0, 1.0)))
+        cx_raw = torch.tensor(np.log((cx0 + 1.0) / max(float(w) - cx0, 1.0)), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
+        cy_raw = torch.tensor(np.log((cy0 + 1.0) / max(float(h) - cy0, 1.0)), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
         rvec = rvec0.detach().clone().requires_grad_(True)
         tvec = t_init.detach().clone().requires_grad_(True)
-        params = [log_fx, log_fy, cx, cy, rvec, tvec]
+        params = [log_fx, log_fy, cx_raw, cy_raw, rvec, tvec]
         opt = torch.optim.Adam(params, lr=float(self.cfg.fit_constrained_lr))
 
         delta = float(self.cfg.fit_constrained_huber_delta)
@@ -342,6 +373,8 @@ class RPCGaussianRenderer:
             z_safe = z.clamp_min(z_eps)
             fx = torch.exp(log_fx)
             fy = torch.exp(log_fy)
+            cx = (float(w) - 1.0) * torch.sigmoid(cx_raw)
+            cy = (float(h) - 1.0) * torch.sigmoid(cy_raw)
             u = fx * (cam[:, 0] / z_safe) + cx
             v = fy * (cam[:, 1] / z_safe) + cy
             pred = torch.stack([u, v], dim=-1)
@@ -364,24 +397,26 @@ class RPCGaussianRenderer:
                 best_state = (
                     log_fx.detach().clone(),
                     log_fy.detach().clone(),
-                    cx.detach().clone(),
-                    cy.detach().clone(),
+                    cx_raw.detach().clone(),
+                    cy_raw.detach().clone(),
                     rvec.detach().clone(),
                     tvec.detach().clone(),
                 )
 
         if best_state is not None:
-            log_fx, log_fy, cx, cy, rvec, tvec = best_state
+            log_fx, log_fy, cx_raw, cy_raw, rvec, tvec = best_state
 
         R_out = axis_angle_to_matrix(rvec.detach())
         t_out = tvec.detach()
         fx_out = torch.exp(log_fx.detach()).clamp_min(1.0)
         fy_out = torch.exp(log_fy.detach()).clamp_min(1.0)
+        cx_out = (float(w) - 1.0) * torch.sigmoid(cx_raw.detach())
+        cy_out = (float(h) - 1.0) * torch.sigmoid(cy_raw.detach())
         K_out = torch.zeros((3, 3), dtype=xyz.dtype, device=xyz.device)
         K_out[0, 0] = fx_out
         K_out[1, 1] = fy_out
-        K_out[0, 2] = cx.detach()
-        K_out[1, 2] = cy.detach()
+        K_out[0, 2] = cx_out
+        K_out[1, 2] = cy_out
         K_out[2, 2] = 1.0
         return K_out, R_out, t_out
 
@@ -439,11 +474,13 @@ class RPCGaussianRenderer:
         uv = torch.stack([samp, line], dim=-1).to(dtype=torch.float64, device=fit_dev)  # x=samp, y=line
 
         xyz = xyz_local.to(dtype=torch.float64, device=fit_dev)
-        n = xyz.shape[0]
+        xyz_n, U = _normalize_points_3d(xyz)
+        uv_n, T = _normalize_points_2d(uv)
+        n = xyz_n.shape[0]
         ones = torch.ones((n, 1), dtype=torch.float64, device=xyz.device)
-        X = torch.cat([xyz, ones], dim=-1)
-        u = uv[:, 0:1]
-        v = uv[:, 1:2]
+        X = torch.cat([xyz_n, ones], dim=-1)
+        u = uv_n[:, 0:1]
+        v = uv_n[:, 1:2]
 
         O = torch.zeros_like(X)
         A1 = torch.cat([X, O, -u * X], dim=-1)
@@ -451,7 +488,8 @@ class RPCGaussianRenderer:
         A = torch.cat([A1, A2], dim=0)
         _, _, Vh = torch.linalg.svd(A)
         p = Vh[-1]
-        P = p.view(3, 4)
+        Pn = p.view(3, 4)
+        P = torch.linalg.inv(T) @ Pn @ U
 
         # 用 OpenCV 分解 P -> K,R,t
         try:
@@ -475,10 +513,8 @@ class RPCGaussianRenderer:
             t_t = -t_t
 
         K = torch.from_numpy(K_np).to(device=fit_dev, dtype=torch.float64)
-        pos_ratio_init, p50_init, p95_init, pmax_init = self._evaluate_camera_fit(xyz=xyz, uv=uv, K=K, R=R, t_t=t_t)
-
         if bool(self.cfg.fit_constrained_enable):
-            K_refine, R_refine, t_refine = self._refine_camera_constrained(
+            K, R, t_t = self._refine_camera_constrained(
                 xyz=xyz,
                 uv=uv,
                 R_init=R,
@@ -486,22 +522,7 @@ class RPCGaussianRenderer:
                 K_init=K,
                 image_hw=(h, w),
             )
-            pos_ratio_refine, p50_refine, p95_refine, pmax_refine = self._evaluate_camera_fit(
-                xyz=xyz, uv=uv, K=K_refine, R=R_refine, t_t=t_refine
-            )
-            p95_ratio = float(self.cfg.fit_constrained_accept_p95_ratio)
-            refine_ok = (
-                pos_ratio_refine >= float(self.cfg.fit_min_positive_depth_ratio)
-                and np.isfinite(p95_refine)
-                and p95_refine <= p95_init * p95_ratio
-            )
-            if refine_ok:
-                K, R, t_t = K_refine, R_refine, t_refine
-                pos_ratio, p50, p95, pmax = pos_ratio_refine, p50_refine, p95_refine, pmax_refine
-            else:
-                pos_ratio, p50, p95, pmax = pos_ratio_init, p50_init, p95_init, pmax_init
-        else:
-            pos_ratio, p50, p95, pmax = pos_ratio_init, p50_init, p95_init, pmax_init
+        pos_ratio, p50, p95, pmax = self._evaluate_camera_fit(xyz=xyz, uv=uv, K=K, R=R, t_t=t_t)
 
         w2c = torch.eye(4, dtype=torch.float64, device=fit_dev)
         w2c[:3, :3] = R
