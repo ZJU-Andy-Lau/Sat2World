@@ -62,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cover-camera-margin-ratio", type=float, default=0.05)
     p.add_argument("--cover-camera-distance-factor", type=float, default=3.0)
     p.add_argument("--cover-camera-max-retries", type=int, default=8)
+    p.add_argument("--root-cause-alpha-ratio-threshold", type=float, default=10.0)
     p.add_argument("--save-images", action="store_true")
     p.add_argument("--dump-json", action="store_true")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -402,6 +403,69 @@ def _build_cover_camera_from_points(
     raise RuntimeError(f"failed to build cover camera after {max_retries} retries: {last_err}")
 
 
+def _camera_intrinsics_diagnostics(cam: VirtualPinholeCamera, image_hw: tuple[int, int]) -> dict[str, float]:
+    h, w = image_hw
+    K = cam.K.detach().cpu().numpy().astype(np.float64)
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    skew = float(K[0, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    return {
+        "fx": fx,
+        "fy": fy,
+        "skew": skew,
+        "cx": cx,
+        "cy": cy,
+        "fx_positive": 1.0 if fx > 0 else 0.0,
+        "fy_positive": 1.0 if fy > 0 else 0.0,
+        "principal_in_frame": 1.0 if (0.0 <= cx < float(w) and 0.0 <= cy < float(h)) else 0.0,
+    }
+
+
+def _k_ablation_alpha_probe(
+    renderer: RPCGaussianRenderer,
+    cam: VirtualPinholeCamera,
+    centers: torch.Tensor,
+    opacity: torch.Tensor,
+    scale: torch.Tensor,
+    rotation: torch.Tensor,
+    rgb: torch.Tensor,
+    image_hw: tuple[int, int],
+) -> dict[str, dict[str, float]]:
+    h, w = image_hw
+    K0 = cam.K.detach().clone()
+    K_center = K0.clone()
+    K_center[0, 2] = float(w) * 0.5
+    K_center[1, 2] = float(h) * 0.5
+    variants = {
+        "current": K0,
+        "abs_focal": torch.stack(
+            [torch.stack([K0[0, 0].abs(), K0[0, 1], K0[0, 2]]), torch.stack([K0[1, 0], K0[1, 1].abs(), K0[1, 2]]), K0[2]]
+        ),
+        "zero_skew": torch.stack([torch.stack([K0[0, 0], torch.zeros_like(K0[0, 1]), K0[0, 2]]), K0[1], K0[2]]),
+        "center_principal": K_center,
+    }
+    out: dict[str, dict[str, float]] = {}
+    for name, K_var in variants.items():
+        cam_v = VirtualPinholeCamera(K=K_var, w2c=cam.w2c, fit_p50=cam.fit_p50, fit_p95=cam.fit_p95, fit_max=cam.fit_max)
+        _, ra, _ = _render_variant(
+            renderer=renderer,
+            centers=centers,
+            opacity=opacity,
+            scale=scale,
+            rotation=rotation,
+            rgb=rgb,
+            cam=cam_v,
+            image_hw=image_hw,
+        )
+        st = _alpha_stats(ra)
+        out[name] = {
+            "alpha_max": float(st["alpha_max"]),
+            "alpha_cov": float(st["alpha_coverage"]),
+            "alpha_thr": float(st["alpha_thr"]),
+        }
+    return out
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
@@ -503,6 +567,17 @@ def main() -> None:
         and best_variant != "current"
     )
     cover_probe: dict[str, Any] | None = None
+    fit_intr_diag = _camera_intrinsics_diagnostics(cam, (h, w))
+    k_ablation_probe = _k_ablation_alpha_probe(
+        renderer=renderer,
+        cam=cam,
+        centers=centers,
+        opacity=opacity,
+        scale=scale,
+        rotation=rotation,
+        rgb=rgb,
+        image_hw=(h, w),
+    )
     if args.enable_cover_camera_probe:
         cover_cam = _build_cover_camera_from_points(
             xyz_world=centers.detach().cpu().numpy().astype(np.float64),
@@ -535,6 +610,21 @@ def main() -> None:
                 st_cover["alpha_coverage"] / max(float(render_by_variant["current"]["alpha_coverage"]), 1e-12)
             ),
         }
+    root_cause_note = "insufficient evidence"
+    if cover_probe is not None:
+        alpha_ratio = float(cover_probe["alpha_max"] / max(current_alpha_max, 1e-12))
+        k_sus = (
+            fit_intr_diag["fx_positive"] < 0.5
+            or fit_intr_diag["fy_positive"] < 0.5
+            or fit_intr_diag["principal_in_frame"] < 0.5
+            or abs(fit_intr_diag["skew"]) > 1e-3
+        )
+        if alpha_ratio >= float(args.root_cause_alpha_ratio_threshold):
+            root_cause_note = (
+                "fit camera intrinsics likely non-canonical"
+                if k_sus
+                else "fit camera likely incompatible with rasterizer convention"
+            )
 
     # 5) 关键检查
     checks: list[CheckResult] = [
@@ -576,6 +666,15 @@ def main() -> None:
                 ),
             ]
         )
+    checks.append(
+        CheckResult(
+            "root_cause_fit_camera_suspected",
+            1.0 if root_cause_note != "insufficient evidence" else 0.0,
+            0.5,
+            True,
+            note=root_cause_note,
+        )
+    )
 
     scene_id = int(batch["scene_id"][0].item())
     work_dir = Path(cfg.get("system", {}).get("work_dir", "work_dirs/sat2world_default"))
@@ -632,6 +731,8 @@ def main() -> None:
         },
         "probe_pinhole_reprojection": reproj,
         "probe_camera_matrix": cam_diag,
+        "probe_fit_intrinsics": fit_intr_diag,
+        "probe_k_ablation": k_ablation_probe,
         "probe_render_variants": {
             k: {
                 "alpha_max": float(vv["alpha_max"]),
@@ -650,6 +751,7 @@ def main() -> None:
             "alpha_coverage": float(cover_probe["alpha_coverage"]),
             "alpha_max_ratio_cover_vs_fit": float(cover_probe["alpha_max_ratio_cover_vs_fit"]),
             "alpha_cov_ratio_cover_vs_fit": float(cover_probe["alpha_cov_ratio_cover_vs_fit"]),
+            "root_cause_note": root_cause_note,
         },
         "checks": [
             {
@@ -701,6 +803,15 @@ def main() -> None:
             f"  ratio_cover_vs_fit: alpha_max={cover_probe['alpha_max_ratio_cover_vs_fit']:.3e}, "
             f"alpha_cov={cover_probe['alpha_cov_ratio_cover_vs_fit']:.3e}"
         )
+    print("\n-- fit camera intrinsics diagnostics --")
+    print(
+        f"  fx={fit_intr_diag['fx']:.6f}, fy={fit_intr_diag['fy']:.6f}, "
+        f"skew={fit_intr_diag['skew']:.6f}, cx={fit_intr_diag['cx']:.6f}, cy={fit_intr_diag['cy']:.6f}, "
+        f"principal_in_frame={fit_intr_diag['principal_in_frame']:.1f}"
+    )
+    print("\n-- fit camera K-ablation probe --")
+    for name, vv in k_ablation_probe.items():
+        print(f"  {name:16s}: alpha_max={vv['alpha_max']:.6f}, alpha_cov={vv['alpha_cov']:.6f}, alpha_thr={vv['alpha_thr']:.6f}")
 
     print("---------------------------------------------------------------")
     print("RESULT:", "PASS" if all_pass else "FAIL")

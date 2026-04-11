@@ -72,6 +72,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cover-camera-margin-ratio", type=float, default=0.05)
     p.add_argument("--cover-camera-distance-factor", type=float, default=3.0)
     p.add_argument("--cover-camera-max-retries", type=int, default=8)
+    p.add_argument("--root-cause-alpha-ratio-threshold", type=float, default=10.0)
+    p.add_argument("--root-cause-reproj-threshold-px", type=float, default=2.0)
     p.add_argument("--save-images", action="store_true")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -418,6 +420,139 @@ def _build_cover_camera_from_points(
     raise RuntimeError(f"failed to build cover camera after {max_retries} retries: {last_err}")
 
 
+def _extract_probe_gaussians(outputs: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
+    centers = outputs["gaussian_centers_rpc"][0].permute(0, 2, 3, 1).reshape(-1, 3)
+    opacity = outputs["gaussian_opacity"][0].permute(0, 2, 3, 1).reshape(-1, 1)
+    conf = outputs["gaussian_confidence_rpc"][0].permute(0, 2, 3, 1).reshape(-1, 1)
+    scale = outputs["gaussian_scale"][0].permute(0, 2, 3, 1).reshape(-1, 3)
+    rotation = outputs["gaussian_rotation"][0].permute(0, 2, 3, 1).reshape(-1, 4)
+    sh = outputs["gaussian_sh"][0].permute(0, 2, 3, 1).reshape(-1, outputs["gaussian_sh"].shape[2])
+    rgb = torch.sigmoid(sh[:, :3])
+    op_eff = (opacity * conf).clamp(0.0, 1.0).squeeze(1)
+    keep = op_eff > 1.0e-6
+    return {
+        "centers": centers[keep].to(device=device, dtype=torch.float32),
+        "scale": scale[keep].to(device=device, dtype=torch.float32),
+        "rotation": rotation[keep].to(device=device, dtype=torch.float32),
+        "rgb": rgb[keep].to(device=device, dtype=torch.float32),
+        "opacity": op_eff[keep].unsqueeze(1).to(device=device, dtype=torch.float32),
+    }
+
+
+def _camera_intrinsics_diagnostics(cam: VirtualPinholeCamera, image_hw: tuple[int, int]) -> dict[str, float]:
+    h, w = image_hw
+    K = cam.K.detach().cpu().numpy().astype(np.float64)
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    skew = float(K[0, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    fov_x = float(2.0 * np.arctan2(float(w), max(2.0 * abs(fx), 1e-12)) * 180.0 / np.pi)
+    fov_y = float(2.0 * np.arctan2(float(h), max(2.0 * abs(fy), 1e-12)) * 180.0 / np.pi)
+    A = K[:2, :2]
+    cond = float(np.linalg.cond(A)) if np.isfinite(A).all() else float("inf")
+    return {
+        "fx": fx,
+        "fy": fy,
+        "skew": skew,
+        "cx": cx,
+        "cy": cy,
+        "fx_over_w": fx / max(float(w), 1.0),
+        "fy_over_h": fy / max(float(h), 1.0),
+        "fov_x_deg": fov_x,
+        "fov_y_deg": fov_y,
+        "k2x2_cond": cond,
+        "fx_positive": 1.0 if fx > 0 else 0.0,
+        "fy_positive": 1.0 if fy > 0 else 0.0,
+        "principal_in_frame": 1.0 if (0.0 <= cx < float(w) and 0.0 <= cy < float(h)) else 0.0,
+    }
+
+
+def _project_with_camera_np(cam: VirtualPinholeCamera, xyz_world: np.ndarray, image_hw: tuple[int, int]) -> dict[str, float]:
+    h, w = image_hw
+    n = xyz_world.shape[0]
+    xyz_h = np.concatenate([xyz_world.astype(np.float64), np.ones((n, 1), dtype=np.float64)], axis=1)
+    K = cam.K.detach().cpu().numpy().astype(np.float64)
+    w2c = cam.w2c.detach().cpu().numpy().astype(np.float64)
+    cam_xyz = (w2c[:3, :] @ xyz_h.T).T
+    z = cam_xyz[:, 2]
+    proj = (K @ cam_xyz.T).T
+    valid = np.isfinite(z) & (z > 1e-8) & np.isfinite(proj).all(axis=1)
+    if not valid.any():
+        return {
+            "positive_depth_ratio": 0.0,
+            "in_frame_ratio": 0.0,
+            "z_p01": float("inf"),
+            "z_p50": float("inf"),
+            "z_p99": float("inf"),
+            "uv_bbox_w": 0.0,
+            "uv_bbox_h": 0.0,
+        }
+    uv = proj[valid, :2] / proj[valid, 2:3]
+    in_frame = (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+    z_valid = z[valid]
+    return {
+        "positive_depth_ratio": float(valid.mean()),
+        "in_frame_ratio": float(in_frame.mean()),
+        "z_p01": float(np.quantile(z_valid, 0.01)),
+        "z_p50": float(np.quantile(z_valid, 0.50)),
+        "z_p99": float(np.quantile(z_valid, 0.99)),
+        "uv_bbox_w": float(np.max(uv[:, 0]) - np.min(uv[:, 0])) if uv.shape[0] > 0 else 0.0,
+        "uv_bbox_h": float(np.max(uv[:, 1]) - np.min(uv[:, 1])) if uv.shape[0] > 0 else 0.0,
+    }
+
+
+def _k_ablation_render_probe(
+    renderer: RPCGaussianRenderer,
+    cam: VirtualPinholeCamera,
+    gauss: dict[str, torch.Tensor],
+    image_hw: tuple[int, int],
+) -> dict[str, dict[str, float]]:
+    K0 = cam.K.detach().clone()
+    h, w = image_hw
+    K_center = K0.clone()
+    K_center[0, 2] = float(w) * 0.5
+    K_center[1, 2] = float(h) * 0.5
+    variants: dict[str, torch.Tensor] = {
+        "current": K0,
+        "abs_focal": torch.stack(
+            [
+                torch.stack([K0[0, 0].abs(), K0[0, 1], K0[0, 2]]),
+                torch.stack([K0[1, 0], K0[1, 1].abs(), K0[1, 2]]),
+                K0[2],
+            ]
+        ),
+        "zero_skew": torch.stack(
+            [
+                torch.stack([K0[0, 0], torch.zeros_like(K0[0, 1]), K0[0, 2]]),
+                K0[1],
+                K0[2],
+            ]
+        ),
+        "center_principal": K_center,
+    }
+    out: dict[str, dict[str, float]] = {}
+    for name, K_var in variants.items():
+        cam_v = VirtualPinholeCamera(K=K_var, w2c=cam.w2c, fit_p50=cam.fit_p50, fit_p95=cam.fit_p95, fit_max=cam.fit_max)
+        _, ra, _ = renderer._render_cuda(
+            centers=gauss["centers"],
+            opacity=gauss["opacity"],
+            scale=gauss["scale"],
+            rotation=gauss["rotation"],
+            rgb=gauss["rgb"],
+            cam=cam_v,
+            image_hw=image_hw,
+        )
+        a = ra.detach().cpu().numpy().squeeze(0).astype(np.float32)
+        amax = float(np.maximum(a, 0.0).max())
+        athr = max(0.01, amax * 0.1)
+        acov = float((a > athr).mean())
+        out[name] = {
+            "alpha_max": amax,
+            "alpha_cov": acov,
+            "alpha_thr": float(athr),
+        }
+    return out
+
+
 def _camera_handedness_diagnostics(
     cam: Any,
     xyz_local: np.ndarray,
@@ -738,30 +873,30 @@ def main() -> None:
             samp_j,
             scale_expected_px=float(args.scale_radius_expected_px),
         )
+        fit_intr_diag = _camera_intrinsics_diagnostics(cam, (int(rendered_rgb.shape[-2]), int(rendered_rgb.shape[-1])))
         cover_metrics: dict[str, float] | None = None
         cover_diag: dict[str, float] | None = None
+        fit_render_domain_diag: dict[str, float] | None = None
+        cover_render_domain_diag: dict[str, float] | None = None
+        k_ablation_diag: dict[str, dict[str, float]] | None = None
         cover_rr: torch.Tensor | None = None
         cover_ra: torch.Tensor | None = None
-        if args.enable_cover_camera_probe:
-            # 与 convention probe 保持一致：同一批高斯，只替换相机。
-            centers = outputs["gaussian_centers_rpc"][0].permute(0, 2, 3, 1).reshape(-1, 3)
-            opacity = outputs["gaussian_opacity"][0].permute(0, 2, 3, 1).reshape(-1, 1)
-            conf = outputs["gaussian_confidence_rpc"][0].permute(0, 2, 3, 1).reshape(-1, 1)
-            scale = outputs["gaussian_scale"][0].permute(0, 2, 3, 1).reshape(-1, 3)
-            rotation = outputs["gaussian_rotation"][0].permute(0, 2, 3, 1).reshape(-1, 4)
-            sh = outputs["gaussian_sh"][0].permute(0, 2, 3, 1).reshape(-1, outputs["gaussian_sh"].shape[2])
-            rgb = torch.sigmoid(sh[:, :3])
-            op_eff = (opacity * conf).clamp(0.0, 1.0).squeeze(1)
-            keep = op_eff > 1.0e-6
-            if bool(keep.any()):
-                c_use = centers[keep].to(device=target_rgb.device, dtype=torch.float32)
-                s_use = scale[keep].to(device=target_rgb.device, dtype=torch.float32)
-                r_use = rotation[keep].to(device=target_rgb.device, dtype=torch.float32)
-                col_use = rgb[keep].to(device=target_rgb.device, dtype=torch.float32)
-                o_use = op_eff[keep].unsqueeze(1).to(device=target_rgb.device, dtype=torch.float32)
-
+        gauss = _extract_probe_gaussians(outputs, device=target_rgb.device)
+        if gauss["centers"].shape[0] > 0:
+            fit_render_domain_diag = _project_with_camera_np(
+                cam,
+                gauss["centers"].detach().cpu().numpy().astype(np.float64),
+                (int(rendered_rgb.shape[-2]), int(rendered_rgb.shape[-1])),
+            )
+            k_ablation_diag = _k_ablation_render_probe(
+                renderer=renderer,
+                cam=cam,
+                gauss=gauss,
+                image_hw=(int(rendered_rgb.shape[-2]), int(rendered_rgb.shape[-1])),
+            )
+        if args.enable_cover_camera_probe and gauss["centers"].shape[0] > 0:
                 cover_cam = _build_cover_camera_from_points(
-                    xyz_world=c_use.detach().cpu().numpy().astype(np.float64),
+                    xyz_world=gauss["centers"].detach().cpu().numpy().astype(np.float64),
                     image_hw=(int(rendered_rgb.shape[-2]), int(rendered_rgb.shape[-1])),
                     device=target_rgb.device,
                     margin_ratio=float(args.cover_camera_margin_ratio),
@@ -769,11 +904,11 @@ def main() -> None:
                     max_retries=int(args.cover_camera_max_retries),
                 )
                 cover_rr, cover_ra, _ = renderer._render_cuda(
-                    centers=c_use,
-                    opacity=o_use,
-                    scale=s_use,
-                    rotation=r_use,
-                    rgb=col_use,
+                    centers=gauss["centers"],
+                    opacity=gauss["opacity"],
+                    scale=gauss["scale"],
+                    rotation=gauss["rotation"],
+                    rgb=gauss["rgb"],
                     cam=cover_cam,
                     image_hw=(int(rendered_rgb.shape[-2]), int(rendered_rgb.shape[-1])),
                 )
@@ -791,6 +926,11 @@ def main() -> None:
                     "alpha_max_ratio_cover_vs_fit": float(cover_alpha_max / max(float(metrics["alpha_max"]), 1e-12)),
                     "alpha_cov_ratio_cover_vs_fit": float(cover_alpha_cov / max(float(metrics["alpha_coverage"]), 1e-12)),
                 }
+                cover_render_domain_diag = _project_with_camera_np(
+                    cover_cam,
+                    gauss["centers"].detach().cpu().numpy().astype(np.float64),
+                    (int(rendered_rgb.shape[-2]), int(rendered_rgb.shape[-1])),
+                )
                 checks.extend(
                     [
                         CheckResult(
@@ -809,6 +949,32 @@ def main() -> None:
                         ),
                     ]
                 )
+        root_cause_note = "insufficient evidence"
+        if cover_metrics is not None and fit_render_domain_diag is not None:
+            alpha_ratio = float(cover_metrics["alpha_max"] / max(float(metrics["alpha_max"]), 1e-12))
+            reproj_bad = float(metrics["center_centroid_err_px"]) > float(args.root_cause_reproj_threshold_px)
+            k_sus = (
+                fit_intr_diag["fx_positive"] < 0.5
+                or fit_intr_diag["fy_positive"] < 0.5
+                or fit_intr_diag["principal_in_frame"] < 0.5
+                or abs(fit_intr_diag["skew"]) > 1e-3
+            )
+            if alpha_ratio >= float(args.root_cause_alpha_ratio_threshold):
+                if k_sus:
+                    root_cause_note = "fit camera intrinsics likely non-canonical (fx/fy sign/skew/principal)"
+                elif reproj_bad:
+                    root_cause_note = "fit camera geometry good on fit-grid but unstable on render domain"
+                else:
+                    root_cause_note = "fit camera likely convention mismatch with rasterizer despite good reprojection"
+        checks.append(
+            CheckResult(
+                "root_cause_fit_camera_suspected",
+                1.0 if root_cause_note != "insufficient evidence" else 0.0,
+                0.5,
+                True,
+                note=root_cause_note,
+            )
+        )
         checks.extend(
             [
                 CheckResult(
@@ -963,6 +1129,40 @@ def main() -> None:
             print(
                 f"  ratio_cover_vs_fit: alpha_max={cover_diag['alpha_max_ratio_cover_vs_fit']:.3e}, "
                 f"alpha_cov={cover_diag['alpha_cov_ratio_cover_vs_fit']:.3e}"
+            )
+    if "fit_intr_diag" in locals():
+        print("\n-- fit camera intrinsics diagnostics --")
+        print(
+            f"  fx={fit_intr_diag['fx']:.6f}, fy={fit_intr_diag['fy']:.6f}, "
+            f"skew={fit_intr_diag['skew']:.6f}, cx={fit_intr_diag['cx']:.6f}, cy={fit_intr_diag['cy']:.6f}"
+        )
+        print(
+            f"  fx/w={fit_intr_diag['fx_over_w']:.6f}, fy/h={fit_intr_diag['fy_over_h']:.6f}, "
+            f"fov_x={fit_intr_diag['fov_x_deg']:.3f}deg, fov_y={fit_intr_diag['fov_y_deg']:.3f}deg, "
+            f"Kcond={fit_intr_diag['k2x2_cond']:.3e}, principal_in_frame={fit_intr_diag['principal_in_frame']:.1f}"
+        )
+    if "fit_render_domain_diag" in locals() and fit_render_domain_diag is not None:
+        print("\n-- fit camera render-domain projection diagnostics --")
+        print(
+            f"  pos_depth_ratio={fit_render_domain_diag['positive_depth_ratio']:.4f}, "
+            f"in_frame_ratio={fit_render_domain_diag['in_frame_ratio']:.4f}, "
+            f"z(p01,p50,p99)=({fit_render_domain_diag['z_p01']:.4f}, {fit_render_domain_diag['z_p50']:.4f}, {fit_render_domain_diag['z_p99']:.4f}), "
+            f"uv_bbox=({fit_render_domain_diag['uv_bbox_w']:.2f}, {fit_render_domain_diag['uv_bbox_h']:.2f})"
+        )
+    if "cover_render_domain_diag" in locals() and cover_render_domain_diag is not None:
+        print("\n-- cover camera render-domain projection diagnostics --")
+        print(
+            f"  pos_depth_ratio={cover_render_domain_diag['positive_depth_ratio']:.4f}, "
+            f"in_frame_ratio={cover_render_domain_diag['in_frame_ratio']:.4f}, "
+            f"z(p01,p50,p99)=({cover_render_domain_diag['z_p01']:.4f}, {cover_render_domain_diag['z_p50']:.4f}, {cover_render_domain_diag['z_p99']:.4f}), "
+            f"uv_bbox=({cover_render_domain_diag['uv_bbox_w']:.2f}, {cover_render_domain_diag['uv_bbox_h']:.2f})"
+        )
+    if "k_ablation_diag" in locals() and k_ablation_diag is not None:
+        print("\n-- fit camera K-ablation render probe --")
+        for name, d in k_ablation_diag.items():
+            print(
+                f"  {name:16s}: alpha_max={d['alpha_max']:.6f}, "
+                f"alpha_cov={d['alpha_cov']:.6f}, alpha_thr={d['alpha_thr']:.6f}"
             )
 
     print("------------------------------------------------------")
