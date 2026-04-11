@@ -786,9 +786,7 @@ class RPCGaussianRenderer:
 
         stage_pack = [("A", res_a, params_a), ("B", res_b, params_b), ("C", res_c, params_c)]
         diagnostics_stages: list[dict[str, Any]] = []
-        chosen_pass: tuple[str, dict[str, Any], np.ndarray, np.ndarray, np.ndarray] | None = None
-        chosen_best_effort: tuple[str, dict[str, Any], np.ndarray, np.ndarray, np.ndarray] | None = None
-        best_effort_score = float("inf")
+        final_stage_payload: tuple[str, dict[str, Any], np.ndarray, np.ndarray, np.ndarray] | None = None
 
         for name, res, p in stage_pack:
             rvec = np.array([p["rvec0"], p["rvec1"], p["rvec2"]], dtype=np.float64)
@@ -849,31 +847,12 @@ class RPCGaussianRenderer:
                 "health_reasons": reasons,
             }
             diagnostics_stages.append(stage_diag)
-            target_p95 = val_p95 if val_p95 is not None else train_p95
-            if ok and target_p95 <= float(self.cfg.fit_max_reproj_p95_px):
-                candidate = (name, stage_diag, K_np, R, -R @ C)
-                if chosen_pass is None or target_p95 < (chosen_pass[1]["val_p95"] if chosen_pass[1]["val_p95"] is not None else chosen_pass[1]["train_p95"]):
-                    chosen_pass = candidate
-            # 未达标时，选择最小target_p95的兜底解
-            fail_count = float(len(reasons))
-            score = target_p95 + 1e3 * fail_count
-            if score < best_effort_score:
-                best_effort_score = score
-                chosen_best_effort = (name, stage_diag, K_np, R, -R @ C)
+            if name == "C":
+                final_stage_payload = (name, stage_diag, K_np, R, -R @ C)
 
-        chosen = chosen_pass if chosen_pass is not None else chosen_best_effort
-        assert chosen is not None
-        chosen_name, chosen_diag, K_best, R_best, t_best = chosen
-        if not bool(chosen_diag["health_pass"]) or (
-            (chosen_diag["val_p95"] is not None and float(chosen_diag["val_p95"]) > float(self.cfg.fit_max_reproj_p95_px))
-            or (chosen_diag["val_p95"] is None and float(chosen_diag["train_p95"]) > float(self.cfg.fit_max_reproj_p95_px))
-        ):
-            import warnings
-
-            warnings.warn(
-                "该数据不适合用单个健康针孔模型在当前误差阈值下拟合；已返回最优阶段结果。",
-                RuntimeWarning,
-            )
+        if final_stage_payload is None:
+            raise RuntimeError("Stage-C camera fitting did not produce a final camera payload")
+        chosen_name, chosen_diag, K_best, R_best, t_best = final_stage_payload
 
         K = torch.from_numpy(K_best).to(dtype=torch.float64, device=fit_dev)
         R = torch.from_numpy(R_best).to(dtype=torch.float64, device=fit_dev)
