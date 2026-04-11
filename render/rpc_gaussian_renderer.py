@@ -43,6 +43,24 @@ def quaternion_to_matrix(q: torch.Tensor) -> torch.Tensor:
     )
 
 
+def axis_angle_to_matrix(rvec: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Rodrigues axis-angle -> rotation matrix."""
+    theta = torch.linalg.norm(rvec).clamp_min(eps)
+    k = rvec / theta
+    kx, ky, kz = k[0], k[1], k[2]
+    K = torch.stack(
+        [
+            torch.stack([torch.zeros_like(kx), -kz, ky]),
+            torch.stack([kz, torch.zeros_like(kx), -kx]),
+            torch.stack([-ky, kx, torch.zeros_like(kx)]),
+        ]
+    )
+    I = torch.eye(3, dtype=rvec.dtype, device=rvec.device)
+    ct = torch.cos(theta)
+    st = torch.sin(theta)
+    return I + st * K + (1.0 - ct) * (K @ K)
+
+
 def cov3d_from_scale_rotation(scale: torch.Tensor, quaternion: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     s = scale.clamp_min(eps)
     r = quaternion_to_matrix(quaternion)
@@ -181,6 +199,12 @@ class RPCGaussianRendererCfg:
     fit_cache_enable: bool = True
     fit_z_eps: float = 1.0e-6
     fit_min_positive_depth_ratio: float = 0.7
+    fit_constrained_enable: bool = True
+    fit_constrained_iters: int = 250
+    fit_constrained_lr: float = 5.0e-2
+    fit_constrained_huber_delta: float = 1.0
+    fit_constrained_lambda_fxy: float = 1.0e-2
+    fit_constrained_lambda_depth: float = 5.0e-2
 
 
 class RPCGaussianRenderer:
@@ -260,6 +284,82 @@ class RPCGaussianRenderer:
         # 局部米制坐标（与renderer centers一致）
         return torch.stack([xx.reshape(-1), yy.reshape(-1), zz.reshape(-1)], dim=-1)
 
+    def _refine_camera_constrained(
+        self,
+        *,
+        xyz: torch.Tensor,
+        uv: torch.Tensor,
+        R_init: torch.Tensor,
+        t_init: torch.Tensor,
+        K_init: torch.Tensor,
+        image_hw: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Constrained camera refinement with skew=0 and centered principal point."""
+        h, w = image_hw
+        cx = torch.tensor((float(w) - 1.0) * 0.5, dtype=xyz.dtype, device=xyz.device)
+        cy = torch.tensor((float(h) - 1.0) * 0.5, dtype=xyz.dtype, device=xyz.device)
+
+        fx0 = float(abs(float(K_init[0, 0].item())))
+        fy0 = float(abs(float(K_init[1, 1].item())))
+        fx0 = max(fx0, 1.0)
+        fy0 = max(fy0, 1.0)
+
+        try:
+            import cv2  # type: ignore
+
+            rvec0_np, _ = cv2.Rodrigues(R_init.detach().cpu().numpy())
+            rvec0 = torch.from_numpy(rvec0_np.reshape(3)).to(device=xyz.device, dtype=xyz.dtype)
+        except Exception:
+            rvec0 = torch.zeros((3,), device=xyz.device, dtype=xyz.dtype)
+
+        log_fx = torch.tensor(np.log(fx0), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
+        log_fy = torch.tensor(np.log(fy0), device=xyz.device, dtype=xyz.dtype, requires_grad=True)
+        rvec = rvec0.detach().clone().requires_grad_(True)
+        tvec = t_init.detach().clone().requires_grad_(True)
+        params = [log_fx, log_fy, rvec, tvec]
+        opt = torch.optim.Adam(params, lr=float(self.cfg.fit_constrained_lr))
+
+        delta = float(self.cfg.fit_constrained_huber_delta)
+        lam_fxy = float(self.cfg.fit_constrained_lambda_fxy)
+        lam_depth = float(self.cfg.fit_constrained_lambda_depth)
+        z_eps = float(self.cfg.fit_z_eps)
+        n_iter = max(int(self.cfg.fit_constrained_iters), 1)
+
+        for _ in range(n_iter):
+            opt.zero_grad(set_to_none=True)
+            R = axis_angle_to_matrix(rvec)
+            cam = (R @ xyz.T + tvec[:, None]).T
+            z = cam[:, 2]
+            z_safe = z.clamp_min(z_eps)
+            fx = torch.exp(log_fx)
+            fy = torch.exp(log_fy)
+            u = fx * (cam[:, 0] / z_safe) + cx
+            v = fy * (cam[:, 1] / z_safe) + cy
+            pred = torch.stack([u, v], dim=-1)
+            err = pred - uv
+            abs_err = err.abs()
+            quad = torch.minimum(abs_err, torch.full_like(abs_err, delta))
+            lin = abs_err - quad
+            huber = 0.5 * quad.square() + delta * lin
+            reproj_loss = huber.sum(dim=-1).mean()
+            depth_penalty = torch.relu((z_eps * 10.0) - z).square().mean()
+            ratio_penalty = (log_fx - log_fy).square()
+            loss = reproj_loss + lam_fxy * ratio_penalty + lam_depth * depth_penalty
+            loss.backward()
+            opt.step()
+
+        R_out = axis_angle_to_matrix(rvec.detach())
+        t_out = tvec.detach()
+        fx_out = torch.exp(log_fx.detach()).clamp_min(1.0)
+        fy_out = torch.exp(log_fy.detach()).clamp_min(1.0)
+        K_out = torch.zeros((3, 3), dtype=xyz.dtype, device=xyz.device)
+        K_out[0, 0] = fx_out
+        K_out[1, 1] = fy_out
+        K_out[0, 2] = cx
+        K_out[1, 2] = cy
+        K_out[2, 2] = 1.0
+        return K_out, R_out, t_out
+
     def _fit_virtual_camera(self, batch: dict[str, Any], bi: int, tv: int, image_hw: tuple[int, int]) -> VirtualPinholeCamera:
         h, w = image_hw
         cache_key = (int(batch["scene_id"][bi].item()) if torch.is_tensor(batch.get("scene_id", None)) else bi, tv, h, w)
@@ -322,6 +422,16 @@ class RPCGaussianRenderer:
             t_t = -t_t
 
         K = torch.from_numpy(K_np).to(device=fit_dev, dtype=torch.float64)
+        if bool(self.cfg.fit_constrained_enable):
+            K, R, t_t = self._refine_camera_constrained(
+                xyz=xyz,
+                uv=uv,
+                R_init=R,
+                t_init=t_t,
+                K_init=K,
+                image_hw=(h, w),
+            )
+
         w2c = torch.eye(4, dtype=torch.float64, device=fit_dev)
         w2c[:3, :3] = R
         w2c[:3, 3] = t_t
