@@ -669,18 +669,29 @@ class RPCGaussianRenderer:
 
         scene_scale = max(float(np.std(xyz_train[:, 0])), float(np.std(xyz_train[:, 1])), float(np.std(xyz_train[:, 2])), 1.0)
 
+        f_min = 10.0
+        f_max = 1.0e5
+        log_f_min = float(np.log(f_min))
+        log_f_max = float(np.log(f_max))
+        center_bound = float(scene_scale) * 20.0
+        beta_bound = 6.0
+        rot_bound = np.pi * 2.0
+
+        def _safe_exp(v: float) -> float:
+            return float(np.exp(np.clip(v, log_f_min, log_f_max)))
+
         def _solve_stage(stage: str, x0: np.ndarray, max_nfev: int) -> tuple[scipy.optimize.OptimizeResult, dict[str, float]]:
             def unpack(params: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float, float, float]:
                 if stage == "A":
                     rvec = params[:3]
                     C = params[3:6]
-                    f = float(np.exp(params[6]))
+                    f = _safe_exp(float(params[6]))
                     cx, cy = 0.5 * w, 0.5 * h
                     return rvec, C, f, f, cx, cy
                 if stage == "B":
                     rvec = params[:3]
                     C = params[3:6]
-                    f = float(np.exp(params[6]))
+                    f = _safe_exp(float(params[6]))
                     bx, by = float(params[7]), float(params[8])
                     cx = 0.5 * w + gamma_x * w * np.tanh(bx)
                     cy = 0.5 * h + gamma_y * h * np.tanh(by)
@@ -689,7 +700,7 @@ class RPCGaussianRenderer:
                 C = params[3:6]
                 ax, ay = float(params[6]), float(params[7])
                 bx, by = float(params[8]), float(params[9])
-                fx, fy = float(np.exp(ax)), float(np.exp(ay))
+                fx, fy = _safe_exp(ax), _safe_exp(ay)
                 cx = 0.5 * w + gamma_x * w * np.tanh(bx)
                 cy = 0.5 * h + gamma_y * h * np.tanh(by)
                 return rvec, C, fx, fy, cx, cy
@@ -715,22 +726,50 @@ class RPCGaussianRenderer:
                 lam_fd = float(self.cfg.fit_lambda_depth_barrier)
                 k = float(self.cfg.fit_depth_barrier_k)
                 eps_d = float(self.cfg.fit_constrained_min_depth)
-                depth_soft = np.log1p(np.exp(k * (eps_d - z))) / max(k, 1e-6)
+                depth_soft = np.logaddexp(0.0, k * (eps_d - z)) / max(k, 1e-6)
                 residuals.append(np.sqrt(lam_fd) * np.sqrt(np.maximum(depth_soft, 0.0)))
                 lam_cp = float(self.cfg.fit_lambda_center_prior)
                 residuals.append(np.sqrt(lam_cp) * ((C - C0) / scene_scale))
                 if stage == "C":
                     lam_fr = float(self.cfg.fit_lambda_focal_ratio)
                     residuals.append(np.array([np.sqrt(lam_fr) * np.log(max(fx, 1e-12) / max(fy, 1e-12))], dtype=np.float64))
-                return np.concatenate(residuals, axis=0)
+                out = np.concatenate(residuals, axis=0)
+                if not np.isfinite(out).all():
+                    out = np.nan_to_num(out, nan=1e6, posinf=1e6, neginf=-1e6)
+                return out
+
+            if stage == "A":
+                lb = np.array([-rot_bound, -rot_bound, -rot_bound, C0[0] - center_bound, C0[1] - center_bound, C0[2] - center_bound, log_f_min], dtype=np.float64)
+                ub = np.array([rot_bound, rot_bound, rot_bound, C0[0] + center_bound, C0[1] + center_bound, C0[2] + center_bound, log_f_max], dtype=np.float64)
+            elif stage == "B":
+                lb = np.array(
+                    [-rot_bound, -rot_bound, -rot_bound, C0[0] - center_bound, C0[1] - center_bound, C0[2] - center_bound, log_f_min, -beta_bound, -beta_bound],
+                    dtype=np.float64,
+                )
+                ub = np.array(
+                    [rot_bound, rot_bound, rot_bound, C0[0] + center_bound, C0[1] + center_bound, C0[2] + center_bound, log_f_max, beta_bound, beta_bound],
+                    dtype=np.float64,
+                )
+            else:
+                lb = np.array(
+                    [-rot_bound, -rot_bound, -rot_bound, C0[0] - center_bound, C0[1] - center_bound, C0[2] - center_bound, log_f_min, log_f_min, -beta_bound, -beta_bound],
+                    dtype=np.float64,
+                )
+                ub = np.array(
+                    [rot_bound, rot_bound, rot_bound, C0[0] + center_bound, C0[1] + center_bound, C0[2] + center_bound, log_f_max, log_f_max, beta_bound, beta_bound],
+                    dtype=np.float64,
+                )
+            x0_local = np.clip(x0.astype(np.float64), lb + 1e-9, ub - 1e-9)
 
             result = scipy.optimize.least_squares(
                 residual,
-                x0,
+                x0_local,
                 method="trf",
                 loss=str(self.cfg.fit_robust_loss),
                 f_scale=float(self.cfg.fit_robust_f_scale),
                 max_nfev=max_nfev,
+                bounds=(lb, ub),
+                x_scale="jac",
             )
             rvec, C, fx, fy, cx, cy = unpack(result.x)
             return result, {"fx": fx, "fy": fy, "cx": cx, "cy": cy, "rvec0": rvec[0], "rvec1": rvec[1], "rvec2": rvec[2], "C0": C[0], "C1": C[1], "C2": C[2]}
@@ -747,7 +786,9 @@ class RPCGaussianRenderer:
 
         stage_pack = [("A", res_a, params_a), ("B", res_b, params_b), ("C", res_c, params_c)]
         diagnostics_stages: list[dict[str, Any]] = []
-        chosen: tuple[str, dict[str, Any], np.ndarray, np.ndarray, np.ndarray] | None = None
+        chosen_pass: tuple[str, dict[str, Any], np.ndarray, np.ndarray, np.ndarray] | None = None
+        chosen_best_effort: tuple[str, dict[str, Any], np.ndarray, np.ndarray, np.ndarray] | None = None
+        best_effort_score = float("inf")
 
         for name, res, p in stage_pack:
             rvec = np.array([p["rvec0"], p["rvec1"], p["rvec2"]], dtype=np.float64)
@@ -810,11 +851,17 @@ class RPCGaussianRenderer:
             diagnostics_stages.append(stage_diag)
             target_p95 = val_p95 if val_p95 is not None else train_p95
             if ok and target_p95 <= float(self.cfg.fit_max_reproj_p95_px):
-                chosen = (name, stage_diag, K_np, R, -R @ C)
-                break
-            if chosen is None:
-                chosen = (name, stage_diag, K_np, R, -R @ C)
+                candidate = (name, stage_diag, K_np, R, -R @ C)
+                if chosen_pass is None or target_p95 < (chosen_pass[1]["val_p95"] if chosen_pass[1]["val_p95"] is not None else chosen_pass[1]["train_p95"]):
+                    chosen_pass = candidate
+            # 未达标时，选择最小target_p95的兜底解
+            fail_count = float(len(reasons))
+            score = target_p95 + 1e3 * fail_count
+            if score < best_effort_score:
+                best_effort_score = score
+                chosen_best_effort = (name, stage_diag, K_np, R, -R @ C)
 
+        chosen = chosen_pass if chosen_pass is not None else chosen_best_effort
         assert chosen is not None
         chosen_name, chosen_diag, K_best, R_best, t_best = chosen
         if not bool(chosen_diag["health_pass"]) or (
