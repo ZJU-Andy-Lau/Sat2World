@@ -58,6 +58,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alpha-coverage-threshold", type=float, default=1e-4)
     p.add_argument("--fit-p95-threshold", type=float, default=1.0)
     p.add_argument("--reproj-p95-threshold", type=float, default=1.0)
+    p.add_argument("--enable-cover-camera-probe", action="store_true")
+    p.add_argument("--cover-camera-margin-ratio", type=float, default=0.05)
+    p.add_argument("--cover-camera-distance-factor", type=float, default=3.0)
+    p.add_argument("--cover-camera-max-retries", type=int, default=8)
     p.add_argument("--save-images", action="store_true")
     p.add_argument("--dump-json", action="store_true")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -325,6 +329,79 @@ def _draw_points_overlay(base_chw: torch.Tensor, line: np.ndarray, samp: np.ndar
     img.save(out_path)
 
 
+def _look_at_w2c_np(eye: np.ndarray, target: np.ndarray, up_hint: np.ndarray) -> np.ndarray:
+    f = target - eye
+    f = f / (np.linalg.norm(f) + 1e-12)
+    r = np.cross(f, up_hint)
+    r = r / (np.linalg.norm(r) + 1e-12)
+    u = np.cross(r, f)
+    R = np.stack([r, u, f], axis=0)
+    t = -R @ eye
+    w2c = np.eye(4, dtype=np.float64)
+    w2c[:3, :3] = R
+    w2c[:3, 3] = t
+    return w2c
+
+
+def _fit_intrinsics_cover_points_np(points_xyz: np.ndarray, w2c: np.ndarray, width: int, height: int, margin_ratio: float) -> np.ndarray:
+    cxy = np.array([width / 2.0, height / 2.0], dtype=np.float64)
+    xyz_h = np.concatenate([points_xyz, np.ones((points_xyz.shape[0], 1), dtype=np.float64)], axis=1)
+    cam = (w2c[:3, :] @ xyz_h.T).T
+    z = cam[:, 2]
+    if not np.all(z > 1e-6):
+        raise RuntimeError("cover camera invalid: some points behind camera")
+    xz = np.abs(cam[:, 0] / z)
+    yz = np.abs(cam[:, 1] / z)
+    usable_w = max(float(width) * (1.0 - 2.0 * margin_ratio), 1.0)
+    usable_h = max(float(height) * (1.0 - 2.0 * margin_ratio), 1.0)
+    fx_max = (usable_w / 2.0) / max(float(np.max(xz)), 1e-8)
+    fy_max = (usable_h / 2.0) / max(float(np.max(yz)), 1e-8)
+    fx = 0.98 * fx_max
+    fy = 0.98 * fy_max
+    return np.array([[fx, 0.0, cxy[0]], [0.0, fy, cxy[1]], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def _build_cover_camera_from_points(
+    xyz_world: np.ndarray,
+    image_hw: tuple[int, int],
+    device: torch.device,
+    margin_ratio: float,
+    distance_factor: float,
+    max_retries: int,
+) -> VirtualPinholeCamera:
+    h, w = image_hw
+    xyz = xyz_world.astype(np.float64)
+    xyz_min = xyz.min(axis=0)
+    xyz_max = xyz.max(axis=0)
+    center = (xyz_min + xyz_max) * 0.5
+    extent = xyz_max - xyz_min
+    diag = float(np.linalg.norm(extent) + 1e-8)
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    last_err: Exception | None = None
+    for i in range(max(int(max_retries), 1)):
+        d = max(diag * float(distance_factor) * (1.6**i), 1.0)
+        eye = center + np.array([0.0, 0.0, d], dtype=np.float64)
+        w2c = _look_at_w2c_np(eye=eye, target=center, up_hint=up)
+        xyz_h = np.concatenate([xyz, np.ones((xyz.shape[0], 1), dtype=np.float64)], axis=1)
+        cam = (w2c[:3, :] @ xyz_h.T).T
+        if not np.all(cam[:, 2] > 1e-6):
+            last_err = RuntimeError("points behind camera")
+            continue
+        try:
+            K = _fit_intrinsics_cover_points_np(xyz, w2c, w, h, float(margin_ratio))
+            return VirtualPinholeCamera(
+                K=torch.from_numpy(K).to(device=device, dtype=torch.float32),
+                w2c=torch.from_numpy(w2c).to(device=device, dtype=torch.float32),
+                fit_p50=float("nan"),
+                fit_p95=float("nan"),
+                fit_max=float("nan"),
+            )
+        except Exception as e:  # pragma: no cover
+            last_err = e
+            continue
+    raise RuntimeError(f"failed to build cover camera after {max_retries} retries: {last_err}")
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
@@ -425,6 +502,39 @@ def main() -> None:
         and best_alpha_max >= float(args.alpha_max_threshold)
         and best_variant != "current"
     )
+    cover_probe: dict[str, Any] | None = None
+    if args.enable_cover_camera_probe:
+        cover_cam = _build_cover_camera_from_points(
+            xyz_world=centers.detach().cpu().numpy().astype(np.float64),
+            image_hw=(h, w),
+            device=centers.device,
+            margin_ratio=float(args.cover_camera_margin_ratio),
+            distance_factor=float(args.cover_camera_distance_factor),
+            max_retries=int(args.cover_camera_max_retries),
+        )
+        rr_cover, ra_cover, rd_cover = _render_variant(
+            renderer=renderer,
+            centers=centers,
+            opacity=opacity,
+            scale=scale,
+            rotation=rotation,
+            rgb=rgb,
+            cam=cover_cam,
+            image_hw=(h, w),
+        )
+        st_cover = _alpha_stats(ra_cover)
+        cover_probe = {
+            "rendered_rgb": rr_cover,
+            "rendered_alpha": ra_cover,
+            "rendered_depth": rd_cover,
+            "alpha_max": float(st_cover["alpha_max"]),
+            "alpha_thr": float(st_cover["alpha_thr"]),
+            "alpha_coverage": float(st_cover["alpha_coverage"]),
+            "alpha_max_ratio_cover_vs_fit": float(st_cover["alpha_max"] / max(current_alpha_max, 1e-12)),
+            "alpha_cov_ratio_cover_vs_fit": float(
+                st_cover["alpha_coverage"] / max(float(render_by_variant["current"]["alpha_coverage"]), 1e-12)
+            ),
+        }
 
     # 5) 关键检查
     checks: list[CheckResult] = [
@@ -449,6 +559,23 @@ def main() -> None:
             ),
         ),
     ]
+    if cover_probe is not None:
+        checks.extend(
+            [
+                CheckResult(
+                    "cover_cam_alpha_max",
+                    float(cover_probe["alpha_max"]),
+                    float(args.alpha_max_threshold),
+                    float(cover_probe["alpha_max"]) >= float(args.alpha_max_threshold),
+                ),
+                CheckResult(
+                    "cover_cam_alpha_coverage",
+                    float(cover_probe["alpha_coverage"]),
+                    float(args.alpha_coverage_threshold),
+                    float(cover_probe["alpha_coverage"]) >= float(args.alpha_coverage_threshold),
+                ),
+            ]
+        )
 
     scene_id = int(batch["scene_id"][0].item())
     work_dir = Path(cfg.get("system", {}).get("work_dir", "work_dirs/sat2world_default"))
@@ -468,6 +595,9 @@ def main() -> None:
         ra_best = render_by_variant[best_variant]["rendered_alpha"]
         _save_chw_rgb(out_dir / "render_best_variant_rgb.png", rr_best)
         _save_chw_gray(out_dir / "render_best_variant_alpha.png", ra_best)
+        if cover_probe is not None:
+            _save_chw_rgb(out_dir / "render_cover_cam_rgb.png", cover_probe["rendered_rgb"])
+            _save_chw_gray(out_dir / "render_cover_cam_alpha.png", cover_probe["rendered_alpha"])
 
         _draw_points_overlay(target_rgb, rpc_line, rpc_samp, out_dir / "rpc_projection_overlay.png", color=(255, 255, 0))
         _draw_points_overlay(target_rgb, pd_line, pd_samp, out_dir / "pinhole_projection_overlay.png", color=(255, 0, 255))
@@ -512,6 +642,15 @@ def main() -> None:
         },
         "best_variant": best_variant,
         "convention_mismatch_suspected": bool(conv_mismatch_suspected),
+        "cover_camera_probe": None
+        if cover_probe is None
+        else {
+            "alpha_max": float(cover_probe["alpha_max"]),
+            "alpha_thr": float(cover_probe["alpha_thr"]),
+            "alpha_coverage": float(cover_probe["alpha_coverage"]),
+            "alpha_max_ratio_cover_vs_fit": float(cover_probe["alpha_max_ratio_cover_vs_fit"]),
+            "alpha_cov_ratio_cover_vs_fit": float(cover_probe["alpha_cov_ratio_cover_vs_fit"]),
+        },
         "checks": [
             {
                 "name": c.name,
@@ -551,6 +690,17 @@ def main() -> None:
         f"  best_variant={best_variant}, current_alpha_max={current_alpha_max:.6f}, "
         f"best_alpha_max={best_alpha_max:.6f}"
     )
+    if cover_probe is not None:
+        print("\n-- cover camera probe --")
+        print(
+            f"  alpha_max={cover_probe['alpha_max']:.6f}, "
+            f"alpha_cov={cover_probe['alpha_coverage']:.6f}, "
+            f"alpha_thr={cover_probe['alpha_thr']:.6f}"
+        )
+        print(
+            f"  ratio_cover_vs_fit: alpha_max={cover_probe['alpha_max_ratio_cover_vs_fit']:.3e}, "
+            f"alpha_cov={cover_probe['alpha_cov_ratio_cover_vs_fit']:.3e}"
+        )
 
     print("---------------------------------------------------------------")
     print("RESULT:", "PASS" if all_pass else "FAIL")
