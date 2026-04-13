@@ -1,4 +1,4 @@
-"""RPC -> pinhole 相机拟合（复用 rpc2pinhole_test 的核心逻辑）。"""
+"""RPC -> pinhole 相机拟合"""
 
 from __future__ import annotations
 
@@ -169,7 +169,7 @@ def _fit_pnp(obj_pts: torch.Tensor, img_pts: torch.Tensor, image_h: int, image_w
     return K, R, t, init_m, ref_m, inlier_mask
 
 
-def fit_view_pinhole_from_rpc2(
+def fit_view_pinhole_from_rpc(
     batch: dict[str, Any],
     bi: int,
     tv: int,
