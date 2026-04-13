@@ -314,6 +314,8 @@ def fit_pinhole_fixed_center(
     fx0 = max(abs(float(K0[0, 0])), 10.0)
     fy0 = max(abs(float(K0[1, 1])), 10.0)
     f0 = max(10.0, 0.5 * (fx0 + fy0))
+
+    print(f"原始f: {fx0:.2f} , {fy0:.2f} \t f0:{f0:.2f}")
     x0 = np.concatenate([rvec0, C0, np.array([np.log(f0)], dtype=np.float64)], axis=0)
 
     z_eps = 1e-6
