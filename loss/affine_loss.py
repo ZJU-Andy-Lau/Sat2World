@@ -160,7 +160,13 @@ class AffinePairwiseGeometryLoss:
             ref = ref.expand(b)
         return ref
 
-    def __call__(self, outputs: dict[str, Any], batch: dict[str, Any]) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
+    def __call__(
+        self,
+        outputs: dict[str, Any],
+        batch: dict[str, Any],
+        *,
+        return_error_samples: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
         """计算 pairwise 几何一致性损失。
 
         输入:
@@ -355,7 +361,10 @@ class AffinePairwiseGeometryLoss:
                 "pairwise_valid_anchor_ratio": zero,
                 "pairwise_num_pairs_used": zero,
             }
-            return zero, probe, {"num_pairs_used": 0}
+            aux = {"num_pairs_used": 0}
+            if bool(return_error_samples):
+                aux["pair_error_samples"] = torch.zeros((0,), device=affine_pred.device, dtype=affine_pred.dtype)
+            return zero, probe, aux
 
         loss = torch.stack(pair_losses).mean()
         all_err = torch.cat(pair_errors, dim=-1)
@@ -367,7 +376,9 @@ class AffinePairwiseGeometryLoss:
             "pairwise_valid_anchor_ratio": torch.stack(valid_anchor_ratios).mean().detach(),
             "pairwise_num_pairs_used": torch.tensor(float(num_pairs_used), device=loss.device),
         }
-        aux = {"num_pairs_used": num_pairs_used}
+        aux: dict[str, Any] = {"num_pairs_used": num_pairs_used}
+        if bool(return_error_samples):
+            aux["pair_error_samples"] = all_err.reshape(-1).detach()
         return loss, probe, aux
 
 
