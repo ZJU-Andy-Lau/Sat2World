@@ -67,7 +67,7 @@ class FitLogger:
         self.history.append(rec)
         if self.eval_count == 1 or self.eval_count % self.print_every == 0:
             print(
-                "[fit][eval={:04d}] rmse={:.6f} p50={:.6f} p95={:.6f} p99={:.6f} max={:.6f} pos_depth={:.4f} f={:.4f} C0={:.4f} C1={:.4f} C2={:.4f}".format(
+                "[fit][eval={:04d}] rmse={:.6f} p50={:.6f} p95={:.6f} p99={:.6f} max={:.6f} pos_depth={:.4f}".format(
                     self.eval_count,
                     metrics["rmse"],
                     metrics["p50"],
@@ -75,10 +75,6 @@ class FitLogger:
                     metrics["p99"],
                     metrics["pmax"],
                     metrics["pos_ratio"],
-                    metrics["f"],
-                    metrics['C0'],
-                    metrics['C1'],
-                    metrics['C2'],
                 ),
                 flush=True,
             )
@@ -97,6 +93,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-random-test-points", type=int, default=100)
     p.add_argument("--fit-max-nfev", type=int, default=300)
     p.add_argument("--fit-print-every", type=int, default=20)
+    p.add_argument("--f-fixed", type=float, default=1.0e5)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--work-dir", type=str, default="")
@@ -297,10 +294,11 @@ def reproj_metrics(err_xy: np.ndarray) -> dict[str, float]:
     }
 
 
-def fit_pinhole_fixed_center(
+def fit_extrinsics_fixed_f(
     xyz: np.ndarray,
     uv: np.ndarray,
     image_hw: tuple[int, int],
+    f_fixed: float,
     max_nfev: int,
     print_every: int,
 ) -> FitResult:
@@ -315,51 +313,50 @@ def fit_pinhole_fixed_center(
     K0, R0, C0 = decompose_projection(P0)
     rvec0 = scipy.spatial.transform.Rotation.from_matrix(R0).as_rotvec()
 
-    fx0 = max(abs(float(K0[0, 0])), 10.0)
-    fy0 = max(abs(float(K0[1, 1])), 10.0)
-    f0 = max(10.0, 0.5 * (fx0 + fy0))
-
-    print(f"原始f: {fx0:.2f} , {fy0:.2f} \t f0:{f0:.2f}")
-    print(f"原始C: {C0[0]:.2f}, {C0[1]:.2f}, {C0[2]:.2f}")
-    x0 = np.concatenate([rvec0, C0, np.array([np.log(f0)], dtype=np.float64)], axis=0)
+    x0 = np.concatenate([rvec0, C0], axis=0)
 
     z_eps = 1e-6
     lam_depth = 1.0
     k_depth = 20.0
     min_depth = 1e-2
+    lam_center_prior = 5.0e-3
+    c_scale = max(float(np.std(xyz[:, 0])), float(np.std(xyz[:, 1])), float(np.std(xyz[:, 2])), 1.0)
     logger = FitLogger(print_every=print_every)
 
-    def unpack(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    def unpack(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         rvec = theta[0:3]
         C = theta[3:6]
-        f = float(np.exp(np.clip(theta[6], np.log(10.0), np.log(1e6))))
-        return rvec, C, f
+        return rvec, C
 
     def residual(theta: np.ndarray) -> np.ndarray:
-        rvec, C, f = unpack(theta)
-        pred_uv, z = project_points(xyz, rvec, C, f, f, cx_fix, cy_fix, z_eps=z_eps)
+        rvec, C = unpack(theta)
+        pred_uv, z = project_points(xyz, rvec, C, float(f_fixed), float(f_fixed), cx_fix, cy_fix, z_eps=z_eps)
         data_res = (pred_uv - uv).reshape(-1)
 
         # 深度屏障，抑制 z<=0
         depth_soft = np.logaddexp(0.0, k_depth * (min_depth - z)) / max(k_depth, 1e-6)
         depth_res = np.sqrt(lam_depth) * np.sqrt(np.maximum(depth_soft, 0.0))
 
-        all_res = np.concatenate([data_res, depth_res], axis=0)
+        center_prior_res = np.sqrt(lam_center_prior) * ((C - C0) / c_scale)
+        all_res = np.concatenate([data_res, depth_res, center_prior_res], axis=0)
 
         metrics = reproj_metrics(pred_uv - uv)
         metrics["pos_ratio"] = float(np.mean(z > z_eps))
-        metrics["f"] = f
-        metrics['C0'] = C[0]
-        metrics['C1'] = C[1]
-        metrics['C2'] = C[2]
         logger.add(metrics)
 
         if not np.isfinite(all_res).all():
             all_res = np.nan_to_num(all_res, nan=1e6, posinf=1e6, neginf=-1e6)
         return all_res
 
-    lb = np.array([-2 * np.pi, -2 * np.pi, -2 * np.pi, -1e8, -1e8, -1e8, np.log(10.0)], dtype=np.float64)
-    ub = np.array([2 * np.pi, 2 * np.pi, 2 * np.pi, 1e8, 1e8, 1e8, np.log(1e6)], dtype=np.float64)
+    c_win = max(2.0e5, 10.0 * c_scale)
+    lb = np.array(
+        [-2 * np.pi, -2 * np.pi, -2 * np.pi, C0[0] - c_win, C0[1] - c_win, C0[2] - c_win],
+        dtype=np.float64,
+    )
+    ub = np.array(
+        [2 * np.pi, 2 * np.pi, 2 * np.pi, C0[0] + c_win, C0[1] + c_win, C0[2] + c_win],
+        dtype=np.float64,
+    )
 
     t0 = time.perf_counter()
     opt = scipy.optimize.least_squares(
@@ -374,14 +371,14 @@ def fit_pinhole_fixed_center(
     )
     fit_elapsed = time.perf_counter() - t0
 
-    rvec, C, f = unpack(opt.x)
-    pred_uv, z = project_points(xyz, rvec, C, f, f, cx_fix, cy_fix, z_eps=z_eps)
+    rvec, C = unpack(opt.x)
+    pred_uv, z = project_points(xyz, rvec, C, float(f_fixed), float(f_fixed), cx_fix, cy_fix, z_eps=z_eps)
     met = reproj_metrics(pred_uv - uv)
     pos_ratio = float(np.mean(z > z_eps))
 
     R = scipy.spatial.transform.Rotation.from_rotvec(rvec).as_matrix()
     t = -R @ C
-    K = np.array([[f, 0.0, cx_fix], [0.0, f, cy_fix], [0.0, 0.0, 1.0]], dtype=np.float64)
+    K = np.array([[float(f_fixed), 0.0, cx_fix], [0.0, float(f_fixed), cy_fix], [0.0, 0.0, 1.0]], dtype=np.float64)
     w2c = np.eye(4, dtype=np.float64)
     w2c[:3, :3] = R
     w2c[:3, 3] = t
@@ -390,7 +387,7 @@ def fit_pinhole_fixed_center(
     print(f"optimizer.success={bool(opt.success)}")
     print(f"optimizer.message={opt.message}")
     print(f"nfev={int(opt.nfev)} elapsed={fit_elapsed:.3f}s")
-    print(f"f={f:.6f} (fx=fy), cx={cx_fix:.6f}, cy={cy_fix:.6f}, skew=0")
+    print(f"f_fixed={float(f_fixed):.6f} (fx=fy), cx={cx_fix:.6f}, cy={cy_fix:.6f}, skew=0")
     print(
         "reproj: rmse={:.6f}, p50={:.6f}, p95={:.6f}, p99={:.6f}, max={:.6f}, pos_depth_ratio={:.4f}".format(
             met["rmse"], met["p50"], met["p95"], met["p99"], met["pmax"], pos_ratio
@@ -402,14 +399,16 @@ def fit_pinhole_fixed_center(
         "optimizer_message": str(opt.message),
         "nfev": int(opt.nfev),
         "fit_elapsed_sec": float(fit_elapsed),
+        "f_fixed": float(f_fixed),
+        "center_prior_lambda": float(lam_center_prior),
         "history": logger.history,
     }
 
     return FitResult(
         K=K,
         w2c=w2c,
-        fx=float(f),
-        fy=float(f),
+        fx=float(f_fixed),
+        fy=float(f_fixed),
         cx=float(cx_fix),
         cy=float(cy_fix),
         rmse=met["rmse"],
@@ -701,10 +700,11 @@ def main() -> None:
     )
 
     # Step 5: 拟合 pinhole（独立实现）
-    fit_res = fit_pinhole_fixed_center(
+    fit_res = fit_extrinsics_fixed_f(
         xyz=xyz,
         uv=uv,
         image_hw=(h, w),
+        f_fixed=float(args.f_fixed),
         max_nfev=int(args.fit_max_nfev),
         print_every=int(args.fit_print_every),
     )
