@@ -228,7 +228,10 @@ def decompose_projection(P: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndar
     if np.linalg.det(R) < 0:
         K[:, 2] *= -1.0
         R[2, :] *= -1.0
-    K = K / max(K[2, 2], 1e-12)
+    # 保符号归一化，避免 K[2,2] < 0 时被 max(..., eps) 夹到 +eps 导致 K 数值爆炸。
+    k22 = float(K[2, 2])
+    k22_den = math.copysign(max(abs(k22), 1e-12), k22 if k22 != 0.0 else 1.0)
+    K = K / k22_den
     _, _, vh = np.linalg.svd(P)
     C_h = vh[-1]
     # SVD 零空间向量只在整体符号上确定（v 与 -v 等价）。
