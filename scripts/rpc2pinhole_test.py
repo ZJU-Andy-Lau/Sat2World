@@ -293,6 +293,45 @@ def build_second_world_grid_and_correspondence(
     return world2_x, world2_y, world2_h, obj_pts, img_pts
 
 
+def build_first_correspondence_from_image_grid(
+    line_3d: torch.Tensor,
+    samp_3d: torch.Tensor,
+    world1_x: torch.Tensor,
+    world1_y: torch.Tensor,
+    world1_h: torch.Tensor,
+    image_h: int,
+    image_w: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """由像方均匀网格(含多高程)直接构建第一部分 3D-2D 对应。"""
+    in_frame = (
+        torch.isfinite(line_3d)
+        & torch.isfinite(samp_3d)
+        & (line_3d >= 0.0)
+        & (line_3d < float(image_h))
+        & (samp_3d >= 0.0)
+        & (samp_3d < float(image_w))
+    )
+    finite_world = torch.isfinite(world1_x) & torch.isfinite(world1_y) & torch.isfinite(world1_h)
+    valid = in_frame & finite_world
+
+    obj_pts = torch.stack([world1_x[valid], world1_y[valid], world1_h[valid]], dim=-1)
+    img_pts = torch.stack([samp_3d[valid], line_3d[valid]], dim=-1)  # OpenCV: (x=samp, y=line)
+    return obj_pts, img_pts
+
+
+def merge_correspondences(
+    obj_a: torch.Tensor,
+    img_a: torch.Tensor,
+    obj_b: torch.Tensor,
+    img_b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """合并两部分对应关系，并进行基础有效性筛选。"""
+    obj = torch.cat([obj_a, obj_b], dim=0)
+    img = torch.cat([img_a, img_b], dim=0)
+    valid = torch.isfinite(obj).all(dim=-1) & torch.isfinite(img).all(dim=-1)
+    return obj[valid], img[valid]
+
+
 def _project_pinhole(K: np.ndarray, R: np.ndarray, t: np.ndarray, obj_pts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     # obj_pts: [N,3]
     n = obj_pts.shape[0]
@@ -640,6 +679,10 @@ def run_internal_audit(
     h_3d: torch.Tensor,
     world1_x: torch.Tensor,
     world1_y: torch.Tensor,
+    obj_pts_part1: torch.Tensor,
+    img_pts_part1: torch.Tensor,
+    obj_pts_part2: torch.Tensor,
+    img_pts_part2: torch.Tensor,
     obj_pts: torch.Tensor,
     img_pts: torch.Tensor,
     pnp: PnPResult,
@@ -662,6 +705,18 @@ def run_internal_audit(
         bool(torch.isfinite(world1_x).any() and torch.isfinite(world1_y).any()),
         f"world1 finite ratio x={float(torch.isfinite(world1_x).to(torch.float32).mean().item()):.6f}, "
         f"y={float(torch.isfinite(world1_y).to(torch.float32).mean().item()):.6f}",
+    ))
+
+    checks.append((
+        "Step4 part1 correspondences",
+        obj_pts_part1.shape[0] >= 6 and img_pts_part1.shape[0] == obj_pts_part1.shape[0],
+        f"part1 obj={obj_pts_part1.shape}, img={img_pts_part1.shape}",
+    ))
+
+    checks.append((
+        "Step5 part2 correspondences",
+        obj_pts_part2.shape[0] >= 6 and img_pts_part2.shape[0] == obj_pts_part2.shape[0],
+        f"part2 obj={obj_pts_part2.shape}, img={img_pts_part2.shape}",
     ))
 
     checks.append((
@@ -748,7 +803,22 @@ def main() -> None:
     print(_stats_t("world1_h", world1_h))
 
     # Step5: 第二部分物方网格 + 3D-2D 对应
-    _world2_x, _world2_y, _world2_h, obj_pts, img_pts = build_second_world_grid_and_correspondence(
+    obj_pts_part1, img_pts_part1 = build_first_correspondence_from_image_grid(
+        line_3d=line_3d,
+        samp_3d=samp_3d,
+        world1_x=world1_x,
+        world1_y=world1_y,
+        world1_h=world1_h,
+        image_h=h,
+        image_w=w,
+    )
+    print("\n========== [Step4+] 第一部分对应关系统计（像方均匀网格 -> 物方） ==========")
+    print(f"part1 correspondence_count={obj_pts_part1.shape[0]}")
+    print(_stats_t("part1_obj_x", obj_pts_part1[:, 0] if obj_pts_part1.numel() > 0 else torch.empty((0,), device=device)))
+    print(_stats_t("part1_obj_y", obj_pts_part1[:, 1] if obj_pts_part1.numel() > 0 else torch.empty((0,), device=device)))
+    print(_stats_t("part1_obj_h", obj_pts_part1[:, 2] if obj_pts_part1.numel() > 0 else torch.empty((0,), device=device)))
+
+    _world2_x, _world2_y, _world2_h, obj_pts_part2, img_pts_part2 = build_second_world_grid_and_correspondence(
         rpc=rpc,
         world1_x=world1_x,
         world1_y=world1_y,
@@ -757,6 +827,17 @@ def main() -> None:
         image_h=h,
         image_w=w,
     )
+    obj_pts, img_pts = merge_correspondences(
+        obj_a=obj_pts_part1,
+        img_a=img_pts_part1,
+        obj_b=obj_pts_part2,
+        img_b=img_pts_part2,
+    )
+    print("\n========== [Step5+] 合并后对应关系统计（用于PnP） ==========")
+    print(f"merged correspondence_count={obj_pts.shape[0]} (part1={obj_pts_part1.shape[0]}, part2={obj_pts_part2.shape[0]})")
+    print(_stats_t("merged_obj_x", obj_pts[:, 0]))
+    print(_stats_t("merged_obj_y", obj_pts[:, 1]))
+    print(_stats_t("merged_obj_h", obj_pts[:, 2]))
 
     # Step6: PnP
     pnp = fit_pnp_extrinsic_fixed_K(
@@ -824,6 +905,10 @@ def main() -> None:
         h_3d=h_3d,
         world1_x=world1_x,
         world1_y=world1_y,
+        obj_pts_part1=obj_pts_part1,
+        img_pts_part1=img_pts_part1,
+        obj_pts_part2=obj_pts_part2,
+        img_pts_part2=img_pts_part2,
         obj_pts=obj_pts,
         img_pts=img_pts,
         pnp=pnp,
