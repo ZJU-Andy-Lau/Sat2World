@@ -94,6 +94,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fit-max-nfev", type=int, default=300)
     p.add_argument("--fit-print-every", type=int, default=20)
     p.add_argument("--f-fixed", type=float, default=1.0e5)
+    p.add_argument("--pnp-ransac-reproj-thr", type=float, default=3.0)
+    p.add_argument("--pnp-ransac-iters", type=int, default=3000)
+    p.add_argument("--pnp-ransac-confidence", type=float, default=0.999)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--work-dir", type=str, default="")
@@ -283,6 +286,25 @@ def project_points(
     return np.stack([u, v], axis=1), z
 
 
+def project_points_rt(
+    xyz: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    z_eps: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    R = scipy.spatial.transform.Rotation.from_rotvec(rvec).as_matrix()
+    cam = (R @ xyz.T).T + tvec.reshape(1, 3)
+    z = cam[:, 2]
+    z_safe = np.maximum(z, z_eps)
+    u = fx * (cam[:, 0] / z_safe) + cx
+    v = fy * (cam[:, 1] / z_safe) + cy
+    return np.stack([u, v], axis=1), z
+
+
 def reproj_metrics(err_xy: np.ndarray) -> dict[str, float]:
     e = np.linalg.norm(err_xy, axis=1)
     return {
@@ -301,6 +323,9 @@ def fit_extrinsics_fixed_f(
     f_fixed: float,
     max_nfev: int,
     print_every: int,
+    pnp_ransac_reproj_thr: float,
+    pnp_ransac_iters: int,
+    pnp_ransac_confidence: float,
 ) -> FitResult:
     h, w = image_hw
     cx_fix = 0.5 * float(w - 1)
@@ -309,56 +334,145 @@ def fit_extrinsics_fixed_f(
     if xyz.shape[0] < 20:
         raise ValueError(f"有效对应点过少: {xyz.shape[0]}")
 
-    P0 = dlt_init_projection(xyz, uv)
-    K0, R0, C0 = decompose_projection(P0)
-    rvec0 = scipy.spatial.transform.Rotation.from_matrix(R0).as_rotvec()
-
-    x0 = np.concatenate([rvec0, C0], axis=0)
-
     z_eps = 1e-6
-    lam_depth = 1.0
-    k_depth = 20.0
-    min_depth = 1e-2
-    lam_center_prior = 5.0e-3
-    c_scale = max(float(np.std(xyz[:, 0])), float(np.std(xyz[:, 1])), float(np.std(xyz[:, 2])), 1.0)
     logger = FitLogger(print_every=print_every)
+    rng = np.random.default_rng(12345)
+
+    t0 = time.perf_counter()
+    # 初值：DLT -> [R,C] -> [rvec,t]
+    P0 = dlt_init_projection(xyz, uv)
+    _, R0, C0 = decompose_projection(P0)
+    rvec0 = scipy.spatial.transform.Rotation.from_matrix(R0).as_rotvec()
+    tvec0 = (-R0 @ C0).astype(np.float64)
+
+    # PnP-RANSAC(自实现): 随机最小子集 + 非线性求解 + 全集评估
+    n = int(xyz.shape[0])
+    min_set = min(max(8, 6), n)
+    if n < min_set:
+        raise RuntimeError(f"Not enough correspondences for RANSAC-PnP: N={n}")
+
+    def _solve_pose_on_subset(ids: np.ndarray, x_init: np.ndarray | None = None) -> tuple[np.ndarray, bool]:
+        xyz_s = xyz[ids]
+        uv_s = uv[ids]
+
+        if x_init is None:
+            P_s = dlt_init_projection(xyz_s, uv_s)
+            _, R_s, C_s = decompose_projection(P_s)
+            rv_s = scipy.spatial.transform.Rotation.from_matrix(R_s).as_rotvec()
+            tv_s = -R_s @ C_s
+            x_init = np.concatenate([rv_s, tv_s], axis=0)
+
+        def _res(th: np.ndarray) -> np.ndarray:
+            rv, tv = th[:3], th[3:6]
+            pred, _ = project_points_rt(xyz_s, rv, tv, float(f_fixed), float(f_fixed), cx_fix, cy_fix, z_eps=1e-6)
+            return (pred - uv_s).reshape(-1)
+
+        try:
+            out = scipy.optimize.least_squares(
+                _res,
+                x0=x_init,
+                method="trf",
+                loss="huber",
+                f_scale=1.0,
+                max_nfev=120,
+            )
+            return out.x.astype(np.float64), bool(out.success)
+        except Exception:
+            return x_init.astype(np.float64), False
+
+    best_inlier_ids: np.ndarray | None = None
+    best_rmse = float("inf")
+    best_x = np.concatenate([rvec0, tvec0], axis=0).astype(np.float64)
+
+    # 先评估DLT初值
+    pred_init, _ = project_points_rt(xyz, rvec0, tvec0, float(f_fixed), float(f_fixed), cx_fix, cy_fix, z_eps=z_eps)
+    e0 = np.linalg.norm(pred_init - uv, axis=1)
+    in0 = np.nonzero(e0 <= float(pnp_ransac_reproj_thr))[0]
+    best_inlier_ids = in0
+    best_rmse = float(np.sqrt(np.mean(e0[in0] ** 2))) if in0.size > 0 else float("inf")
+
+    for _ in range(int(max(pnp_ransac_iters, 1))):
+        ids = rng.choice(n, size=min_set, replace=False)
+        x_cand, ok = _solve_pose_on_subset(ids)
+        if not ok:
+            continue
+        rv, tv = x_cand[:3], x_cand[3:6]
+        pred, _ = project_points_rt(xyz, rv, tv, float(f_fixed), float(f_fixed), cx_fix, cy_fix, z_eps=z_eps)
+        err = np.linalg.norm(pred - uv, axis=1)
+        inlier_ids = np.nonzero(err <= float(pnp_ransac_reproj_thr))[0]
+        if inlier_ids.size == 0:
+            continue
+        rmse = float(np.sqrt(np.mean(err[inlier_ids] ** 2)))
+        if best_inlier_ids is None or inlier_ids.size > best_inlier_ids.size or (
+            inlier_ids.size == best_inlier_ids.size and rmse < best_rmse
+        ):
+            best_inlier_ids = inlier_ids
+            best_rmse = rmse
+            best_x = x_cand
+
+    if best_inlier_ids is None or int(best_inlier_ids.size) < 6:
+        raise RuntimeError("RANSAC-PnP failed: no valid inlier set")
+    inlier_ids = best_inlier_ids.astype(np.int64)
+    inlier_ratio = float(inlier_ids.shape[0]) / float(max(xyz.shape[0], 1))
+
+    rvec0 = best_x[:3].astype(np.float64)
+    tvec0 = best_x[3:6].astype(np.float64)
+    pred0, z0 = project_points_rt(xyz, rvec0, tvec0, float(f_fixed), float(f_fixed), cx_fix, cy_fix, z_eps=z_eps)
+    met0 = reproj_metrics(pred0 - uv)
+    print("\n========== PnP-RANSAC 初值 ==========")
+    print(
+        "inliers={}/{} ({:.2%}), rmse={:.6f}, p95={:.6f}, max={:.6f}, pos_depth={:.4f}".format(
+            int(inlier_ids.shape[0]),
+            int(xyz.shape[0]),
+            inlier_ratio,
+            met0["rmse"],
+            met0["p95"],
+            met0["pmax"],
+            float(np.mean(z0 > z_eps)),
+        )
+    )
+
+    # RANSAC inlier 上一次中间细化（等价于 PnP Refine）
+    x_lm, _ok_lm = _solve_pose_on_subset(inlier_ids, x_init=np.concatenate([rvec0, tvec0], axis=0))
+    rvec_lm_np = x_lm[:3].astype(np.float64)
+    tvec_lm_np = x_lm[3:6].astype(np.float64)
+    pred_lm, z_lm = project_points_rt(xyz, rvec_lm_np, tvec_lm_np, float(f_fixed), float(f_fixed), cx_fix, cy_fix, z_eps=z_eps)
+    met_lm = reproj_metrics(pred_lm - uv)
+    print("========== PnP-RefineLM ==========")
+    print(
+        "rmse={:.6f}, p95={:.6f}, max={:.6f}, pos_depth={:.4f}".format(
+            met_lm["rmse"],
+            met_lm["p95"],
+            met_lm["pmax"],
+            float(np.mean(z_lm > z_eps)),
+        )
+    )
+
+    # 最终非线性细化：仅在 RANSAC inlier 上优化 rvec,tvec，打印收敛过程
+    x0 = np.concatenate([rvec_lm_np, tvec_lm_np], axis=0)
 
     def unpack(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        rvec = theta[0:3]
-        C = theta[3:6]
-        return rvec, C
+        return theta[:3], theta[3:6]
+
+    xyz_fit = xyz[inlier_ids]
+    uv_fit = uv[inlier_ids]
 
     def residual(theta: np.ndarray) -> np.ndarray:
-        rvec, C = unpack(theta)
-        pred_uv, z = project_points(xyz, rvec, C, float(f_fixed), float(f_fixed), cx_fix, cy_fix, z_eps=z_eps)
-        data_res = (pred_uv - uv).reshape(-1)
-
-        # 深度屏障，抑制 z<=0
-        depth_soft = np.logaddexp(0.0, k_depth * (min_depth - z)) / max(k_depth, 1e-6)
-        depth_res = np.sqrt(lam_depth) * np.sqrt(np.maximum(depth_soft, 0.0))
-
-        center_prior_res = np.sqrt(lam_center_prior) * ((C - C0) / c_scale)
-        all_res = np.concatenate([data_res, depth_res, center_prior_res], axis=0)
-
-        metrics = reproj_metrics(pred_uv - uv)
-        metrics["pos_ratio"] = float(np.mean(z > z_eps))
-        logger.add(metrics)
-
+        rvec, tvec = unpack(theta)
+        pred_uv, z = project_points_rt(xyz_fit, rvec, tvec, float(f_fixed), float(f_fixed), cx_fix, cy_fix, z_eps=z_eps)
+        data_res = (pred_uv - uv_fit).reshape(-1)
+        depth_soft = np.logaddexp(0.0, 20.0 * (1e-2 - z)) / 20.0
+        depth_res = np.sqrt(np.maximum(depth_soft, 0.0))
+        all_res = np.concatenate([data_res, depth_res], axis=0)
+        m = reproj_metrics(pred_uv - uv_fit)
+        m["pos_ratio"] = float(np.mean(z > z_eps))
+        logger.add(m)
         if not np.isfinite(all_res).all():
             all_res = np.nan_to_num(all_res, nan=1e6, posinf=1e6, neginf=-1e6)
         return all_res
 
-    c_win = max(2.0e5, 10.0 * c_scale)
-    lb = np.array(
-        [-2 * np.pi, -2 * np.pi, -2 * np.pi, C0[0] - c_win, C0[1] - c_win, C0[2] - c_win],
-        dtype=np.float64,
-    )
-    ub = np.array(
-        [2 * np.pi, 2 * np.pi, 2 * np.pi, C0[0] + c_win, C0[1] + c_win, C0[2] + c_win],
-        dtype=np.float64,
-    )
-
-    t0 = time.perf_counter()
+    lb = np.array([-2 * np.pi, -2 * np.pi, -2 * np.pi, -1e8, -1e8, -1e8], dtype=np.float64)
+    ub = np.array([2 * np.pi, 2 * np.pi, 2 * np.pi, 1e8, 1e8, 1e8], dtype=np.float64)
     opt = scipy.optimize.least_squares(
         residual,
         x0=np.clip(x0, lb + 1e-9, ub - 1e-9),
@@ -371,13 +485,14 @@ def fit_extrinsics_fixed_f(
     )
     fit_elapsed = time.perf_counter() - t0
 
-    rvec, C = unpack(opt.x)
-    pred_uv, z = project_points(xyz, rvec, C, float(f_fixed), float(f_fixed), cx_fix, cy_fix, z_eps=z_eps)
+    rvec, tvec = unpack(opt.x)
+    pred_uv, z = project_points_rt(xyz, rvec, tvec, float(f_fixed), float(f_fixed), cx_fix, cy_fix, z_eps=z_eps)
     met = reproj_metrics(pred_uv - uv)
     pos_ratio = float(np.mean(z > z_eps))
 
     R = scipy.spatial.transform.Rotation.from_rotvec(rvec).as_matrix()
-    t = -R @ C
+    t = tvec
+    C = -R.T @ t
     K = np.array([[float(f_fixed), 0.0, cx_fix], [0.0, float(f_fixed), cy_fix], [0.0, 0.0, 1.0]], dtype=np.float64)
     w2c = np.eye(4, dtype=np.float64)
     w2c[:3, :3] = R
@@ -400,7 +515,10 @@ def fit_extrinsics_fixed_f(
         "nfev": int(opt.nfev),
         "fit_elapsed_sec": float(fit_elapsed),
         "f_fixed": float(f_fixed),
-        "center_prior_lambda": float(lam_center_prior),
+        "pnp_inlier_count": int(inlier_ids.shape[0]),
+        "pnp_inlier_ratio": float(inlier_ratio),
+        "pnp_ransac_rmse": float(met0["rmse"]),
+        "pnp_refine_lm_rmse": float(met_lm["rmse"]),
         "history": logger.history,
     }
 
@@ -707,6 +825,9 @@ def main() -> None:
         f_fixed=float(args.f_fixed),
         max_nfev=int(args.fit_max_nfev),
         print_every=int(args.fit_print_every),
+        pnp_ransac_reproj_thr=float(args.pnp_ransac_reproj_thr),
+        pnp_ransac_iters=int(args.pnp_ransac_iters),
+        pnp_ransac_confidence=float(args.pnp_ransac_confidence),
     )
 
     # Step 6: 随机100点测试
