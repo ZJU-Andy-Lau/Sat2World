@@ -438,11 +438,13 @@ class TensorBoardMonitor:
                 self.writer.add_image(f"vis/{split}/render_rpc_rgb", rr["rendered_rgb"][0], global_step)
                 self.writer.add_image(f"vis/{split}/render_target_rgb", rr["target_rgb"][0], global_step)
                 self.writer.add_image(f"vis/{split}/render_rpc_alpha", rr["rendered_alpha"][0], global_step)
-                self.writer.add_image(f"vis/{split}/render_rpc_height", self.make_colormap_image(rr["rendered_height"][0]), global_step)
+                if not rr["rendered_height"] is None:
+                    self.writer.add_image(f"vis/{split}/render_rpc_height", self.make_colormap_image(rr["rendered_height"][0]), global_step)
             if rp.get("num_targets", 0) > 0:
                 self.writer.add_image(f"vis/{split}/render_point_rgb", rp["rendered_rgb"][0], global_step)
                 self.writer.add_image(f"vis/{split}/render_point_alpha", rp["rendered_alpha"][0], global_step)
-                self.writer.add_image(f"vis/{split}/render_point_height", self.make_colormap_image(rp["rendered_height"][0]), global_step)
+                if not rr["rendered_height"] is None:
+                    self.writer.add_image(f"vis/{split}/render_point_height", self.make_colormap_image(rp["rendered_height"][0]), global_step)
 
         if "gaussian_confidence_rpc" in outputs:
             self.writer.add_image(f"vis/{split}/gaussian_conf_rpc", self.make_colormap_image(outputs["gaussian_confidence_rpc"][0, 0]), global_step)
