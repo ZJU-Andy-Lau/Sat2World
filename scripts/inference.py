@@ -54,7 +54,7 @@ from loss.affine_loss import (  # noqa: E402
     AffinePairwiseGeometryLoss,
     AffinePairwiseGeometryLossCfg,
 )
-from loss.common import apply_affine_to_points, make_uniform_grid_points  # noqa: E402
+from loss.common import apply_affine_to_points, make_uniform_grid_points, sample_map_bilinear  # noqa: E402
 from model import Sat2World  # noqa: E402
 from render import RPCGaussianRenderer, RPCGaussianRendererCfg  # noqa: E402
 from render.rpc_gaussian_renderer import VirtualPinholeCamera, sh_basecolor_to_rgb  # noqa: E402
@@ -571,31 +571,52 @@ def compute_affine_grid_error_samples(
     return err[mask]
 
 
-def _checkerboard_value(line: torch.Tensor, samp: torch.Tensor, cell: int) -> torch.Tensor:
-    c = max(int(cell), 1)
-    return ((torch.floor(line / c) + torch.floor(samp / c)) % 2.0).to(torch.float32)
+def _invert_affine_2x3(affine_2x3: torch.Tensor) -> torch.Tensor:
+    if affine_2x3.shape != (2, 3):
+        raise ValueError("affine_2x3 must be [2,3]")
+    a = affine_2x3[:, :2]
+    t = affine_2x3[:, 2:]
+    a_inv = torch.linalg.inv(a)
+    t_inv = -(a_inv @ t)
+    return torch.cat([a_inv, t_inv], dim=1)
 
 
-def _splat_to_image(
-    line: torch.Tensor,
-    samp: torch.Tensor,
-    value: torch.Tensor,
-    image_hw: tuple[int, int],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    h, w = image_hw
-    yi = torch.round(line).long()
-    xi = torch.round(samp).long()
-    valid = (yi >= 0) & (yi < h) & (xi >= 0) & (xi < w)
-    yi = yi[valid]
-    xi = xi[valid]
-    val = value[valid]
+def _warp_crop_by_affine_forward(
+    image_chw: torch.Tensor,
+    affine_forward_2x3: torch.Tensor,
+    affine_correction_2x3: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if image_chw.ndim != 3 or image_chw.shape[0] != 3:
+        raise ValueError("image_chw must be [3,H,W]")
+    h, w = int(image_chw.shape[-2]), int(image_chw.shape[-1])
+    img = image_chw.unsqueeze(0).detach().float()
+    aff_corr = affine_correction_2x3 if affine_correction_2x3 is not None else _invert_affine_2x3(affine_forward_2x3)
+    aff_corr = aff_corr.to(device=img.device, dtype=img.dtype)
 
-    acc = torch.zeros((h, w), dtype=torch.float32, device=value.device)
-    cnt = torch.zeros((h, w), dtype=torch.float32, device=value.device)
-    acc.index_put_((yi, xi), val, accumulate=True)
-    cnt.index_put_((yi, xi), torch.ones_like(val), accumulate=True)
-    out = torch.where(cnt > 0, acc / cnt.clamp_min(1.0), torch.zeros_like(acc))
-    return out, cnt
+    line = torch.arange(h, device=img.device, dtype=img.dtype)
+    samp = torch.arange(w, device=img.device, dtype=img.dtype)
+    yy, xx = torch.meshgrid(line, samp, indexing="ij")
+    obs_grid = torch.stack([yy, xx], dim=-1).view(1, -1, 2)
+    src_grid = apply_affine_to_points(obs_grid, aff_corr.unsqueeze(0)).view(1, h, w, 2)
+    x = 2.0 * src_grid[..., 1] / max(w - 1, 1) - 1.0
+    y = 2.0 * src_grid[..., 0] / max(h - 1, 1) - 1.0
+    grid = torch.stack([x, y], dim=-1)
+    out = torch.nn.functional.grid_sample(img, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+    return out[0].clamp(0, 1)
+
+
+def _make_checkerboard_blend(image_a_chw: torch.Tensor, image_b_chw: torch.Tensor, tile_size: int = 32) -> torch.Tensor:
+    if image_a_chw.shape != image_b_chw.shape:
+        raise ValueError("image_a_chw and image_b_chw must share shape")
+    if image_a_chw.ndim != 3 or image_a_chw.shape[0] != 3:
+        raise ValueError("image_a_chw must be [3,H,W]")
+    if tile_size <= 0:
+        raise ValueError("tile_size must be > 0")
+    h, w = int(image_a_chw.shape[-2]), int(image_a_chw.shape[-1])
+    yy = torch.arange(h, device=image_a_chw.device).view(h, 1).expand(h, w)
+    xx = torch.arange(w, device=image_a_chw.device).view(1, w).expand(h, w)
+    mask = ((yy // tile_size + xx // tile_size) % 2).to(dtype=image_a_chw.dtype).unsqueeze(0)
+    return (image_a_chw * (1.0 - mask) + image_b_chw * mask).clamp(0, 1)
 
 
 def save_checkerboard_pair_panel(
@@ -608,78 +629,80 @@ def save_checkerboard_pair_panel(
     geometry_ops: Any,
 ) -> dict[str, Any]:
     i, j = int(pair[0]), int(pair[1])
-    h = int(batch["images"].shape[-2])
-    w = int(batch["images"].shape[-1])
-    dev = batch["images"].device
+    del point_stride
+    bi = 0
+    images = batch["images"]
+    aff_gt_forward = batch["affine_gt_forward"]
+    aff_pred = outputs["affine_pred"]
+    h = int(images.shape[-2])
+    w = int(images.shape[-1])
 
-    yy = torch.arange(0, h, max(int(point_stride), 1), device=dev, dtype=torch.float32)
-    xx = torch.arange(0, w, max(int(point_stride), 1), device=dev, dtype=torch.float32)
-    gy, gx = torch.meshgrid(yy, xx, indexing="ij")
-    line_i = gy.reshape(-1)
-    samp_i = gx.reshape(-1)
+    image_i_true = images[bi, i].detach().float()
+    image_j_true = images[bi, j].detach().float()
 
-    hgt_i = batch["height_gt"][0, i, 0, line_i.long(), samp_i.long()].to(torch.float32)
-    checker_i = _checkerboard_value(line_i, samp_i, cell=cell_size)
+    image_i_obs = _warp_crop_by_affine_forward(image_i_true, aff_gt_forward[bi, i].detach().float())
+    image_j_obs = _warp_crop_by_affine_forward(image_j_true, aff_gt_forward[bi, j].detach().float())
+    image_i_corr = _warp_crop_by_affine_forward(image_i_obs, aff_pred[bi, i].detach().float())
+    image_j_corr = _warp_crop_by_affine_forward(image_j_obs, aff_pred[bi, j].detach().float())
 
-    xs_i_gt, ys_i_gt = geometry_ops.linesamp_to_xy_batch(
-        rpc_batch=[[batch["rpc_gt"][0][i]]],
-        lines=line_i.view(1, 1, -1),
-        samps=samp_i.view(1, 1, -1),
-        heights=hgt_i.view(1, 1, -1),
-        scene_xy_center=batch["scene_xy_center"][0:1],
-        scene_xy_scale=batch["scene_xy_scale"][0:1],
+    rpc_j = batch["rpc_gt"][bi][j]
+    rpc_i = batch["rpc_gt"][bi][i]
+    line = torch.arange(h, device=image_j_corr.device, dtype=torch.float32)
+    samp = torch.arange(w, device=image_j_corr.device, dtype=torch.float32)
+    yy, xx = torch.meshgrid(line, samp, indexing="ij")
+    line_flat = yy.reshape(-1)
+    samp_flat = xx.reshape(-1)
+    h_j_map = batch["height_gt"][bi, j]
+    if h_j_map.ndim == 3 and h_j_map.shape[0] == 1:
+        h_j_map = h_j_map[0]
+    h_j_flat = h_j_map.detach().to(device=image_j_corr.device, dtype=torch.float32).reshape(-1)
+
+    scene_xy_center = batch.get("scene_xy_center", None)
+    scene_xy_scale = batch.get("scene_xy_scale", None)
+    xy_center_j = None if scene_xy_center is None else scene_xy_center[bi]
+    xy_scale_j = None if scene_xy_scale is None else scene_xy_scale[bi]
+
+    x_world, y_world = rpc_j.RPC_LINESAMP2XY(
+        line_in=line_flat,
+        samp_in=samp_flat,
+        h_in=h_j_flat,
+        output_type="tensor",
+        xy_center=xy_center_j,
+        xy_scale=xy_scale_j,
     )
-    l_i2j_gt, s_i2j_gt = geometry_ops.xy_to_linesamp_batch(
-        rpc_batch=[[batch["rpc_gt"][0][j]]],
-        xs=xs_i_gt,
-        ys=ys_i_gt,
-        heights=hgt_i.view(1, 1, -1),
-        scene_xy_center=batch["scene_xy_center"][0:1],
-        scene_xy_scale=batch["scene_xy_scale"][0:1],
+    line_i_proj, samp_i_proj = rpc_i.RPC_XY2LINESAMP(
+        x_in=x_world,
+        y_in=y_world,
+        h_in=h_j_flat,
+        output_type="tensor",
+        xy_center=xy_center_j,
+        xy_scale=xy_scale_j,
     )
+    proj_points_i = torch.stack(
+        [
+            line_i_proj.to(device=image_i_corr.device, dtype=image_i_corr.dtype),
+            samp_i_proj.to(device=image_i_corr.device, dtype=image_i_corr.dtype),
+        ],
+        dim=-1,
+    ).unsqueeze(0)
+    sampled_i_to_j, in_bounds = sample_map_bilinear(image_i_corr.unsqueeze(0), proj_points_i)
+    image_i_to_j = sampled_i_to_j.view(1, 3, h, w)[0].clamp(0, 1)
+    checker = _make_checkerboard_blend(image_j_corr, image_i_to_j, tile_size=max(int(cell_size), 1))
 
-    xs_i_pred, ys_i_pred = geometry_ops.linesamp_to_xy_batch(
-        rpc_batch=[[outputs["rpc_corrected"][0][i]]],
-        lines=line_i.view(1, 1, -1),
-        samps=samp_i.view(1, 1, -1),
-        heights=hgt_i.view(1, 1, -1),
-        scene_xy_center=batch["scene_xy_center"][0:1],
-        scene_xy_scale=batch["scene_xy_scale"][0:1],
-    )
-    l_i2j_pred, s_i2j_pred = geometry_ops.xy_to_linesamp_batch(
-        rpc_batch=[[outputs["rpc_corrected"][0][j]]],
-        xs=xs_i_pred,
-        ys=ys_i_pred,
-        heights=hgt_i.view(1, 1, -1),
-        scene_xy_center=batch["scene_xy_center"][0:1],
-        scene_xy_scale=batch["scene_xy_scale"][0:1],
-    )
-
-    gt_map, gt_cnt = _splat_to_image(l_i2j_gt.reshape(-1), s_i2j_gt.reshape(-1), checker_i, image_hw=(h, w))
-    pred_map, pred_cnt = _splat_to_image(l_i2j_pred.reshape(-1), s_i2j_pred.reshape(-1), checker_i, image_hw=(h, w))
-
-    diff = (pred_map - gt_map).abs()
-    valid = (gt_cnt > 0) & (pred_cnt > 0)
-    diff = torch.where(valid, diff, torch.zeros_like(diff))
-
-    gt_rgb = (gt_map.clamp(0.0, 1.0).detach().cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
-    pred_rgb = (pred_map.clamp(0.0, 1.0).detach().cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
-    diff_rgb = (diff.clamp(0.0, 1.0).detach().cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
-
-    gt_img = Image.fromarray(np.stack([gt_rgb, gt_rgb, gt_rgb], axis=-1))
-    pred_img = Image.fromarray(np.stack([pred_rgb, pred_rgb, pred_rgb], axis=-1))
-    diff_img = Image.fromarray(np.stack([diff_rgb, diff_rgb, diff_rgb], axis=-1))
+    checker_rgb = (checker.detach().cpu().permute(1, 2, 0).numpy() * 255.0 + 0.5).astype(np.uint8)
+    j_corr_rgb = (image_j_corr.detach().cpu().permute(1, 2, 0).numpy() * 255.0 + 0.5).astype(np.uint8)
+    i_proj_rgb = (image_i_to_j.detach().cpu().permute(1, 2, 0).numpy() * 255.0 + 0.5).astype(np.uint8)
     panel = Image.new("RGB", (w * 3, h))
-    panel.paste(gt_img, (0, 0))
-    panel.paste(pred_img, (w, 0))
-    panel.paste(diff_img, (2 * w, 0))
+    panel.paste(Image.fromarray(checker_rgb), (0, 0))
+    panel.paste(Image.fromarray(j_corr_rgb), (w, 0))
+    panel.paste(Image.fromarray(i_proj_rgb), (2 * w, 0))
     panel.save(out_path)
 
     return {
         "view_i": int(i),
         "view_j": int(j),
         "panel_path": str(out_path),
-        "valid_ratio": float(valid.to(torch.float32).mean().item()),
+        "valid_ratio": float(in_bounds.to(torch.float32).mean().item()),
     }
 
 
