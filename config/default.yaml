@@ -34,6 +34,16 @@ data:
     strict_same_hw: true
     crop_size: 512
     anchors_per_view_per_sample: 128
+    fit_pinhole_in_dataset: true
+    fit_pinhole_keep_diagnostics: false
+    fit_pinhole_cfg:
+      downsample: 8
+      num_heights: 100
+      height_low: -20.0
+      height_high: 80.0
+      focal: 100000.0
+      use_ransac: true
+      seed: 42
     perturb_cfg:
       tx_range: [ -2.0, 2.0 ]
       ty_range: [ -2.0, 2.0 ]
@@ -55,6 +65,16 @@ data:
     strict_same_hw: true
     crop_size: 512
     anchors_per_view_per_sample: 128
+    fit_pinhole_in_dataset: true
+    fit_pinhole_keep_diagnostics: false
+    fit_pinhole_cfg:
+      downsample: 8
+      num_heights: 100
+      height_low: -20.0
+      height_high: 80.0
+      focal: 100000.0
+      use_ransac: true
+      seed: 42
     perturb_cfg:
       tx_range: [ -2.0, 2.0 ]
       ty_range: [ -2.0, 2.0 ]

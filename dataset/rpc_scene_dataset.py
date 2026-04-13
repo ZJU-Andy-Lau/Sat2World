@@ -40,6 +40,7 @@ from .perturbation import (
     identity_affine_2x3,
     make_deterministic_rng,
 )
+from render.rpc2pinhole_camera_fit import RPC2PinholeFitCfg, fit_view_pinhole_from_rpc
 
 
 class RPCSceneDataset(Dataset):
@@ -74,6 +75,9 @@ class RPCSceneDataset(Dataset):
         strict_same_hw: bool = True,
         crop_size: int = 512,
         anchors_per_view_per_sample: int = 0,
+        fit_pinhole_in_dataset: Optional[bool] = None,
+        fit_pinhole_cfg: Optional[Mapping[str, Any]] = None,
+        fit_pinhole_keep_diagnostics: bool = False,
     ) -> None:
         super().__init__()
         mode = mode.lower()
@@ -118,6 +122,12 @@ class RPCSceneDataset(Dataset):
         if self.crop_size <= 0:
             raise ValueError("crop_size must be > 0")
         self.anchors_per_view_per_sample = int(anchors_per_view_per_sample)
+        self.fit_pinhole_in_dataset = bool(self.mode == "train") if fit_pinhole_in_dataset is None else bool(fit_pinhole_in_dataset)
+        self.fit_pinhole_keep_diagnostics = bool(fit_pinhole_keep_diagnostics)
+        if fit_pinhole_cfg is None:
+            self.fit_pinhole_cfg = RPC2PinholeFitCfg()
+        else:
+            self.fit_pinhole_cfg = RPC2PinholeFitCfg(**dict(fit_pinhole_cfg))
         init_t0 = time.perf_counter()
         init_t_last = init_t0
 
@@ -437,6 +447,35 @@ class RPCSceneDataset(Dataset):
             ref_view_idx=ref_view_idx,
         )
 
+        view_pinhole_K = None
+        view_pinhole_w2c = None
+        view_pinhole_fit_p50 = None
+        view_pinhole_fit_p95 = None
+        view_pinhole_fit_max = None
+        view_pinhole_diagnostics: list[dict[str, Any] | None] | None = None
+        if self.fit_pinhole_in_dataset:
+            fit_batch = {
+                "rpc_gt": [rpc_gt_views],
+                "scene_xy_center": scene_xy_center.unsqueeze(0),
+            }
+            cams = [
+                fit_view_pinhole_from_rpc(
+                    batch=fit_batch,
+                    bi=0,
+                    tv=vi,
+                    image_hw=(self.crop_size, self.crop_size),
+                    cfg=self.fit_pinhole_cfg,
+                )
+                for vi in range(len(selected_views))
+            ]
+            view_pinhole_K = torch.stack([cam.K.to(torch.float32).cpu() for cam in cams], dim=0)
+            view_pinhole_w2c = torch.stack([cam.w2c.to(torch.float32).cpu() for cam in cams], dim=0)
+            view_pinhole_fit_p50 = torch.tensor([float(cam.fit_p50) for cam in cams], dtype=torch.float32)
+            view_pinhole_fit_p95 = torch.tensor([float(cam.fit_p95) for cam in cams], dtype=torch.float32)
+            view_pinhole_fit_max = torch.tensor([float(cam.fit_max) for cam in cams], dtype=torch.float32)
+            if self.fit_pinhole_keep_diagnostics:
+                view_pinhole_diagnostics = [cam.diagnostics for cam in cams]
+
         sample = {
             "images": images_t,
             "height_gt": height_gt_t,
@@ -469,6 +508,14 @@ class RPCSceneDataset(Dataset):
                 anchor_h.append(h_i)
             sample["anchor_line_samp_true"] = torch.stack(anchor_ls, dim=0).to(torch.float32)  # [V,K,2]
             sample["anchor_height_true"] = torch.stack(anchor_h, dim=0).to(torch.float32)  # [V,K]
+        if view_pinhole_K is not None and view_pinhole_w2c is not None:
+            sample["view_pinhole_K"] = view_pinhole_K
+            sample["view_pinhole_w2c"] = view_pinhole_w2c
+            sample["view_pinhole_fit_p50"] = view_pinhole_fit_p50
+            sample["view_pinhole_fit_p95"] = view_pinhole_fit_p95
+            sample["view_pinhole_fit_max"] = view_pinhole_fit_max
+            if view_pinhole_diagnostics is not None:
+                sample["view_pinhole_diagnostics"] = view_pinhole_diagnostics
         return sample
 
 
@@ -496,6 +543,9 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     crop_tops_b, crop_lefts_b = [], []
     crop_anchor_xy_b, crop_anchor_h_b, max_center_dist_b = [], [], []
     anchor_ls_b, anchor_h_b = [], []
+    pinhole_K_b, pinhole_w2c_b = [], []
+    pinhole_p50_b, pinhole_p95_b, pinhole_max_b = [], [], []
+    pinhole_diag_b: list[list[dict[str, Any] | None]] = []
 
     for sample in batch:
         idx = torch.arange(v_out, dtype=torch.long)
@@ -531,6 +581,18 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
             anchor_ls_b.append(sample["anchor_line_samp_true"][idx])
         if "anchor_height_true" in sample:
             anchor_h_b.append(sample["anchor_height_true"][idx])
+        if "view_pinhole_K" in sample:
+            pinhole_K_b.append(sample["view_pinhole_K"][idx])
+        if "view_pinhole_w2c" in sample:
+            pinhole_w2c_b.append(sample["view_pinhole_w2c"][idx])
+        if "view_pinhole_fit_p50" in sample:
+            pinhole_p50_b.append(sample["view_pinhole_fit_p50"][idx])
+        if "view_pinhole_fit_p95" in sample:
+            pinhole_p95_b.append(sample["view_pinhole_fit_p95"][idx])
+        if "view_pinhole_fit_max" in sample:
+            pinhole_max_b.append(sample["view_pinhole_fit_max"][idx])
+        if "view_pinhole_diagnostics" in sample:
+            pinhole_diag_b.append([sample["view_pinhole_diagnostics"][int(i)] for i in idx.tolist()])
 
     out = {
         "images": torch.stack(images_b, dim=0).to(torch.float32),
@@ -562,6 +624,18 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         out["anchor_line_samp_true"] = torch.stack(anchor_ls_b, dim=0).to(torch.float32)
     if len(anchor_h_b) > 0:
         out["anchor_height_true"] = torch.stack(anchor_h_b, dim=0).to(torch.float32)
+    if len(pinhole_K_b) > 0:
+        out["view_pinhole_K"] = torch.stack(pinhole_K_b, dim=0).to(torch.float32)
+    if len(pinhole_w2c_b) > 0:
+        out["view_pinhole_w2c"] = torch.stack(pinhole_w2c_b, dim=0).to(torch.float32)
+    if len(pinhole_p50_b) > 0:
+        out["view_pinhole_fit_p50"] = torch.stack(pinhole_p50_b, dim=0).to(torch.float32)
+    if len(pinhole_p95_b) > 0:
+        out["view_pinhole_fit_p95"] = torch.stack(pinhole_p95_b, dim=0).to(torch.float32)
+    if len(pinhole_max_b) > 0:
+        out["view_pinhole_fit_max"] = torch.stack(pinhole_max_b, dim=0).to(torch.float32)
+    if len(pinhole_diag_b) > 0:
+        out["view_pinhole_diagnostics"] = pinhole_diag_b
 
     v_chk = int(out["images"].shape[1])
     if int(out["affine_gt_forward"].shape[1]) != v_chk:

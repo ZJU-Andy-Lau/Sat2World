@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 import sys
 import time
-import types
 from typing import Any
 
 import numpy as np
@@ -28,7 +27,7 @@ if str(_ROOT) not in sys.path:
 
 from dataset import build_dataset, rpc_scene_collate_fn
 from render.rpc_gaussian_renderer import RPCGaussianRenderer, RPCGaussianRendererCfg, VirtualPinholeCamera
-from render.rpc2pinhole_camera_fit import RPC2PinholeFitCfg, fit_view_pinhole_from_rpc2, format_rpc2_fit_diag
+from render.rpc2pinhole_camera_fit import format_rpc2_fit_diag
 
 
 @dataclass
@@ -89,7 +88,19 @@ def load_cfg(path: str) -> dict[str, Any]:
 
 
 def build_val_batch(cfg: dict[str, Any], scene_index: int) -> dict[str, Any]:
-    ds = build_dataset(mode="val", **cfg.get("data", {}).get("val", {}))
+    val_cfg = dict(cfg.get("data", {}).get("val", {}))
+    val_cfg["fit_pinhole_in_dataset"] = True
+    val_cfg["fit_pinhole_keep_diagnostics"] = True
+    val_cfg["fit_pinhole_cfg"] = {
+        "downsample": int(cfg.get("_render_check_rpc2_cfg", {}).get("downsample", 8)),
+        "num_heights": int(cfg.get("_render_check_rpc2_cfg", {}).get("num_heights", 100)),
+        "height_low": float(cfg.get("_render_check_rpc2_cfg", {}).get("height_low", -20.0)),
+        "height_high": float(cfg.get("_render_check_rpc2_cfg", {}).get("height_high", 80.0)),
+        "focal": float(cfg.get("_render_check_rpc2_cfg", {}).get("focal", 1e5)),
+        "use_ransac": bool(cfg.get("_render_check_rpc2_cfg", {}).get("use_ransac", True)),
+        "seed": int(cfg.get("_render_check_rpc2_cfg", {}).get("seed", 42)),
+    }
+    ds = build_dataset(mode="val", **val_cfg)
     if len(ds) == 0:
         raise RuntimeError("val dataset empty")
     if not (0 <= scene_index < len(ds)):
@@ -121,44 +132,6 @@ def make_renderer(cfg: dict[str, Any]) -> RPCGaussianRenderer:
     from geometry import RPCGeometryOps
 
     return RPCGaussianRenderer(RPCGeometryOps(rpc_dtype=torch.double, net_dtype=torch.float32), rcfg)
-
-
-def _make_rpc2_cfg(args: argparse.Namespace) -> RPC2PinholeFitCfg:
-    return RPC2PinholeFitCfg(
-        downsample=int(args.rpc2_downsample),
-        num_heights=int(args.rpc2_num_heights),
-        height_low=float(args.rpc2_height_low),
-        height_high=float(args.rpc2_height_high),
-        focal=float(args.rpc2_focal),
-        use_ransac=not bool(args.rpc2_disable_ransac),
-        seed=int(args.rpc2_seed),
-    )
-
-
-def install_rpc2_camera_fitter(renderer: RPCGaussianRenderer, fit_cfg: RPC2PinholeFitCfg) -> None:
-    cache: dict[tuple[int, int, int, int], VirtualPinholeCamera] = {}
-
-    def _fit_virtual_camera_override(self: RPCGaussianRenderer, batch: dict[str, Any], bi: int, tv: int, image_hw: tuple[int, int]) -> VirtualPinholeCamera:
-        sid = int(batch["scene_id"][bi].item()) if torch.is_tensor(batch.get("scene_id", None)) else int(bi)
-        h, w = int(image_hw[0]), int(image_hw[1])
-        key = (sid, int(tv), h, w)
-        if key not in cache:
-            cache[key] = fit_view_pinhole_from_rpc2(batch=batch, bi=int(bi), tv=int(tv), image_hw=(h, w), cfg=fit_cfg)
-        return cache[key]
-
-    def _fit_virtual_camera_for_target_override(
-        self: RPCGaussianRenderer,
-        batch: dict[str, Any],
-        batch_index: int,
-        target_view_index: int,
-        image_hw: tuple[int, int] | None = None,
-    ) -> VirtualPinholeCamera:
-        if image_hw is None:
-            image_hw = (int(batch["images"].shape[-2]), int(batch["images"].shape[-1]))
-        return self._fit_virtual_camera(batch, int(batch_index), int(target_view_index), image_hw)
-
-    renderer._fit_virtual_camera = types.MethodType(_fit_virtual_camera_override, renderer)  # type: ignore[method-assign]
-    renderer.fit_virtual_camera_for_target = types.MethodType(_fit_virtual_camera_for_target_override, renderer)  # type: ignore[method-assign]
 
 
 def _safe_logit(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
@@ -309,6 +282,15 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
     cfg = load_cfg(args.config)
+    cfg["_render_check_rpc2_cfg"] = {
+        "downsample": int(args.rpc2_downsample),
+        "num_heights": int(args.rpc2_num_heights),
+        "height_low": float(args.rpc2_height_low),
+        "height_high": float(args.rpc2_height_high),
+        "focal": float(args.rpc2_focal),
+        "use_ransac": not bool(args.rpc2_disable_ransac),
+        "seed": int(args.rpc2_seed),
+    }
     prog = ProgressLogger()
 
     prog.log("build batch")
@@ -324,11 +306,7 @@ def main() -> None:
     prog.log("build renderer")
     renderer = make_renderer(cfg)
 
-    prog.log("install rpc2 camera fitter")
-    rpc2_cfg = _make_rpc2_cfg(args)
-    install_rpc2_camera_fitter(renderer, rpc2_cfg)
-
-    prog.log("fit target virtual camera (rpc2pinhole)")
+    prog.log("load target virtual camera (pre-fitted in dataset)")
     cam = renderer.fit_virtual_camera_for_target(batch, 0, args.view_j)
     print("\n-- rpc2pinhole fit diagnostics --")
     print(format_rpc2_fit_diag(cam))
