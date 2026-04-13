@@ -21,7 +21,10 @@ from dataclasses import dataclass
 from pathlib import Path
 import random
 import sys
+<<<<<<< codex/implement-inference-demo-in-scripts/inference.py-nafxhj
 import time
+=======
+>>>>>>> main
 from typing import Any, Sequence
 
 import numpy as np
@@ -54,7 +57,10 @@ from loss.affine_loss import (  # noqa: E402
     AffinePairwiseGeometryLoss,
     AffinePairwiseGeometryLossCfg,
 )
+<<<<<<< codex/implement-inference-demo-in-scripts/inference.py-nafxhj
 from loss.common import apply_affine_to_points, make_uniform_grid_points  # noqa: E402
+=======
+>>>>>>> main
 from model import Sat2World  # noqa: E402
 from render import RPCGaussianRenderer, RPCGaussianRendererCfg  # noqa: E402
 from render.rpc_gaussian_renderer import VirtualPinholeCamera, sh_basecolor_to_rgb  # noqa: E402
@@ -110,6 +116,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--render-max-retries", type=int, default=8)
     p.add_argument("--render-confidence-thresh", type=float, default=0.1)
     p.add_argument("--render-topk", type=int, default=200000)
+<<<<<<< codex/implement-inference-demo-in-scripts/inference.py-nafxhj
     p.add_argument("--verbose", action="store_true")
 
     p.add_argument("--viz-checkerboard", action="store_true")
@@ -121,6 +128,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--height-vmax", type=float, default=50.0)
     p.add_argument("--height-vmin-quantile", type=float, default=0.02)
     p.add_argument("--height-colormap", type=str, default="turbo")
+=======
+>>>>>>> main
 
     return p.parse_args()
 
@@ -138,6 +147,7 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+<<<<<<< codex/implement-inference-demo-in-scripts/inference.py-nafxhj
 class StepLogger:
     def __init__(self, enabled: bool = True) -> None:
         self.enabled = bool(enabled)
@@ -178,6 +188,8 @@ class _StepScope:
             )
 
 
+=======
+>>>>>>> main
 def _parse_scene_id(scene_dir: Path) -> int:
     m = re.fullmatch(r"scene_(\d+)", scene_dir.name)
     if m is None:
@@ -529,6 +541,7 @@ def flatten_centers_map(centers_bv3hw: torch.Tensor, mask_bv1hw: torch.Tensor | 
     return c.detach().cpu().numpy().astype(np.float32)
 
 
+<<<<<<< codex/implement-inference-demo-in-scripts/inference.py-nafxhj
 def _compute_basic_stats(x: torch.Tensor) -> dict[str, float]:
     if x.numel() == 0:
         return {"count": 0.0, "mean": 0.0, "median": 0.0, "p95": 0.0, "max": 0.0, "var": 0.0}
@@ -734,6 +747,8 @@ def save_height_panel(
     return {"panel_path": str(out_path), "vmin": float(vmin), "vmax": float(vmax_f), "cmap": str(cmap_name)}
 
 
+=======
+>>>>>>> main
 def _look_at_w2c_np(eye: np.ndarray, target: np.ndarray, up_hint: np.ndarray) -> np.ndarray:
     f = target - eye
     f = f / (np.linalg.norm(f) + 1e-12)
@@ -859,6 +874,7 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
 
     seed_everything(int(args.seed))
     device = torch.device(args.device)
+<<<<<<< codex/implement-inference-demo-in-scripts/inference.py-nafxhj
     slog = StepLogger(enabled=True)
 
     with slog.run("load_cfg_model_checkpoint"):
@@ -881,6 +897,26 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
         view_idxs = parse_view_indices(args.view_idxs)
         selected_views = select_views(scene, args.view_num, view_idxs, seed=int(args.seed))
         slog.info(f"scene_id={scene.scene_id}, selected_view_ids={[int(v.view_id) for v in selected_views]}")
+=======
+
+    cfg = load_cfg(args.config)
+    model: Sat2World = build_model(cfg).to(device)
+    load_checkpoint(
+        args.checkpoint,
+        model=model,
+        optimizer=None,
+        scheduler=None,
+        scaler=None,
+        map_location="cpu",
+        model_strict=bool(cfg.get("system", {}).get("checkpoint_model_strict", False)),
+        load_model_only=True,
+    )
+    model.eval()
+
+    scene = load_scene(args.scene_dir)
+    view_idxs = parse_view_indices(args.view_idxs)
+    selected_views = select_views(scene, args.view_num, view_idxs, seed=int(args.seed))
+>>>>>>> main
 
     perturb_cfg = PerturbationConfig(
         tx_range=(float(args.tx_range[0]), float(args.tx_range[1])),
@@ -889,6 +925,7 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
         shear_range=(float(args.shear_range[0]), float(args.shear_range[1])),
     )
 
+<<<<<<< codex/implement-inference-demo-in-scripts/inference.py-nafxhj
     with slog.run("build_inference_batch"):
         batch_cpu, diagnostics = build_inference_batch(
             selected_views=selected_views,
@@ -916,10 +953,29 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
             l_pair, p_pair, aux_pair = pair_loss_fn(outputs, batch, return_error_samples=True)
 
         grid_samples = compute_affine_grid_error_samples(
+=======
+    batch_cpu, diagnostics = build_inference_batch(
+        selected_views=selected_views,
+        scene_id=int(scene.scene_id),
+        crop_size=int(args.crop_size),
+        seed=int(args.seed),
+        perturb_cfg=perturb_cfg,
+        apply_random_init_error=bool(args.apply_random_init_error),
+    )
+    batch = move_tensor_fields_to_device(batch_cpu, device=device)
+
+    with torch.no_grad():
+        outputs = model(batch)
+
+    grid_loss_fn, pair_loss_fn = build_affine_losses(args, geometry_ops=model.rpc_ops)
+    with torch.no_grad():
+        l_grid, p_grid = grid_loss_fn(
+>>>>>>> main
             affine_pred=outputs["affine_pred"],
             affine_gt_forward=batch["affine_gt_forward"],
             image_hw=(int(batch["images"].shape[-2]), int(batch["images"].shape[-1])),
             ref_view_idx=batch["ref_view_idx"],
+<<<<<<< codex/implement-inference-demo-in-scripts/inference.py-nafxhj
             grid_h=16,
             grid_w=16,
         )
@@ -928,6 +984,10 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
             pair_samples = torch.as_tensor(pair_samples, device=batch["images"].device, dtype=torch.float32)
         grid_stats = _compute_basic_stats(grid_samples)
         pair_stats = _compute_basic_stats(pair_samples)
+=======
+        )
+        l_pair, p_pair, aux_pair = pair_loss_fn(outputs, batch)
+>>>>>>> main
 
     results: dict[str, Any] = {
         "scene_id": int(scene.scene_id),
@@ -939,6 +999,7 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
         "probe_affine_grid": {k: float(v.detach().item()) for k, v in p_grid.items()},
         "probe_affine_pair": {k: float(v.detach().item()) for k, v in p_pair.items()},
         "aux_affine_pair": {"num_pairs_used": int(aux_pair.get("num_pairs_used", 0))},
+<<<<<<< codex/implement-inference-demo-in-scripts/inference.py-nafxhj
         "affine_grid_stats": grid_stats,
         "affine_pair_stats": pair_stats,
     }
@@ -1111,6 +1172,128 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
         report_path = save_dir / "inference_report.json"
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
+=======
+    }
+
+    if bool(args.export_pointcloud):
+        image_h = int(batch["images"].shape[-2])
+        image_w = int(batch["images"].shape[-1])
+        pixel_grid = torch.stack(
+            torch.meshgrid(
+                torch.arange(image_h, device=device, dtype=torch.float32),
+                torch.arange(image_w, device=device, dtype=torch.float32),
+                indexing="ij",
+            ),
+            dim=-1,
+        )
+
+        scene_scale_for_rpc = torch.ones_like(batch["scene_xy_center"])
+        centers_rpc = model.rpc_ops.centers_from_rpc_and_height_batch(
+            corrected_rpc_batch=outputs["rpc_corrected"],
+            pixel_grid=pixel_grid,
+            height_abs=outputs["height_abs"],
+            scene_xy_center=batch["scene_xy_center"],
+            scene_xy_scale=scene_scale_for_rpc,
+            downsample_factor=1,
+        )
+        centers_point = outputs["point_abs"]
+
+        stride = max(int(args.pointcloud_sample_stride), 1)
+        xyz_rpc = flatten_centers_map(centers_rpc, mask_bv1hw=batch["height_valid_mask"], stride=stride)
+        xyz_point = flatten_centers_map(centers_point, mask_bv1hw=batch["height_valid_mask"], stride=stride)
+
+        ply_rpc = save_dir / "cloud_rpc_height.ply"
+        ply_point = save_dir / "cloud_point_path.ply"
+        write_ply_xyz(ply_rpc, xyz_rpc)
+        write_ply_xyz(ply_point, xyz_point)
+        results["pointcloud"] = {
+            "rpc_height_ply": str(ply_rpc),
+            "point_path_ply": str(ply_point),
+            "num_points_rpc": int(xyz_rpc.shape[0]),
+            "num_points_point": int(xyz_point.shape[0]),
+            "stride": int(stride),
+        }
+
+    if bool(args.render_3dgs):
+        if not bool(outputs.get("gaussian_branch_enabled", False)):
+            raise RuntimeError("gaussian branch disabled in model output, cannot render 3DGS")
+
+        renderer = RPCGaussianRenderer(model.rpc_ops, RPCGaussianRendererCfg())
+
+        field_rpc = build_flattened_3dgs_field(
+            outputs=outputs,
+            path="rpc",
+            confidence_thresh=float(args.render_confidence_thresh),
+            topk=int(args.render_topk),
+        )
+        field_point = build_flattened_3dgs_field(
+            outputs=outputs,
+            path="point",
+            confidence_thresh=float(args.render_confidence_thresh),
+            topk=int(args.render_topk),
+        )
+
+        if int(field_rpc["num"].item()) <= 0 or int(field_point["num"].item()) <= 0:
+            raise RuntimeError("No gaussians after confidence/topk filtering, cannot render")
+
+        image_hw = (int(args.render_hw[0]), int(args.render_hw[1]))
+
+        cam_rpc = build_cover_camera_45deg(
+            xyz_world=field_rpc["centers"].detach().cpu().numpy(),
+            image_hw=image_hw,
+            device=device,
+            margin_ratio=float(args.render_margin_ratio),
+            distance_factor=float(args.render_distance_factor),
+            max_retries=int(args.render_max_retries),
+        )
+        cam_point = build_cover_camera_45deg(
+            xyz_world=field_point["centers"].detach().cpu().numpy(),
+            image_hw=image_hw,
+            device=device,
+            margin_ratio=float(args.render_margin_ratio),
+            distance_factor=float(args.render_distance_factor),
+            max_retries=int(args.render_max_retries),
+        )
+
+        with torch.no_grad():
+            rgb_rpc, alpha_rpc, _depth_rpc = renderer._render_cuda(
+                centers=field_rpc["centers"],
+                opacity=field_rpc["opacity"],
+                scale=field_rpc["scale"],
+                rotation=field_rpc["rotation"],
+                rgb=field_rpc["rgb"],
+                cam=cam_rpc,
+                image_hw=image_hw,
+            )
+            rgb_point, alpha_point, _depth_point = renderer._render_cuda(
+                centers=field_point["centers"],
+                opacity=field_point["opacity"],
+                scale=field_point["scale"],
+                rotation=field_point["rotation"],
+                rgb=field_point["rgb"],
+                cam=cam_point,
+                image_hw=image_hw,
+            )
+
+        out_rpc = save_dir / "render_rpc_field.png"
+        out_point = save_dir / "render_point_field.png"
+        save_rgb_tensor(out_rpc, rgb_rpc)
+        save_rgb_tensor(out_point, rgb_point)
+
+        results["render_3dgs"] = {
+            "rpc_rgb": str(out_rpc),
+            "point_rgb": str(out_point),
+            "num_gaussians_rpc": int(field_rpc["num"].item()),
+            "num_gaussians_point": int(field_point["num"].item()),
+            "alpha_cov_rpc": float((alpha_rpc > 1e-4).to(torch.float32).mean().item()),
+            "alpha_cov_point": float((alpha_point > 1e-4).to(torch.float32).mean().item()),
+            "render_hw": [int(image_hw[0]), int(image_hw[1])],
+        }
+
+    report_path = save_dir / "inference_report.json"
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+>>>>>>> main
     results["report_path"] = str(report_path)
     return results
 
