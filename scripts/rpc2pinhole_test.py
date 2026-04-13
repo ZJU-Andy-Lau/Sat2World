@@ -56,6 +56,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-heights", type=int, default=100)
     p.add_argument("--height-low", type=float, default=-20.0)
     p.add_argument("--height-high", type=float, default=80.0)
+    p.add_argument("--f", type=float, default=100000.0)
+    p.add_argument("--use_part_b", action="store_true")
     p.add_argument("--random-test-points", type=int, default=100)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--work-dir", type=str, default="")
@@ -818,15 +820,18 @@ def main() -> None:
     print(_stats_t("part1_obj_y", obj_pts_part1[:, 1] if obj_pts_part1.numel() > 0 else torch.empty((0,), device=device)))
     print(_stats_t("part1_obj_h", obj_pts_part1[:, 2] if obj_pts_part1.numel() > 0 else torch.empty((0,), device=device)))
 
-    _world2_x, _world2_y, _world2_h, obj_pts_part2, img_pts_part2 = build_second_world_grid_and_correspondence(
-        rpc=rpc,
-        world1_x=world1_x,
-        world1_y=world1_y,
-        h_3d=h_3d,
-        scene_center_yx=scene_center_yx,
-        image_h=h,
-        image_w=w,
-    )
+    if args.use_part_b:
+        _world2_x, _world2_y, _world2_h, obj_pts_part2, img_pts_part2 = build_second_world_grid_and_correspondence(
+            rpc=rpc,
+            world1_x=world1_x,
+            world1_y=world1_y,
+            h_3d=h_3d,
+            scene_center_yx=scene_center_yx,
+            image_h=h,
+            image_w=w,
+        )
+    else:
+        obj_pts_part2, img_pts_part2 = torch.tensor([],dtype=obj_pts_part1.dtype,device=obj_pts_part1.device),torch.tensor([],dtype=obj_pts_part1.dtype,device=obj_pts_part1.device)
     obj_pts, img_pts = merge_correspondences(
         obj_a=obj_pts_part1,
         img_a=img_pts_part1,
@@ -845,7 +850,7 @@ def main() -> None:
         img_pts=img_pts,
         image_h=h,
         image_w=w,
-        f=1.0e5,
+        f=args.f,
         use_ransac=True,
         seed=args.seed,
     )
