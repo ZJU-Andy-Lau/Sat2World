@@ -161,6 +161,7 @@ def build_image_space_3d_grid(
     return gv, gu, gh
 
 
+<<<<<<< codex/add-rpc2pinhole_test.py-for-feasibility-experiment-460mk8
 def build_object_space_3d_grid_from_xy_range(
     x_min: float,
     x_max: float,
@@ -181,6 +182,8 @@ def build_object_space_3d_grid_from_xy_range(
     return gx, gy, gh
 
 
+=======
+>>>>>>> main
 def print_tensor_stats(name: str, t: torch.Tensor) -> None:
     t_cpu = t.detach().cpu()
     print(
@@ -313,8 +316,12 @@ def fit_pinhole_fixed_center(
 
     fx0 = max(abs(float(K0[0, 0])), 10.0)
     fy0 = max(abs(float(K0[1, 1])), 10.0)
+<<<<<<< codex/add-rpc2pinhole_test.py-for-feasibility-experiment-460mk8
     f0 = max(10.0, 0.5 * (fx0 + fy0))
     x0 = np.concatenate([rvec0, C0, np.array([np.log(f0)], dtype=np.float64)], axis=0)
+=======
+    x0 = np.concatenate([rvec0, C0, np.array([np.log(fx0), np.log(fy0)], dtype=np.float64)], axis=0)
+>>>>>>> main
 
     z_eps = 1e-6
     lam_depth = 1.0
@@ -322,6 +329,7 @@ def fit_pinhole_fixed_center(
     min_depth = 1e-2
     logger = FitLogger(print_every=print_every)
 
+<<<<<<< codex/add-rpc2pinhole_test.py-for-feasibility-experiment-460mk8
     def unpack(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
         rvec = theta[0:3]
         C = theta[3:6]
@@ -331,6 +339,18 @@ def fit_pinhole_fixed_center(
     def residual(theta: np.ndarray) -> np.ndarray:
         rvec, C, f = unpack(theta)
         pred_uv, z = project_points(xyz, rvec, C, f, f, cx_fix, cy_fix, z_eps=z_eps)
+=======
+    def unpack(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
+        rvec = theta[0:3]
+        C = theta[3:6]
+        fx = float(np.exp(np.clip(theta[6], np.log(10.0), np.log(1e6))))
+        fy = float(np.exp(np.clip(theta[7], np.log(10.0), np.log(1e6))))
+        return rvec, C, fx, fy
+
+    def residual(theta: np.ndarray) -> np.ndarray:
+        rvec, C, fx, fy = unpack(theta)
+        pred_uv, z = project_points(xyz, rvec, C, fx, fy, cx_fix, cy_fix, z_eps=z_eps)
+>>>>>>> main
         data_res = (pred_uv - uv).reshape(-1)
 
         # 深度屏障，抑制 z<=0
@@ -347,8 +367,13 @@ def fit_pinhole_fixed_center(
             all_res = np.nan_to_num(all_res, nan=1e6, posinf=1e6, neginf=-1e6)
         return all_res
 
+<<<<<<< codex/add-rpc2pinhole_test.py-for-feasibility-experiment-460mk8
     lb = np.array([-2 * np.pi, -2 * np.pi, -2 * np.pi, -1e8, -1e8, -1e8, np.log(10.0)], dtype=np.float64)
     ub = np.array([2 * np.pi, 2 * np.pi, 2 * np.pi, 1e8, 1e8, 1e8, np.log(1e6)], dtype=np.float64)
+=======
+    lb = np.array([-2 * np.pi, -2 * np.pi, -2 * np.pi, -1e8, -1e8, -1e8, np.log(10.0), np.log(10.0)], dtype=np.float64)
+    ub = np.array([2 * np.pi, 2 * np.pi, 2 * np.pi, 1e8, 1e8, 1e8, np.log(1e6), np.log(1e6)], dtype=np.float64)
+>>>>>>> main
 
     t0 = time.perf_counter()
     opt = scipy.optimize.least_squares(
@@ -363,14 +388,23 @@ def fit_pinhole_fixed_center(
     )
     fit_elapsed = time.perf_counter() - t0
 
+<<<<<<< codex/add-rpc2pinhole_test.py-for-feasibility-experiment-460mk8
     rvec, C, f = unpack(opt.x)
     pred_uv, z = project_points(xyz, rvec, C, f, f, cx_fix, cy_fix, z_eps=z_eps)
+=======
+    rvec, C, fx, fy = unpack(opt.x)
+    pred_uv, z = project_points(xyz, rvec, C, fx, fy, cx_fix, cy_fix, z_eps=z_eps)
+>>>>>>> main
     met = reproj_metrics(pred_uv - uv)
     pos_ratio = float(np.mean(z > z_eps))
 
     R = scipy.spatial.transform.Rotation.from_rotvec(rvec).as_matrix()
     t = -R @ C
+<<<<<<< codex/add-rpc2pinhole_test.py-for-feasibility-experiment-460mk8
     K = np.array([[f, 0.0, cx_fix], [0.0, f, cy_fix], [0.0, 0.0, 1.0]], dtype=np.float64)
+=======
+    K = np.array([[fx, 0.0, cx_fix], [0.0, fy, cy_fix], [0.0, 0.0, 1.0]], dtype=np.float64)
+>>>>>>> main
     w2c = np.eye(4, dtype=np.float64)
     w2c[:3, :3] = R
     w2c[:3, 3] = t
@@ -379,7 +413,11 @@ def fit_pinhole_fixed_center(
     print(f"optimizer.success={bool(opt.success)}")
     print(f"optimizer.message={opt.message}")
     print(f"nfev={int(opt.nfev)} elapsed={fit_elapsed:.3f}s")
+<<<<<<< codex/add-rpc2pinhole_test.py-for-feasibility-experiment-460mk8
     print(f"f={f:.6f} (fx=fy), cx={cx_fix:.6f}, cy={cy_fix:.6f}, skew=0")
+=======
+    print(f"fx={fx:.6f}, fy={fy:.6f}, cx={cx_fix:.6f}, cy={cy_fix:.6f}, skew=0")
+>>>>>>> main
     print(
         "reproj: rmse={:.6f}, p50={:.6f}, p95={:.6f}, p99={:.6f}, max={:.6f}, pos_depth_ratio={:.4f}".format(
             met["rmse"], met["p50"], met["p95"], met["p99"], met["pmax"], pos_ratio
@@ -397,8 +435,13 @@ def fit_pinhole_fixed_center(
     return FitResult(
         K=K,
         w2c=w2c,
+<<<<<<< codex/add-rpc2pinhole_test.py-for-feasibility-experiment-460mk8
         fx=float(f),
         fy=float(f),
+=======
+        fx=float(fx),
+        fy=float(fy),
+>>>>>>> main
         cx=float(cx_fix),
         cy=float(cy_fix),
         rmse=met["rmse"],
@@ -628,6 +671,7 @@ def main() -> None:
     if not bool(finite.any()):
         raise RuntimeError("物方网格全为无效点")
 
+<<<<<<< codex/add-rpc2pinhole_test.py-for-feasibility-experiment-460mk8
     xyz_a = xyz_flat[finite].detach().cpu().numpy().astype(np.float64)
     uv_a = torch.stack([u_flat, v_flat], dim=-1)[finite].detach().cpu().numpy().astype(np.float64)
 
@@ -678,6 +722,13 @@ def main() -> None:
     print(
         f"partA={xyz_a.shape[0]}, partB_raw={xyz_b_all.shape[0]}, partB_valid={xyz_b.shape[0]}, total={xyz.shape[0]}, partA_valid_ratio={float(finite.float().mean().item()):.6f}"
     )
+=======
+    xyz = xyz_flat[finite].detach().cpu().numpy().astype(np.float64)
+    uv = torch.stack([u_flat, v_flat], dim=-1)[finite].detach().cpu().numpy().astype(np.float64)
+
+    print("\n========== 物方网格信息 ==========")
+    print(f"xyz_valid_shape={xyz.shape}, valid_ratio={float(finite.float().mean().item()):.6f}")
+>>>>>>> main
     print(
         "x[min,max]=[{:.6f},{:.6f}] y[min,max]=[{:.6f},{:.6f}] h[min,max]=[{:.6f},{:.6f}]".format(
             float(xyz[:, 0].min()),
