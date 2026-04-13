@@ -231,7 +231,11 @@ def decompose_projection(P: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndar
     K = K / max(K[2, 2], 1e-12)
     _, _, vh = np.linalg.svd(P)
     C_h = vh[-1]
-    C = C_h[:3] / max(C_h[3], 1e-12)
+    # SVD 零空间向量只在整体符号上确定（v 与 -v 等价）。
+    # 反齐次化时必须保留分母符号，避免 w<0 被错误夹成 +eps 导致相机中心数值爆炸。
+    w = float(C_h[3])
+    w_den = math.copysign(max(abs(w), 1e-12), w if w != 0.0 else 1.0)
+    C = C_h[:3] / w_den
     return K, R, C
 
 
