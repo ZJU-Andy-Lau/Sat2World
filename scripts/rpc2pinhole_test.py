@@ -67,7 +67,7 @@ class FitLogger:
         self.history.append(rec)
         if self.eval_count == 1 or self.eval_count % self.print_every == 0:
             print(
-                "[fit][eval={:04d}] rmse={:.6f} p50={:.6f} p95={:.6f} p99={:.6f} max={:.6f} pos_depth={:.4f}".format(
+                "[fit][eval={:04d}] rmse={:.6f} p50={:.6f} p95={:.6f} p99={:.6f} max={:.6f} pos_depth={:.4f} f={:.4f} C0={:.4f} C1={:.4f} C2={:.4f}".format(
                     self.eval_count,
                     metrics["rmse"],
                     metrics["p50"],
@@ -75,6 +75,10 @@ class FitLogger:
                     metrics["p99"],
                     metrics["pmax"],
                     metrics["pos_ratio"],
+                    metrics["f"],
+                    metrics['C0'],
+                    metrics['C1'],
+                    metrics['C2'],
                 ),
                 flush=True,
             )
