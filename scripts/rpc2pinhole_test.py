@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--height-low", type=float, default=-20.0)
     p.add_argument("--height-high", type=float, default=80.0)
     p.add_argument("--f", type=float, default=100000.0)
-    p.add_argument("--use_part_b", type=bool, action="store_true")
+    p.add_argument("--use_part_b", action="store_true")
     p.add_argument("--random-test-points", type=int, default=100)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--work-dir", type=str, default="")
