@@ -62,24 +62,8 @@ def _rpc_linesamp_to_world(
     return x.view(*shape), y.view(*shape), hh.view(*shape)
 
 
-def _rpc_world_to_linesamp(
-    rpc: Any,
-    x_3d: torch.Tensor,
-    y_3d: torch.Tensor,
-    h_3d: torch.Tensor,
-    scene_center_yx: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    shape = x_3d.shape
-    x = x_3d.reshape(-1).to(dtype=torch.double, device=rpc.device)
-    y = y_3d.reshape(-1).to(dtype=torch.double, device=rpc.device)
-    hh = h_3d.reshape(-1).to(dtype=torch.double, device=rpc.device)
-    center = scene_center_yx.to(dtype=torch.double, device=rpc.device)
-    scale = torch.ones_like(center)
-    line, samp = rpc.RPC_XY2LINESAMP(x_in=x, y_in=y, h_in=hh, output_type="tensor", xy_center=center, xy_scale=scale)
-    return line.view(*shape), samp.view(*shape), hh.view(*shape)
 
-
-def _build_first_correspondence(
+def _build_correspondence(
     line_3d: torch.Tensor,
     samp_3d: torch.Tensor,
     world1_x: torch.Tensor,
@@ -102,55 +86,6 @@ def _build_first_correspondence(
     img = torch.stack([samp_3d[valid], line_3d[valid]], dim=-1)
     return obj, img
 
-
-def _build_second_correspondence(
-    rpc: Any,
-    world1_x: torch.Tensor,
-    world1_y: torch.Tensor,
-    h_3d: torch.Tensor,
-    scene_center_yx: torch.Tensor,
-    image_h: int,
-    image_w: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    ny, nx, nz = world1_x.shape
-    finite_xy = torch.isfinite(world1_x) & torch.isfinite(world1_y)
-    if not bool(finite_xy.any()):
-        raise RuntimeError("world1_x/world1_y have no finite values")
-    x_min = float(world1_x[finite_xy].min().item())
-    x_max = float(world1_x[finite_xy].max().item())
-    y_min = float(world1_y[finite_xy].min().item())
-    y_max = float(world1_y[finite_xy].max().item())
-    x_1d = torch.linspace(x_min, x_max, steps=nx, device=world1_x.device, dtype=torch.double)
-    y_1d = torch.linspace(y_min, y_max, steps=ny, device=world1_y.device, dtype=torch.double)
-    y_2d, x_2d = torch.meshgrid(y_1d, x_1d, indexing="ij")
-    world2_x = x_2d.unsqueeze(-1).expand(ny, nx, nz).contiguous()
-    world2_y = y_2d.unsqueeze(-1).expand(ny, nx, nz).contiguous()
-    world2_h = h_3d.clone()
-    line2, samp2, _ = _rpc_world_to_linesamp(
-        rpc=rpc,
-        x_3d=world2_x,
-        y_3d=world2_y,
-        h_3d=world2_h,
-        scene_center_yx=scene_center_yx,
-    )
-    in_frame = (
-        torch.isfinite(line2)
-        & torch.isfinite(samp2)
-        & (line2 >= 0.0)
-        & (line2 < float(image_h))
-        & (samp2 >= 0.0)
-        & (samp2 < float(image_w))
-    )
-    obj = torch.stack([world2_x[in_frame], world2_y[in_frame], world2_h[in_frame]], dim=-1)
-    img = torch.stack([samp2[in_frame], line2[in_frame]], dim=-1)
-    return obj, img
-
-
-def _merge_correspondences(obj_a: torch.Tensor, img_a: torch.Tensor, obj_b: torch.Tensor, img_b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    obj = torch.cat([obj_a, obj_b], dim=0)
-    img = torch.cat([img_a, img_b], dim=0)
-    valid = torch.isfinite(obj).all(dim=-1) & torch.isfinite(img).all(dim=-1)
-    return obj[valid], img[valid]
 
 
 def _project_pinhole(K: np.ndarray, R: np.ndarray, t: np.ndarray, obj: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -257,7 +192,7 @@ def fit_view_pinhole_from_rpc2(
         h_3d=h_3d,
         scene_center_yx=scene_center,
     )
-    obj1, img1 = _build_first_correspondence(
+    obj, img = _build_correspondence(
         line_3d=line_3d,
         samp_3d=samp_3d,
         world1_x=world1_x,
@@ -266,16 +201,7 @@ def fit_view_pinhole_from_rpc2(
         image_h=h,
         image_w=w,
     )
-    obj2, img2 = _build_second_correspondence(
-        rpc=rpc,
-        world1_x=world1_x,
-        world1_y=world1_y,
-        h_3d=h_3d,
-        scene_center_yx=scene_center,
-        image_h=h,
-        image_w=w,
-    )
-    obj, img = _merge_correspondences(obj1, img1, obj2, img2)
+
     K, R, t, init_m, ref_m, inlier_mask = _fit_pnp(obj, img, image_h=h, image_w=w, cfg=cfg)
 
     w2c = np.eye(4, dtype=np.float64)
@@ -283,9 +209,7 @@ def fit_view_pinhole_from_rpc2(
     w2c[:3, 3:] = t
     diag = {
         "method": "rpc2pinhole",
-        "correspondence_part1": int(obj1.shape[0]),
-        "correspondence_part2": int(obj2.shape[0]),
-        "correspondence_merged": int(obj.shape[0]),
+        "correspondence": int(obj.shape[0]),
         "inlier_count": int(inlier_mask.sum()),
         "inlier_ratio": float(inlier_mask.mean()),
         "init_metrics": init_m,
