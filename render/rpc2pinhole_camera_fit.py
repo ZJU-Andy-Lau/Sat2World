@@ -301,8 +301,8 @@ def fit_view_pinhole_from_rpc2(
         },
     }
     return VirtualPinholeCamera(
-        K=torch.from_numpy(K).to(torch.float32, device=dev),
-        w2c=torch.from_numpy(w2c).to(torch.float32, device=dev),
+        K=torch.from_numpy(K).to(dtype=torch.float32, device=dev),
+        w2c=torch.from_numpy(w2c).to(dtype=torch.float32, device=dev),
         fit_p50=float(ref_m["p50"]),
         fit_p95=float(ref_m["p95"]),
         fit_max=float(ref_m["max"]),
