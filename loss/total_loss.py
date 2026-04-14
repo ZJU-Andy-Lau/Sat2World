@@ -375,6 +375,7 @@ class RPCAnySplatTrainingObjective:
                 l_render_rpc, p_render_rpc = self.render_rpc(render_outputs["rpc"])
             if "point" in render_outputs:
                 l_render_point, p_render_point = self.render_point(render_outputs["point"])
+        l_ssim = 0.5 * (p_render_rpc.get("render_ssim_loss", zero) + p_render_point.get("render_ssim_loss", zero))
 
         total = (
             weights["lambda_affine_grid"] * l_aff_grid
@@ -413,6 +414,7 @@ class RPCAnySplatTrainingObjective:
             "loss_gaussian_scale_reg": l_scale,
             "loss_render_rpc": l_render_rpc,
             "loss_render_point": l_render_point,
+            "loss_ssim": l_ssim,
             "metric_affine_grid_error_px_mean": p_aff_grid.get("affine_grid_error_px_mean", zero),
             "metric_affine_pair_error_px_mean": p_aff_pair.get("affine_pair_error_px_mean", zero),
             "metric_ref_affine_identity_l2": p_aff_ref.get("ref_affine_identity_l2", zero),

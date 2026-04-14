@@ -251,6 +251,7 @@ class GeometryPretrainObjective:
             "loss_gaussian_scale_reg": zero,
             "loss_render_rpc": zero,
             "loss_render_point": zero,
+            "loss_ssim": zero,
         }
 
         aux_dict: dict[str, Any] = {
