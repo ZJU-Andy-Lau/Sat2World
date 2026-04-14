@@ -475,6 +475,9 @@ class Trainer:
             lh = logs.get("loss_height", None)
             lhrel = logs.get("loss_height_rel", None)
             lp = logs.get("loss_point", None)
+            lnp = logs.get("loss_normal_point", None)
+            lnce = logs.get("loss_feature_nce", None)
+            lssim = logs.get("loss_ssim", None)
             if lt is not None and lag is not None and lap is not None and lh is not None and lhrel is not None and lp is not None:
                 loss_sums["loss_total"] += float(lt)
                 loss_sums["loss_affine_grid"] += float(lag)
@@ -498,6 +501,9 @@ class Trainer:
                     f"l_h_abs={float(lh) if lh is not None else float('nan'):.6f} "
                     f"l_h_rel={float(lhrel) if lhrel is not None else float('nan'):.6f} "
                     f"l_pt={float(lp) if lp is not None else float('nan'):.6f} "
+                    f"l_np={float(lnp) if lnp is not None else float('nan'):.6f} "
+                    f"l_nce={float(lnce) if lnce is not None else float('nan'):.6f} "
+                    f"l_ssim={float(lssim) if lssim is not None else float('nan'):.6f} "
                     f"lr={lr:.2e} "
                     f"time={self._format_hhmmss(elapsed)} "
                     f"eta={self._format_hhmmss(eta)}"
@@ -558,6 +564,31 @@ class Trainer:
 
         cur = float(agg.get(self.best_metric_name, agg.get("loss_total", float("inf"))))
         better = (cur < self.best_metric) if self.best_mode == "min" else (cur > self.best_metric)
+        if is_main_process():
+            lt = float(agg.get("loss_total", float("nan")))
+            lag = float(agg.get("loss_affine_grid", float("nan")))
+            lap = float(agg.get("loss_affine_pair", float("nan")))
+            lh = float(agg.get("loss_height", float("nan")))
+            lhrel = float(agg.get("loss_height_rel", float("nan")))
+            lp = float(agg.get("loss_point", float("nan")))
+            lnp = float(agg.get("loss_normal_point", float("nan")))
+            lnce = float(agg.get("loss_feature_nce", float("nan")))
+            lssim = float(agg.get("loss_ssim", float("nan")))
+            tag = " [best]" if better else ""
+            print(
+                "[val] "
+                f"epoch={self.epoch} gstep={self.global_step} "
+                f"l_tot={lt:.6f} "
+                f"l_ag={lag:.6f} "
+                f"l_ap={lap:.6f} "
+                f"l_h_abs={lh:.6f} "
+                f"l_h_rel={lhrel:.6f} "
+                f"l_pt={lp:.6f} "
+                f"l_np={lnp:.6f} "
+                f"l_nce={lnce:.6f} "
+                f"l_ssim={lssim:.6f}"
+                f"{tag}"
+            )
         if better:
             self.best_metric = cur
             self._save_best_checkpoint()
