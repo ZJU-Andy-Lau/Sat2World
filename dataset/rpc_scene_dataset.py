@@ -78,6 +78,7 @@ class RPCSceneDataset(Dataset):
         fit_pinhole_in_dataset: Optional[bool] = None,
         fit_pinhole_cfg: Optional[Mapping[str, Any]] = None,
         fit_pinhole_keep_diagnostics: bool = False,
+        fixed_eval_randomness: bool = True,
     ) -> None:
         super().__init__()
         mode = mode.lower()
@@ -124,6 +125,9 @@ class RPCSceneDataset(Dataset):
         self.anchors_per_view_per_sample = int(anchors_per_view_per_sample)
         self.fit_pinhole_in_dataset = bool(self.mode == "train") if fit_pinhole_in_dataset is None else bool(fit_pinhole_in_dataset)
         self.fit_pinhole_keep_diagnostics = bool(fit_pinhole_keep_diagnostics)
+        # 验证/测试默认使用“随机但固定”的样本生成策略：
+        # 仅由 (base_seed, scene_id, index) 决定，跨 epoch 保持不变，避免评估协议抖动。
+        self.fixed_eval_randomness = bool(fixed_eval_randomness)
         if fit_pinhole_cfg is None:
             self.fit_pinhole_cfg = RPC2PinholeFitCfg()
         else:
@@ -363,7 +367,8 @@ class RPCSceneDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         scene_record = self._scene_from_index(index)
         scene_id = scene_record.scene_id
-        rng = make_deterministic_rng(self.base_seed, self.epoch, scene_id, index)
+        rng_epoch = self.epoch if (self.mode == "train" or (not self.fixed_eval_randomness)) else 0
+        rng = make_deterministic_rng(self.base_seed, rng_epoch, scene_id, index)
 
         selected_views, ref_view_idx = self._select_views(scene_record, rng)
 
