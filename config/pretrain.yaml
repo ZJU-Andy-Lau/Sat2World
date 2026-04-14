@@ -1,8 +1,8 @@
 system:
   project_name: Sat2World
-  experiment_name: geom_pretrain
-  work_dir: work_dirs/sat2world_geom_pretrain
-  output_dir: work_dirs/sat2world_geom_pretrain
+  experiment_name: default_exp
+  work_dir: work_dirs/pretrain_0409
+  output_dir: work_dirs/pretrain_0409
   seed: 42
   deterministic: false
   cudnn_benchmark: true
@@ -11,21 +11,21 @@ system:
   compile_model: false
   ddp_backend: nccl
   auto_resume: true
-  checkpoint_load_model_only: false
-  checkpoint_model_strict: false
+  checkpoint_load_model_only: true
+  checkpoint_model_strict: true
   resume_path: ""
   checkpoint_path: ""
   eval_only: false
 
 data:
   train:
-    root: train_data
-    max_view_num: 4
-    min_view_num: 2
+    root: ./data/JAX_train
+    max_view_num: 6
+    min_view_num: 3
     samples_per_scene: 10
-    min_views: 2
+    min_views: 3
     apply_perturbation: true
-    synthetic_perturbation_in_eval: false
+    synthetic_perturbation_in_eval: true
     cache_rpc: true
     cache_image: false
     cache_height: false
@@ -37,18 +37,18 @@ data:
     fit_pinhole_in_dataset: false
     fit_pinhole_keep_diagnostics: false
     perturb_cfg:
-      tx_range: [-2.0, 2.0]
-      ty_range: [-2.0, 2.0]
-      scale_range: [-0.0005, 0.0005]
-      shear_range: [-0.0005, 0.0005]
+      tx_range: [ -20.0, 20.0 ]
+      ty_range: [ -20.0, 20.0 ]
+      scale_range: [ -0.0005, 0.0005 ]
+      shear_range: [ -0.0005, 0.0005 ]
   val:
-    root: test_data
-    max_view_num: 4
-    min_view_num: 2
+    root: ./data/JAX_val
+    max_view_num: 6
+    min_view_num: 3
     samples_per_scene: 1
     min_views: 2
-    apply_perturbation: false
-    synthetic_perturbation_in_eval: false
+    apply_perturbation: true
+    synthetic_perturbation_in_eval: true
     cache_rpc: true
     cache_image: false
     cache_height: false
@@ -60,19 +60,19 @@ data:
     fit_pinhole_in_dataset: false
     fit_pinhole_keep_diagnostics: false
     perturb_cfg:
-      tx_range: [-2.0, 2.0]
-      ty_range: [-2.0, 2.0]
-      scale_range: [-0.0005, 0.0005]
-      shear_range: [-0.0005, 0.0005]
+      tx_range: [ -20.0, 20.0 ]
+      ty_range: [ -20.0, 20.0 ]
+      scale_range: [ -0.0005, 0.0005 ]
+      shear_range: [ -0.0005, 0.0005 ]
   test:
-    root: test_data
+    root: ./data/JAX_val
     crop_size: 512
   loader:
     batch_size: 1
     val_batch_size: 1
     num_workers: 4
     pin_memory: true
-    persistent_workers: false
+    persistent_workers: true
     prefetch_factor: 2
     drop_last: true
 
@@ -81,7 +81,7 @@ geometry:
   net_dtype: float32
 
 model:
-  dino_weight_path: "path/to/dinov3_vitl16_pretrain.pth"
+  dino_weight_path: "./weights/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
   pretrained: true
   freeze_backbone: true
   patch_size: 16
@@ -90,15 +90,14 @@ model:
   fusion_dim: 1024
   encoder_depth: 24
   encoder_num_scene_tokens: 4
-  nce_layer_index: 5
   intermediate_layer_idx: [5, 11, 17, 23]
   dense_pos_embed: true
   dense_down_ratio: 1
   dense_frames_chunk_size: 8
   task_adapter_depth: 2
+  nce_layer_index: 5
   nce_projector_dim: 256
   nce_projector_hidden_dim: 512
-  encoder_num_heads: 8
   encoder_ffn_ratio: 4.0
   encoder_dropout: 0.0
   encoder_aa_order: [frame, global]
@@ -111,19 +110,19 @@ model:
   encoder_rope_freq: 100.0
   encoder_drop_path_rate: 0.0
   encoder_layerscale_init_values: 0.01
-  affine_diag_scale: 0.05
-  affine_offdiag_scale: 0.05
-  affine_trans_scale: 4.0
+  affine_diag_scale: 0.01
+  affine_offdiag_scale: 0.01
+  affine_trans_scale: 10.0
   height_bins: 33
   height_bin_size: 1.0
   height_fine_range: 0.5
   point_bins: 33
-  point_bin_size_xy: 2.0
+  point_bin_size_xy: 0.1
   point_bin_size_z: 1.0
-  point_fine_range_xy: 1.0
+  point_fine_range_xy: 0.05
   point_fine_range_z: 0.5
-  center_downsample_stage_steps: [0, 20000, 60000]
-  center_downsample_factors: [4, 2, 1]
+  center_downsample_stage_steps: [0,100,200]
+  center_downsample_factors: [4,2,1]
   enable_gaussian_branch: false
   sh_dim: 48
   gaussian_scale_epsilon: 1.0e-4
@@ -135,8 +134,8 @@ loss:
   lambda_affine_reg: 0.1
   lambda_affine_ref: 0.1
   lambda_height: 1.0
-  height_abs_keep_steps: 5000
-  lambda_height_rel: 0.5
+  height_abs_keep_steps: 1000
+  lambda_height_rel: 1.0
   lambda_height_rel_consistency: 1.0
   lambda_height_rel_cycle: 1.0
   height_rel_beta: 1.0
@@ -145,14 +144,14 @@ loss:
   height_rel_sample_from_valid_only: true
   lambda_point: 1.0
   lambda_point_pair: 0.2
-  lambda_normal_height: 0.2
-  lambda_normal_point: 0.2
-  lambda_feature_nce: 0.1
+  lambda_normal_height: 10
+  lambda_normal_point: 10
   normal_w_cos: 1.0
   normal_w_l1: 0.5
   normal_eps: 1.0e-6
   normal_sign_invariant: true
   normal_detach_gt: true
+  lambda_feature_nce: 1.0
   feature_nce_temperature: 0.1
   feature_nce_max_pairs: 4096
   point_pair_grid_h: 64
@@ -167,18 +166,18 @@ loss:
 
 optim:
   type: adamw
-  base_lr: 1.0e-4
+  base_lr: 5.0e-5
   backbone_lr_mult: 0.5
   weight_decay: 0.01
   betas: [0.9, 0.999]
   eps: 1.0e-8
   scheduler: warmup_cosine
-  warmup_steps: 1000
-  max_steps: 100000
-  min_lr_ratio: 0.05
+  warmup_steps: 500
+  max_steps: 10000
+  min_lr_ratio: 0.01
 
 train:
-  max_epochs: 50
+  max_epochs: 200
   accumulate_steps: 1
   grad_clip_norm: 1.0
   amp_dtype: fp16
@@ -186,9 +185,9 @@ train:
   enable_render_train: false
   enable_render_val: false
   skip_nan_batch: true
-  log_interval: 20
-  hist_interval: 200
-  vis_interval: 500
+  log_interval: 1
+  hist_interval: 10
+  vis_interval: 50
   val_interval: 1000
   ckpt_interval: 1000
   save_every_epoch: true
@@ -204,7 +203,7 @@ train:
 logging:
   tensorboard:
     enable: true
-    log_dir: work_dirs/sat2world_geom_pretrain/tb
+    log_dir: work_dirs/pretrain_0409/tb
     enable_mesh: true
     image_max_views: 4
     max_pointcloud_points: 8192
@@ -214,7 +213,7 @@ logging:
     record_pointcloud: true
 
 checkpoint:
-  checkpoints_dir: work_dirs/sat2world_geom_pretrain/checkpoints
+  checkpoints_dir: work_dirs/pretrain_0409/checkpoints
   save_last: true
   save_best: true
   best_metric_name: loss_total
