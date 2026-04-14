@@ -18,13 +18,17 @@ import torch.nn.functional as F
 
 
 class ConvBlock(nn.Module):
-    """通用卷积块：Conv-BN-GELU。"""
+    """通用卷积块：Conv-Norm-GELU（默认 GroupNorm，避免小 batch 下 BN 统计不稳定）。"""
 
     def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, p: int = 1) -> None:
         super().__init__()
+        # 选择可整除的最大组数（上限 32），保证对任意通道数都可用。
+        groups = 32
+        while groups > 1 and (out_ch % groups != 0):
+            groups //= 2
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False),
-            nn.BatchNorm2d(out_ch),
+            nn.GroupNorm(groups, out_ch),
             nn.GELU(),
         )
 

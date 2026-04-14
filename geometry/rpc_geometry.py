@@ -87,7 +87,10 @@ class RPCGeometryOps:
             raise ValueError(f"affine_correction must be [2,3], got {tuple(affine_correction.shape)}")
 
         corrected = self.clone_rpc(rpc_obj)
-        corrected.Update_Adjust(affine_correction.detach().to(dtype=self.rpc_dtype, device=corrected.device))
+        # 保持 affine_correction 与上游计算图的梯度连接：
+        # 不再在此处 detach，确保依赖 corrected RPC 的损失（如 affine_pair/center/render_rpc）
+        # 可以把梯度回传到 affine_pred。
+        corrected.Update_Adjust(affine_correction.to(dtype=self.rpc_dtype, device=corrected.device))
         return corrected
 
     def apply_affine_correction_batch(
