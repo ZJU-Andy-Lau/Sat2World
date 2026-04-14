@@ -926,6 +926,11 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
     with slog.run("model_forward"):
         with torch.no_grad():
             outputs = model(batch)
+    
+    print("affine pred:")
+    print(outputs["affine_pred"])
+    print("affine_gt_forward")
+    print(batch["affine_gt_forward"])
 
     with slog.run("compute_affine_losses_and_stats"):
         grid_loss_fn, pair_loss_fn = build_affine_losses(args, geometry_ops=model.rpc_ops)
