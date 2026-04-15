@@ -485,6 +485,7 @@ class Trainer:
             lh = logs.get("loss_height", None)
             lhrel = logs.get("loss_height_rel", None)
             lp = logs.get("loss_point", None)
+            lpp = logs.get("loss_point_pair", None)
             lnp = logs.get("loss_normal_point", None)
             lnce = logs.get("loss_feature_nce", None)
             lssim = logs.get("loss_ssim", None)
@@ -505,15 +506,16 @@ class Trainer:
                 print(
                     "[train] "
                     f"epoch={self.epoch} step={step_idx} gstep={self.global_step} "
-                    f"l_tot={float(lt) if lt is not None else float('nan'):.6f} "
-                    f"l_ag={float(lag) if lag is not None else float('nan'):.6f} "
-                    f"l_ap={float(lap) if lap is not None else float('nan'):.6f} "
-                    f"l_h_abs={float(lh) if lh is not None else float('nan'):.6f} "
-                    f"l_h_rel={float(lhrel) if lhrel is not None else float('nan'):.6f} "
-                    f"l_pt={float(lp) if lp is not None else float('nan'):.6f} "
-                    f"l_np={float(lnp) if lnp is not None else float('nan'):.6f} "
-                    f"l_nce={float(lnce) if lnce is not None else float('nan'):.6f} "
-                    f"l_ssim={float(lssim) if lssim is not None else float('nan'):.6f} "
+                    f"l_tot={float(lt) if lt is not None else float('nan'):.2f} "
+                    f"l_ag={float(lag) if lag is not None else float('nan'):.2f} "
+                    f"l_ap={float(lap) if lap is not None else float('nan'):.2f} "
+                    f"l_h_abs={float(lh) if lh is not None else float('nan'):.2f} "
+                    f"l_h_rel={float(lhrel) if lhrel is not None else float('nan'):.2f} "
+                    f"l_pt={float(lp) if lp is not None else float('nan'):.2f} "
+                    f"l_pp={float(lpp) if lpp is not None else float('nan'):.2f} "
+                    f"l_np={float(lnp) if lnp is not None else float('nan'):.2f} "
+                    f"l_nce={float(lnce) if lnce is not None else float('nan'):.2f} "
+                    f"l_ssim={float(lssim) if lssim is not None else float('nan'):.2f} "
                     f"lr={lr:.2e} "
                     f"time={self._format_hhmmss(elapsed)} "
                     f"eta={self._format_hhmmss(eta)}"
@@ -537,12 +539,12 @@ class Trainer:
             print(
                 "[train][epoch_summary] "
                 f"epoch={self.epoch} "
-                f"l_tot={avg_total:.6f} "
-                f"l_ag={avg_ag:.6f} "
-                f"l_ap={avg_ap:.6f} "
-                f"l_h_abs={avg_h_abs:.6f} "
-                f"l_h_rel={avg_h_rel:.6f} "
-                f"l_pt={avg_pt:.6f}"
+                f"l_tot={avg_total:.2f} "
+                f"l_ag={avg_ag:.2f} "
+                f"l_ap={avg_ap:.2f} "
+                f"l_h_abs={avg_h_abs:.2f} "
+                f"l_h_rel={avg_h_rel:.2f} "
+                f"l_pt={avg_pt:.2f}"
             )
 
     def validate(self) -> dict[str, float]:
