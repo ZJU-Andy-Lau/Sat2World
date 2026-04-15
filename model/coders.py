@@ -79,7 +79,7 @@ class SymmetricBinScalarCoder(nn.Module):
 
 
 class HeightCoder(nn.Module):
-    """高程解码器：直接把网络输出解码为绝对高程。"""
+    """高程解码器：把有界残差解码为绝对高程。"""
 
     def __init__(self, cfg: SymmetricBinCoderCfg) -> None:
         """初始化 HeightCoder。"""
@@ -90,25 +90,27 @@ class HeightCoder(nn.Module):
         self,
         coarse_logits: torch.Tensor,
         fine_raw: torch.Tensor,
+        h_ref_map: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """解码绝对高程。
 
         参数:
             coarse_logits: [B,V,K,H,W]。
             fine_raw: [B,V,1,H,W]。
+            h_ref_map: [B,V,1,H,W]。
 
         返回:
             dict:
                 h_abs: [B,V,1,H,W]
-                h_coarse: [B,V,1,H,W]
-                h_fine: [B,V,1,H,W]
+                delta_h_coarse: [B,V,1,H,W]
+                delta_h_fine: [B,V,1,H,W]
         """
         residual, coarse, fine = self.scalar.decode(coarse_logits, fine_raw, channel_dim=2)
-        h_abs = residual.unsqueeze(2)
+        h_abs = h_ref_map + residual.unsqueeze(2)
         return {
             "h_abs": h_abs,
-            "h_coarse": coarse.unsqueeze(2),
-            "h_fine": fine.unsqueeze(2),
+            "delta_h_coarse": coarse.unsqueeze(2),
+            "delta_h_fine": fine.unsqueeze(2),
         }
 
 
