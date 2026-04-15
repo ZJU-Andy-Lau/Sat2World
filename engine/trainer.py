@@ -581,6 +581,7 @@ class Trainer:
             lh = float(agg.get("loss_height", float("nan")))
             lhrel = float(agg.get("loss_height_rel", float("nan")))
             lp = float(agg.get("loss_point", float("nan")))
+            lpp = float(agg.get("loss_point_pair", float("nan")))
             lnp = float(agg.get("loss_normal_point", float("nan")))
             lnce = float(agg.get("loss_feature_nce", float("nan")))
             lssim = float(agg.get("loss_ssim", float("nan")))
@@ -588,15 +589,16 @@ class Trainer:
             print(
                 "[val] "
                 f"epoch={self.epoch} gstep={self.global_step} "
-                f"l_tot={lt:.6f} "
-                f"l_ag={lag:.6f} "
-                f"l_ap={lap:.6f} "
-                f"l_h_abs={lh:.6f} "
-                f"l_h_rel={lhrel:.6f} "
-                f"l_pt={lp:.6f} "
-                f"l_np={lnp:.6f} "
-                f"l_nce={lnce:.6f} "
-                f"l_ssim={lssim:.6f}"
+                f"l_tot={lt:.2f} "
+                f"l_ag={lag:.2f} "
+                f"l_ap={lap:.2f} "
+                f"l_h_abs={lh:.2f} "
+                f"l_h_rel={lhrel:.2f} "
+                f"l_pt={lp:.2f} "
+                f"l_pp={lpp:.2f}"
+                f"l_np={lnp:.2f} "
+                f"l_nce={lnce:.2f} "
+                f"l_ssim={lssim:.2f}"
                 f"{tag}"
             )
         if better:
