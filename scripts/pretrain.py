@@ -262,6 +262,15 @@ def main() -> None:
     checkpoint_load_model_only = bool(system_cfg.get("checkpoint_load_model_only", False))
     checkpoint_model_strict = bool(system_cfg.get("checkpoint_model_strict", False))
 
+    # 新增：按 shape 部分加载模型参数
+    checkpoint_match_by_shape = bool(system_cfg.get("checkpoint_match_by_shape", False))
+    checkpoint_strip_prefixes = tuple(system_cfg.get("checkpoint_strip_prefixes", ["module."]))
+    checkpoint_ignore_prefixes = tuple(system_cfg.get("checkpoint_ignore_prefixes", []))
+    verbose_model_load = bool(system_cfg.get("verbose_model_load", True))
+
+    # 结构发生变化并启用按 shape 加载时，强制按“仅加载模型参数”处理
+    effective_load_model_only = bool(checkpoint_load_model_only or checkpoint_match_by_shape)
+
     if checkpoint_path:
         resume_path = checkpoint_path
     elif args.checkpoint:
@@ -282,20 +291,28 @@ def main() -> None:
         resume_state = resume_from_checkpoint(
             resume_path,
             model=model,
-            optimizer=None if checkpoint_load_model_only else optimizer,
-            scheduler=None if checkpoint_load_model_only else scheduler,
-            scaler=None if checkpoint_load_model_only else scaler,
+            optimizer=None if effective_load_model_only else optimizer,
+            scheduler=None if effective_load_model_only else scheduler,
+            scaler=None if effective_load_model_only else scaler,
             map_location="cpu",
             model_strict=checkpoint_model_strict,
-            load_model_only=checkpoint_load_model_only,
-            restore_rng=(not checkpoint_load_model_only),
+            load_model_only=effective_load_model_only,
+            restore_rng=(not effective_load_model_only),
+            model_match_by_shape=checkpoint_match_by_shape,
+            model_strip_prefixes=checkpoint_strip_prefixes,
+            model_ignore_prefixes=checkpoint_ignore_prefixes,
+            verbose_model_load=verbose_model_load,
         )
-        if checkpoint_load_model_only:
+
+        # 对“只加载模型参数”的场景，不把 checkpoint 的 epoch/step 等状态交给 Trainer
+        if effective_load_model_only:
             resume_state = None
         elif resume_state is not None:
             resume_state["resume_path"] = str(resume_path)
+
         if is_main_process() and monitor is not None:
-            monitor.log_text("events/resume", f"resume from {resume_path}", 0)
+            suffix = " (match_by_shape)" if checkpoint_match_by_shape else ""
+            monitor.log_text("events/resume", f"resume from {resume_path}{suffix}", 0)
 
     trainer_cfg = dict(cfg.get("train", {}))
     trainer_cfg["enable_render_train"] = False
