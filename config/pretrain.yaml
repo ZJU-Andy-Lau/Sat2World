@@ -11,6 +11,7 @@ system:
   compile_model: false
   ddp_backend: nccl
   auto_resume: true
+  checkpoint_match_by_shape: false
   checkpoint_load_model_only: true
   checkpoint_model_strict: true
   resume_path: ""

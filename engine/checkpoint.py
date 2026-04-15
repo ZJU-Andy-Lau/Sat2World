@@ -10,13 +10,14 @@ Checkpoint 保存/恢复工具。
 
 from __future__ import annotations
 
+import errno
 import os
 import random
 import tempfile
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
-import errno
 
 import numpy as np
 import torch
@@ -93,6 +94,159 @@ def _safe_unlink(path: Path, retries: int = 5, base_sleep_sec: float = 0.1) -> N
             time.sleep(base_sleep_sec * (2**i))
 
 
+def _strip_key_prefix(key: str, strip_prefixes: tuple[str, ...]) -> str:
+    """按顺序剥离 checkpoint key 的常见前缀，例如 'module.'。"""
+    for prefix in strip_prefixes:
+        if prefix and key.startswith(prefix):
+            return key[len(prefix) :]
+    return key
+
+
+def _format_shape(x: Any) -> tuple[int, ...] | None:
+    """把 tensor/parameter 的 shape 统一转成 tuple，非 tensor 返回 None。"""
+    if torch.is_tensor(x):
+        return tuple(int(v) for v in x.shape)
+    return None
+
+
+def load_state_dict_match_by_shape(
+    model: torch.nn.Module,
+    checkpoint_state_dict: dict[str, Any],
+    *,
+    strip_prefixes: tuple[str, ...] = ("module.",),
+    ignore_prefixes: tuple[str, ...] = (),
+    verbose: bool = True,
+    max_report_items: int = 50,
+) -> dict[str, Any]:
+    """只加载 key 存在且 shape 完全匹配的参数/缓冲区。
+
+    设计目标：
+    - 允许模型结构发生变化（增删模块、修改维度）后，仍复用旧 checkpoint 中能复用的部分；
+    - 对于同名但 shape 不匹配的层，直接跳过；
+    - 对于 checkpoint 中存在、当前模型中不存在的层，直接跳过；
+    - 返回详细报告，便于审计实际加载了哪些层。
+
+    参数:
+        model:
+            当前模型（可带 DDP 包装）。
+        checkpoint_state_dict:
+            checkpoint 中的 model state_dict。
+        strip_prefixes:
+            尝试剥离的 key 前缀，例如 DDP 常见的 "module."。
+        ignore_prefixes:
+            需要显式忽略的 key 前缀。
+        verbose:
+            是否打印摘要。
+        max_report_items:
+            打印时每类最多展示多少项，防止日志过长。
+
+    返回:
+        report:
+            {
+                "num_model_keys": int,
+                "num_ckpt_keys": int,
+                "num_loaded": int,
+                "loaded_keys": list[str],
+                "missing_keys": list[str],
+                "unexpected_keys": list[str],
+                "shape_mismatch": list[dict],
+                "ignored_keys": list[str],
+            }
+    """
+    model_ref = unwrap_model(model)
+    model_state = model_ref.state_dict()
+
+    filtered_state = OrderedDict()
+
+    loaded_keys: list[str] = []
+    unexpected_keys: list[str] = []
+    ignored_keys: list[str] = []
+    shape_mismatch: list[dict[str, Any]] = []
+
+    matched_model_keys: set[str] = set()
+
+    for ckpt_key, ckpt_val in checkpoint_state_dict.items():
+        norm_key = _strip_key_prefix(str(ckpt_key), strip_prefixes)
+
+        if any(norm_key.startswith(p) for p in ignore_prefixes):
+            ignored_keys.append(norm_key)
+            continue
+
+        if norm_key not in model_state:
+            unexpected_keys.append(norm_key)
+            continue
+
+        model_val = model_state[norm_key]
+
+        ckpt_shape = _format_shape(ckpt_val)
+        model_shape = _format_shape(model_val)
+
+        # 非 tensor 项通常不应出现在 state_dict 中；保守跳过
+        if ckpt_shape is None or model_shape is None:
+            unexpected_keys.append(norm_key)
+            continue
+
+        if ckpt_shape != model_shape:
+            shape_mismatch.append(
+                {
+                    "key": norm_key,
+                    "ckpt_shape": ckpt_shape,
+                    "model_shape": model_shape,
+                    "ckpt_dtype": str(getattr(ckpt_val, "dtype", "unknown")),
+                    "model_dtype": str(getattr(model_val, "dtype", "unknown")),
+                }
+            )
+            continue
+
+        filtered_state[norm_key] = ckpt_val
+        loaded_keys.append(norm_key)
+        matched_model_keys.add(norm_key)
+
+    missing_keys = [k for k in model_state.keys() if k not in matched_model_keys and not any(k.startswith(p) for p in ignore_prefixes)]
+
+    # 这里只对“已经筛过且 shape 匹配”的部分做真正加载
+    model_ref.load_state_dict(filtered_state, strict=False)
+
+    report = {
+        "num_model_keys": int(len(model_state)),
+        "num_ckpt_keys": int(len(checkpoint_state_dict)),
+        "num_loaded": int(len(loaded_keys)),
+        "loaded_keys": loaded_keys,
+        "missing_keys": missing_keys,
+        "unexpected_keys": unexpected_keys,
+        "shape_mismatch": shape_mismatch,
+        "ignored_keys": ignored_keys,
+    }
+
+    if verbose and is_main_process():
+        print(
+            "[checkpoint] partial model load by shape: "
+            f"loaded={len(loaded_keys)} / model_keys={len(model_state)} / ckpt_keys={len(checkpoint_state_dict)}",
+            flush=True,
+        )
+
+        if shape_mismatch:
+            print(f"[checkpoint] shape mismatches (showing up to {max_report_items}):", flush=True)
+            for item in shape_mismatch[:max_report_items]:
+                print(
+                    "  - {key}: ckpt={ckpt_shape}, model={model_shape}, "
+                    "ckpt_dtype={ckpt_dtype}, model_dtype={model_dtype}".format(**item),
+                    flush=True,
+                )
+
+        if unexpected_keys:
+            print(f"[checkpoint] unexpected ckpt keys (showing up to {max_report_items}):", flush=True)
+            for k in unexpected_keys[:max_report_items]:
+                print(f"  - {k}", flush=True)
+
+        if missing_keys:
+            print(f"[checkpoint] missing model keys (showing up to {max_report_items}):", flush=True)
+            for k in missing_keys[:max_report_items]:
+                print(f"  - {k}", flush=True)
+
+    return report
+
+
 def save_checkpoint(
     path: str | os.PathLike,
     *,
@@ -166,10 +320,36 @@ def load_checkpoint(
     map_location: str = "cpu",
     model_strict: bool = False,
     load_model_only: bool = False,
+    model_match_by_shape: bool = False,
+    model_strip_prefixes: tuple[str, ...] = ("module.",),
+    model_ignore_prefixes: tuple[str, ...] = (),
+    verbose_model_load: bool = True,
 ) -> dict[str, Any]:
     """加载 checkpoint 并恢复对象状态。"""
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
-    unwrap_model(model).load_state_dict(ckpt["model"], strict=bool(model_strict))
+
+    model_load_report = None
+
+    if bool(model_match_by_shape):
+        # 部分加载通常只适合“加载预训练模型参数”，不适合恢复优化器/调度器/scaler。
+        if not load_model_only:
+            if is_main_process():
+                print(
+                    "[checkpoint] model_match_by_shape=True, force load_model_only=True "
+                    "to avoid restoring optimizer/scheduler/scaler with changed model structure.",
+                    flush=True,
+                )
+            load_model_only = True
+
+        model_load_report = load_state_dict_match_by_shape(
+            model,
+            ckpt["model"],
+            strip_prefixes=tuple(model_strip_prefixes),
+            ignore_prefixes=tuple(model_ignore_prefixes),
+            verbose=bool(verbose_model_load),
+        )
+    else:
+        unwrap_model(model).load_state_dict(ckpt["model"], strict=bool(model_strict))
 
     if (not load_model_only) and optimizer is not None and ckpt.get("optimizer", None) is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -187,6 +367,8 @@ def load_checkpoint(
         "cfg": ckpt.get("cfg", {}),
         "extra_state": ckpt.get("extra_state", {}),
         "rng_state": ckpt.get("rng_state", None),
+        "model_load_report": model_load_report,
+        "load_model_only_effective": bool(load_model_only),
     }
 
 
@@ -218,8 +400,16 @@ def resume_from_checkpoint(
     model_strict: bool = False,
     load_model_only: bool = False,
     restore_rng: bool = True,
+    model_match_by_shape: bool = False,
+    model_strip_prefixes: tuple[str, ...] = ("module.",),
+    model_ignore_prefixes: tuple[str, ...] = (),
+    verbose_model_load: bool = True,
 ) -> dict[str, Any]:
     """恢复 checkpoint 并恢复随机状态。"""
+    if model_match_by_shape and not load_model_only:
+        load_model_only = True
+        restore_rng = False
+
     state = load_checkpoint(
         path,
         model=model,
@@ -229,6 +419,10 @@ def resume_from_checkpoint(
         map_location=map_location,
         model_strict=model_strict,
         load_model_only=load_model_only,
+        model_match_by_shape=model_match_by_shape,
+        model_strip_prefixes=model_strip_prefixes,
+        model_ignore_prefixes=model_ignore_prefixes,
+        verbose_model_load=verbose_model_load,
     )
     if restore_rng and (not load_model_only):
         restore_rng_state(state.get("rng_state", None))
