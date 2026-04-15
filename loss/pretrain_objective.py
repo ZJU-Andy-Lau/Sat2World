@@ -23,7 +23,7 @@ from loss.feature_nce_loss import FeatureInfoNCELoss, FeatureInfoNCELossCfg
 from loss.height_loss import HeightHuberLoss
 from loss.height_pair_loss import HeightPairwiseLossCfg, HeightPairwiseRelativeLoss
 from loss.normal_loss import PointNormalLoss, PointNormalLossCfg
-from loss.point_pair_loss import PointPairwiseConsistencyLoss, PointPairwiseLossCfg
+from loss.point_pair_loss import PointPairwiseConsistencyLoss, PointPairwiseLossCfg, PointReprojectionLoss
 from loss.point_loss import PointMapLoss
 
 
@@ -38,11 +38,12 @@ class GeometryPretrainWeightCfg:
     lambda_height: float = 1.0
     lambda_height_rel: float = 0.0
     lambda_point: float = 1.0
+    lambda_point_reproj: float = 0.2
     lambda_point_pair: float = 0.1
     lambda_normal_height: float = 0.2
     lambda_normal_point: float = 0.2
     lambda_feature_nce: float = 0.1
-    height_abs_keep_steps: int = 5000
+    abs_keep_steps: int = 5000
 
 
 class GeometryPretrainObjective:
@@ -78,6 +79,7 @@ class GeometryPretrainObjective:
         self.affine_ref = RefAffineIdentityLoss()
         self.height_loss = HeightHuberLoss(beta=height_beta)
         self.point_loss = PointMapLoss(geometry_ops=geometry_ops, beta=point_beta)
+        self.point_reproj_loss = PointReprojectionLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.point_pair_loss = PointPairwiseConsistencyLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.height_pair_loss = HeightPairwiseRelativeLoss(geometry_ops=geometry_ops, cfg=height_pair_cfg or HeightPairwiseLossCfg())
         self.feature_nce_loss = FeatureInfoNCELoss(geometry_ops=geometry_ops, cfg=feature_nce_cfg or FeatureInfoNCELossCfg())
@@ -144,6 +146,10 @@ class GeometryPretrainObjective:
         affine_pred = outputs["affine_pred"]
         ref_idx = batch.get("ref_view_idx", None)
         affine_pred_for_loss = self._replace_ref_affine_with_identity(affine_pred, ref_idx)
+        outputs_for_affine_pair = dict(outputs)
+        outputs_for_affine_pair["affine_pred"] = affine_pred_for_loss
+        if "rpc_init" in batch:
+            outputs_for_affine_pair["rpc_corrected"] = self.geometry_ops.apply_affine_correction_batch(batch["rpc_init"], affine_pred_for_loss)
         image_hw = (int(outputs["height_abs"].shape[-2]), int(outputs["height_abs"].shape[-1]))
 
         l_aff_grid, p_aff_grid = self.affine_grid(
@@ -152,7 +158,7 @@ class GeometryPretrainObjective:
             image_hw=image_hw,
             ref_view_idx=ref_idx,
         )
-        l_aff_pair, p_aff_pair, aux_pair = self.affine_pair(outputs, batch)
+        l_aff_pair, p_aff_pair, aux_pair = self.affine_pair(outputs_for_affine_pair, batch)
         l_aff_reg, p_aff_reg = self.affine_reg(affine_pred_for_loss, ref_view_idx=ref_idx)
         l_aff_ref, p_aff_ref = self.affine_ref(affine_pred, ref_view_idx=ref_idx)
 
@@ -163,6 +169,7 @@ class GeometryPretrainObjective:
         )
 
         l_p, p_p, aux_point = self.point_loss(outputs["point_abs"], outputs["point_anchor"], batch, return_aux=False)
+        l_preproj, p_preproj, aux_preproj = self.point_reproj_loss(outputs["point_abs"], batch)
         l_ppair, p_ppair, aux_ppair = self.point_pair_loss(outputs["point_abs"], batch)
         l_nh, l_np, p_norm, aux_norm = self.normal_loss(
             height_abs=outputs["height_abs"],
@@ -180,7 +187,9 @@ class GeometryPretrainObjective:
         )
 
         w = self.weights
-        w_h_abs = float(w.lambda_height) if int(global_step) < int(w.height_abs_keep_steps) else 0.0
+        abs_mul = 1.0 if int(global_step) < int(w.abs_keep_steps) else 0.1
+        w_h_abs = float(w.lambda_height) * abs_mul
+        w_p_abs = float(w.lambda_point) * abs_mul
         total = (
             w.lambda_affine_grid * l_aff_grid
             + w.lambda_affine_pair * l_aff_pair
@@ -188,7 +197,8 @@ class GeometryPretrainObjective:
             + w.lambda_affine_ref * l_aff_ref
             + w_h_abs * l_h
             + w.lambda_height_rel * l_hrel
-            + w.lambda_point * l_p
+            + w_p_abs * l_p
+            + w.lambda_point_reproj * l_preproj
             + w.lambda_point_pair * l_ppair
             + w.lambda_normal_height * l_nh
             + w.lambda_normal_point * l_np
@@ -205,6 +215,7 @@ class GeometryPretrainObjective:
             "loss_height": l_h,
             "loss_height_rel": l_hrel,
             "loss_point": l_p,
+            "loss_point_reproj": l_preproj,
             "loss_point_pair": l_ppair,
             "loss_normal_height": l_nh,
             "loss_normal_point": l_np,
@@ -222,6 +233,8 @@ class GeometryPretrainObjective:
             "metric_point_xy_rmse": p_p.get("point_xy_rmse", zero),
             "metric_point_z_rmse": p_p.get("point_z_rmse", zero),
             "metric_point_anchor_displacement_mean": p_p.get("point_anchor_displacement_mean", zero),
+            "metric_point_reproj_px_mean": p_preproj.get("point_reproj_px_mean", zero),
+            "metric_point_reproj_num_pairs_used": p_preproj.get("point_reproj_num_pairs_used", zero),
             "metric_point_pair_dist_mean": p_ppair.get("point_pair_dist_mean", zero),
             "metric_point_pair_num_pairs_used": p_ppair.get("point_pair_num_pairs_used", zero),
             "metric_normal_h_cos_mean": p_norm.get("normal_h_cos_mean", zero),
@@ -235,7 +248,8 @@ class GeometryPretrainObjective:
             "weight_affine_ref": float(w.lambda_affine_ref),
             "weight_height": float(w_h_abs),
             "weight_height_rel": float(w.lambda_height_rel),
-            "weight_point": float(w.lambda_point),
+            "weight_point": float(w_p_abs),
+            "weight_point_reproj": float(w.lambda_point_reproj),
             "weight_point_pair": float(w.lambda_point_pair),
             "weight_normal_height": float(w.lambda_normal_height),
             "weight_normal_point": float(w.lambda_normal_point),
@@ -260,6 +274,7 @@ class GeometryPretrainObjective:
             "render_point_num_targets": 0.0,
         }
         aux_dict.update(aux_point)
+        aux_dict.update(aux_preproj)
         aux_dict.update(aux_ppair)
         aux_dict.update(aux_norm)
         aux_dict.update(aux_hrel)

@@ -29,7 +29,7 @@ from loss.height_loss import HeightHuberLoss
 from loss.height_pair_loss import HeightPairwiseLossCfg, HeightPairwiseRelativeLoss
 from loss.normal_loss import PointNormalLoss, PointNormalLossCfg
 from loss.point_loss import PointMapLoss
-from loss.point_pair_loss import PointPairwiseConsistencyLoss, PointPairwiseLossCfg
+from loss.point_pair_loss import PointPairwiseConsistencyLoss, PointPairwiseLossCfg, PointReprojectionLoss
 from loss.regularization_loss import CenterConsistencyLoss, CoderProbe, GaussianRegularizationLoss
 from loss.render_loss import RenderPathLoss
 
@@ -60,6 +60,7 @@ class LossWeightScheduler:
             "lambda_height": 1.0,
             "lambda_height_rel": 0.0,
             "lambda_point": 1.0,
+            "lambda_point_reproj": 0.2,
             "lambda_point_pair": 0.2,
             "lambda_normal_height": 0.2,
             "lambda_normal_point": 0.2,
@@ -78,7 +79,7 @@ class LossWeightScheduler:
     ramp_mode: str = "linear"
     stage1_steps: int = 5000
     stage2_steps: int = 20000
-    height_abs_keep_steps: int = 5000
+    abs_keep_steps: int = 5000
 
     def _render_multiplier(self, global_step: int) -> float:
         """计算 render 权重乘子。"""
@@ -127,8 +128,9 @@ class LossWeightScheduler:
             w["lambda_render_point"] = w["lambda_render_point"] * stage_mul
         else:
             stage_mul = 1.0
-        if global_step >= int(self.height_abs_keep_steps):
-            w["lambda_height"] = 0.0
+        if global_step >= int(self.abs_keep_steps):
+            w["lambda_height"] = w.get("lambda_height", 0.0) * 0.1
+            w["lambda_point"] = w.get("lambda_point", 0.0) * 0.1
         return w, {"schedule_render_multiplier": mul, "schedule_detail_stage_multiplier": stage_mul}
 
 
@@ -186,6 +188,7 @@ class RPCAnySplatTrainingObjective:
         self.height_loss = HeightHuberLoss(beta=height_beta)
         self.point_loss = PointMapLoss(geometry_ops=geometry_ops, beta=point_beta)
         self.point_pair_loss = PointPairwiseConsistencyLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
+        self.point_reproj_loss = PointReprojectionLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.height_pair_loss = HeightPairwiseRelativeLoss(geometry_ops=geometry_ops, cfg=height_pair_cfg or HeightPairwiseLossCfg())
         self.feature_nce_loss = FeatureInfoNCELoss(geometry_ops=geometry_ops, cfg=feature_nce_cfg or FeatureInfoNCELossCfg())
         self.normal_loss = PointNormalLoss(geometry_ops=geometry_ops, cfg=normal_cfg or PointNormalLossCfg())
@@ -304,6 +307,10 @@ class RPCAnySplatTrainingObjective:
         ref_idx = batch.get("ref_view_idx", None)
         affine_pred = outputs["affine_pred"]
         affine_pred_for_loss = self._replace_ref_affine_with_identity(affine_pred, ref_idx)
+        outputs_for_affine_pair = dict(outputs)
+        outputs_for_affine_pair["affine_pred"] = affine_pred_for_loss
+        if "rpc_init" in batch:
+            outputs_for_affine_pair["rpc_corrected"] = self.geometry_ops.apply_affine_correction_batch(batch["rpc_init"], affine_pred_for_loss)
 
         l_aff_grid, p_aff_grid = self.affine_grid(
             affine_pred=affine_pred_for_loss,
@@ -311,7 +318,7 @@ class RPCAnySplatTrainingObjective:
             image_hw=image_hw,
             ref_view_idx=ref_idx,
         )
-        l_aff_pair, p_aff_pair, aux_pair = self.affine_pair(outputs, batch)
+        l_aff_pair, p_aff_pair, aux_pair = self.affine_pair(outputs_for_affine_pair, batch)
         l_aff_reg, p_aff_reg = self.affine_reg(affine_pred_for_loss, ref_view_idx=ref_idx)
         l_aff_ref, p_aff_ref = self.affine_ref(affine_pred, ref_view_idx=ref_idx)
 
@@ -322,6 +329,7 @@ class RPCAnySplatTrainingObjective:
         )
 
         l_p, p_p, aux_point = self.point_loss(outputs["point_abs"], outputs["point_anchor"], batch, return_aux=False)
+        l_preproj, p_preproj, aux_preproj = self.point_reproj_loss(outputs["point_abs"], batch)
         l_ppair, p_ppair, aux_ppair = self.point_pair_loss(outputs["point_abs"], batch)
         l_nh, l_np, p_norm, aux_norm = self.normal_loss(
             height_abs=outputs["height_abs"],
@@ -385,6 +393,7 @@ class RPCAnySplatTrainingObjective:
             + weights["lambda_height"] * l_h
             + weights.get("lambda_height_rel", 0.0) * l_hrel
             + weights["lambda_point"] * l_p
+            + weights.get("lambda_point_reproj", 0.0) * l_preproj
             + weights.get("lambda_point_pair", 0.0) * l_ppair
             + weights.get("lambda_normal_height", 0.0) * l_nh
             + weights.get("lambda_normal_point", 0.0) * l_np
@@ -405,6 +414,7 @@ class RPCAnySplatTrainingObjective:
             "loss_height": l_h,
             "loss_height_rel": l_hrel,
             "loss_point": l_p,
+            "loss_point_reproj": l_preproj,
             "loss_point_pair": l_ppair,
             "loss_normal_height": l_nh,
             "loss_normal_point": l_np,
@@ -428,6 +438,8 @@ class RPCAnySplatTrainingObjective:
             "metric_point_xy_rmse": p_p.get("point_xy_rmse", zero),
             "metric_point_z_rmse": p_p.get("point_z_rmse", zero),
             "metric_point_anchor_displacement_mean": p_p.get("point_anchor_displacement_mean", zero),
+            "metric_point_reproj_px_mean": p_preproj.get("point_reproj_px_mean", zero),
+            "metric_point_reproj_num_pairs_used": p_preproj.get("point_reproj_num_pairs_used", zero),
             "metric_point_pair_dist_mean": p_ppair.get("point_pair_dist_mean", zero),
             "metric_point_pair_num_pairs_used": p_ppair.get("point_pair_num_pairs_used", zero),
             "metric_normal_h_cos_mean": p_norm.get("normal_h_cos_mean", zero),
@@ -461,6 +473,7 @@ class RPCAnySplatTrainingObjective:
             "weight_height": weights["lambda_height"],
             "weight_height_rel": weights.get("lambda_height_rel", 0.0),
             "weight_point": weights["lambda_point"],
+            "weight_point_reproj": weights.get("lambda_point_reproj", 0.0),
             "weight_point_pair": weights.get("lambda_point_pair", 0.0),
             "weight_normal_height": weights.get("lambda_normal_height", 0.0),
             "weight_normal_point": weights.get("lambda_normal_point", 0.0),
@@ -478,6 +491,7 @@ class RPCAnySplatTrainingObjective:
             "render_point_num_targets": float(p_render_point.get("render_num_targets", zero).detach().item()) if torch.is_tensor(p_render_point.get("render_num_targets", None)) else p_render_point.get("render_num_targets", 0),
         }
         aux_dict.update(aux_point)
+        aux_dict.update(aux_preproj)
         aux_dict.update(aux_ppair)
         aux_dict.update(aux_norm)
         aux_dict.update(aux_hrel)

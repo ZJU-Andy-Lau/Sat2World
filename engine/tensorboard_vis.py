@@ -310,8 +310,14 @@ class TensorBoardMonitor:
                 out[2, li, si] = color[2]
         return out.clamp(0, 1)
 
-    def make_colormap_image(self, x: torch.Tensor, vmin: float | None = None, vmax: float | None = None) -> torch.Tensor:
-        """把单通道图转为伪彩色（简单 heatmap）。"""
+    def make_colormap_image(
+        self,
+        x: torch.Tensor,
+        vmin: float | None = None,
+        vmax: float | None = None,
+        cmap_name: str = "YlGnBu_r",
+    ) -> torch.Tensor:
+        """把单通道图转为伪彩色。"""
         t = x.detach().float()
         if t.ndim == 3:
             t = t[0]
@@ -319,12 +325,55 @@ class TensorBoardMonitor:
         mx = float(t.max().item()) if vmax is None else vmax
         if mx <= mn:
             mx = mn + 1e-6
-        n = (t - mn) / (mx - mn)
-        n = n.clamp(0, 1)
-        r = n
-        g = 1.0 - (n - 0.5).abs() * 2.0
-        b = 1.0 - n
-        return torch.stack([r, g.clamp(0, 1), b], dim=0)
+        try:
+            from matplotlib import cm, colors
+
+            arr = t.cpu().numpy().astype(np.float32)
+            norm = colors.Normalize(vmin=float(mn), vmax=float(mx), clip=True)
+            cmap = cm.get_cmap(cmap_name)
+            rgba = cmap(norm(arr))
+            rgb = torch.from_numpy(rgba[..., :3]).permute(2, 0, 1).to(torch.float32)
+            return rgb.clamp(0, 1)
+        except Exception:
+            n = ((t - mn) / (mx - mn)).clamp(0, 1)
+            r = n
+            g = 1.0 - (n - 0.5).abs() * 2.0
+            b = 1.0 - n
+            return torch.stack([r, g.clamp(0, 1), b], dim=0)
+
+    def _group_vrange(
+        self,
+        maps: list[torch.Tensor],
+        *,
+        masks: list[torch.Tensor] | None = None,
+        q_low: float = 0.05,
+        q_high: float = 0.95,
+    ) -> tuple[float, float]:
+        vals: list[torch.Tensor] = []
+        for idx, m in enumerate(maps):
+            mm = m.detach().float()
+            if mm.ndim == 3:
+                mm = mm[0]
+            if masks is not None and idx < len(masks) and masks[idx] is not None:
+                mk = masks[idx].detach().float()
+                if mk.ndim == 3:
+                    mk = mk[0]
+                vals.append(mm[mk > 0.5].reshape(-1))
+            else:
+                vals.append(mm.reshape(-1))
+        if len(vals) == 0:
+            return 0.0, 1.0
+        nz = [x for x in vals if x.numel() > 0]
+        if len(nz) == 0:
+            return 0.0, 1.0
+        joint = torch.cat(nz, dim=0)
+        if joint.numel() == 0:
+            return 0.0, 1.0
+        lo = float(torch.quantile(joint, float(q_low)).item())
+        hi = float(torch.quantile(joint, float(q_high)).item())
+        if hi <= lo + 1e-6:
+            hi = lo + 1e-6
+        return lo, hi
 
     def make_abs_error_map(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
         """构建绝对误差热力图。"""
@@ -333,7 +382,7 @@ class TensorBoardMonitor:
             err = err[0]
         elif err.ndim == 4:
             err = err[0, 0]
-        return self.make_colormap_image(err)
+        return self.make_colormap_image(err, cmap_name="magma")
 
     def make_affine_residual_heatmap(self, affine_gt_forward: torch.Tensor, affine_pred: torch.Tensor, h: int, w: int) -> torch.Tensor:
         """仿射组合残差热力图。
@@ -420,15 +469,21 @@ class TensorBoardMonitor:
         if height_gt is not None and pred_h is not None:
             gt = height_gt[0, 0]
             ph = pred_h[0, 0]
-            self.writer.add_image(f"vis/{split}/height_gt", self.make_colormap_image(gt), global_step)
-            self.writer.add_image(f"vis/{split}/height_pred", self.make_colormap_image(ph), global_step)
+            hmask = batch.get("height_valid_mask", None)
+            vm = hmask[0, 0] if torch.is_tensor(hmask) else None
+            vmin, vmax = self._group_vrange([gt, ph], masks=[vm, vm], q_low=0.05, q_high=0.95)
+            self.writer.add_image(f"vis/{split}/height_gt", self.make_colormap_image(gt, vmin=vmin, vmax=vmax), global_step)
+            self.writer.add_image(f"vis/{split}/height_pred", self.make_colormap_image(ph, vmin=vmin, vmax=vmax), global_step)
             self.writer.add_image(f"vis/{split}/height_error", self.make_abs_error_map(ph, gt), global_step)
 
         if pred_p is not None and aux.get("gt_point_map", None) is not None:
             pz = pred_p[0, 0, 2]
             gz = aux["gt_point_map"][0, 0, 2]
-            self.writer.add_image(f"vis/{split}/point_z_pred", self.make_colormap_image(pz), global_step)
-            self.writer.add_image(f"vis/{split}/point_z_gt", self.make_colormap_image(gz), global_step)
+            hmask = batch.get("height_valid_mask", None)
+            vm = hmask[0, 0] if torch.is_tensor(hmask) else None
+            vmin, vmax = self._group_vrange([pz, gz], masks=[vm, vm], q_low=0.05, q_high=0.95)
+            self.writer.add_image(f"vis/{split}/point_z_pred", self.make_colormap_image(pz, vmin=vmin, vmax=vmax), global_step)
+            self.writer.add_image(f"vis/{split}/point_z_gt", self.make_colormap_image(gz, vmin=vmin, vmax=vmax), global_step)
             self.writer.add_image(f"vis/{split}/point_z_error", self.make_abs_error_map(pz, gz), global_step)
 
         if render_outputs is not None and render_outputs.get("rpc", None) is not None:
@@ -439,12 +494,20 @@ class TensorBoardMonitor:
                 self.writer.add_image(f"vis/{split}/render_target_rgb", rr["target_rgb"][0], global_step)
                 self.writer.add_image(f"vis/{split}/render_rpc_alpha", rr["rendered_alpha"][0], global_step)
                 if not rr["rendered_height"] is None:
-                    self.writer.add_image(f"vis/{split}/render_rpc_height", self.make_colormap_image(rr["rendered_height"][0]), global_step)
+                    rh_maps = [rr["rendered_height"][0]]
+                    if rp is not None and rp.get("rendered_height", None) is not None:
+                        rh_maps.append(rp["rendered_height"][0])
+                    rvmin, rvmax = self._group_vrange(rh_maps, q_low=0.05, q_high=0.95)
+                    self.writer.add_image(f"vis/{split}/render_rpc_height", self.make_colormap_image(rr["rendered_height"][0], vmin=rvmin, vmax=rvmax), global_step)
             if rp.get("num_targets", 0) > 0:
                 self.writer.add_image(f"vis/{split}/render_point_rgb", rp["rendered_rgb"][0], global_step)
                 self.writer.add_image(f"vis/{split}/render_point_alpha", rp["rendered_alpha"][0], global_step)
-                if not rr["rendered_height"] is None:
-                    self.writer.add_image(f"vis/{split}/render_point_height", self.make_colormap_image(rp["rendered_height"][0]), global_step)
+                if not rp["rendered_height"] is None:
+                    rh_maps = [rp["rendered_height"][0]]
+                    if rr is not None and rr.get("rendered_height", None) is not None:
+                        rh_maps.append(rr["rendered_height"][0])
+                    rvmin, rvmax = self._group_vrange(rh_maps, q_low=0.05, q_high=0.95)
+                    self.writer.add_image(f"vis/{split}/render_point_height", self.make_colormap_image(rp["rendered_height"][0], vmin=rvmin, vmax=rvmax), global_step)
 
         if "gaussian_confidence_rpc" in outputs:
             self.writer.add_image(f"vis/{split}/gaussian_conf_rpc", self.make_colormap_image(outputs["gaussian_confidence_rpc"][0, 0]), global_step)

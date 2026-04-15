@@ -135,7 +135,7 @@ loss:
   lambda_affine_reg: 0.1
   lambda_affine_ref: 0.1
   lambda_height: 1.0
-  height_abs_keep_steps: 1000
+  abs_keep_steps: 1000
   lambda_height_rel: 1.0
   lambda_height_rel_consistency: 1.0
   lambda_height_rel_cycle: 1.0
@@ -144,6 +144,7 @@ loss:
   height_rel_max_pairs: 12
   height_rel_sample_from_valid_only: true
   lambda_point: 1.0
+  lambda_point_reproj: 0.2
   lambda_point_pair: 0.2
   lambda_normal_height: 10
   lambda_normal_point: 10
