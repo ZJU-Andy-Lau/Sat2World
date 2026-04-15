@@ -249,7 +249,7 @@ class RPCGeometryOps:
         scene_xy_center: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
         scene_xy_scale: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
     ) -> torch.Tensor:
-        """批量计算 patch 级 43 维几何特征。
+        """批量计算 patch 级 45 维几何特征。
 
         参数:
             rpc_batch: [B][V] RPC 列表。
@@ -258,7 +258,7 @@ class RPCGeometryOps:
             scene_xy_center/scene_xy_scale: [B,2] 或等价 list。
 
         返回:
-            geom_feat: [B,V,N,43]，float32。
+            geom_feat: [B,V,N,45]，float32。
 
         说明:
             本函数默认不对 affine 保梯度，内部使用 no_grad 调用几何特征接口，
@@ -281,7 +281,7 @@ class RPCGeometryOps:
         else:
             raise ValueError(f"Unsupported patch_centers shape: {tuple(patch_centers.shape)}")
 
-        out = torch.empty((b, v, n, 43), device=height_ref.device, dtype=self.net_dtype)
+        out = torch.empty((b, v, n, 45), device=height_ref.device, dtype=self.net_dtype)
         h_offsets = torch.tensor([-50.0, -10.0, -5.0, -1.0, 0.0, 1.0, 5.0, 10.0, 50.0], dtype=self.rpc_dtype)
 
         for bi in range(b):
@@ -316,8 +316,9 @@ class RPCGeometryOps:
                 )
                 xy_anchors = torch.stack([x_norm_rep, y_norm_rep], dim=-1).view(n, 9, 2).reshape(n, 18)  # [N,18]
 
-                feat43 = torch.cat([feat, h_ref_digits_n, xy_anchors], dim=-1)
-                out[bi, vi] = feat43.detach().to(dtype=self.net_dtype, device=height_ref.device)
+                line_samp_norm = coords / 1000.0  # [N,2]: (line/1000, samp/1000)
+                feat45 = torch.cat([feat, h_ref_digits_n, xy_anchors, line_samp_norm], dim=-1)
+                out[bi, vi] = feat45.detach().to(dtype=self.net_dtype, device=height_ref.device)
 
         return out
 

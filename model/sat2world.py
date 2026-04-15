@@ -23,7 +23,6 @@ import torch.nn as nn
 
 from geometry import (
     RPCGeometryOps,
-    expand_height_ref_map,
     infer_height_ref_batch,
     make_image_grid,
     make_patch_centers,
@@ -97,7 +96,7 @@ class Sat2World(nn.Module):
         self.cfg = cfg
 
         self.backbone = DINOv3Backbone(cfg.backbone)
-        self.geom_mlp = GeometryTokenMLP(in_dim=43, hidden_dim=256, out_dim=256)
+        self.geom_mlp = GeometryTokenMLP(in_dim=45, hidden_dim=256, out_dim=256)
         self.fuser = VisualGeometryFuser(visual_dim=self.backbone.embed_dim, geom_dim=256, out_dim=self.backbone.embed_dim)
 
         encoder_cfg = cfg.encoder
@@ -323,8 +322,7 @@ class Sat2World(nn.Module):
         h_logits = self._reshape_logits_to_bv(height_pred["logits"], b, v)
         h_fine = self._reshape_logits_to_bv(height_pred["fine"], b, v)
 
-        h_ref_map = expand_height_ref_map(height_ref, h, w)
-        height_decoded = self.height_coder(h_logits, h_fine, h_ref_map)
+        height_decoded = self.height_coder(h_logits, h_fine)
         height_abs = height_decoded["h_abs"]
 
         # 8) 点云分支（独立 anchor）
@@ -363,8 +361,8 @@ class Sat2World(nn.Module):
             "rpc_corrected": rpc_corrected,
             "height_ref": height_ref,
             "height_abs": height_abs,
-            "height_coarse": height_decoded["delta_h_coarse"],
-            "height_fine": height_decoded["delta_h_fine"],
+            "height_coarse": height_decoded["h_coarse"],
+            "height_fine": height_decoded["h_fine"],
             "height_logits": h_logits,
             "height_fine_raw": h_fine,
             "point_anchor": point_anchor,
