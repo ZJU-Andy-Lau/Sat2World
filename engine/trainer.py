@@ -514,7 +514,7 @@ class Trainer:
                     f"l_hr={float(lhrel) if lhrel is not None else float('nan'):.2f} "
                     f"l_pt={float(lp) if lp is not None else float('nan'):.2f} "
                     f"l_pp={float(lpp) if lpp is not None else float('nan'):.2f} "
-                    f"l_pp={float(lpr) if lpr is not None else float('nan'):.2f} "
+                    f"l_pr={float(lpr) if lpr is not None else float('nan'):.2f} "
                     f"l_np={float(lnp) if lnp is not None else float('nan'):.2f} "
                     f"l_nce={float(lnce) if lnce is not None else float('nan'):.2f} "
                     f"l_ssim={float(lssim) if lssim is not None else float('nan'):.2f} "
