@@ -118,9 +118,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkerboard-include-ref", action="store_true")
 
     p.add_argument("--viz-height", action="store_true")
-    p.add_argument("--height-vmax", type=float, default=50.0)
-    p.add_argument("--height-vmin-quantile", type=float, default=0.02)
-    p.add_argument("--height-colormap", type=str, default="turbo")
+    p.add_argument("--height-vmin-quantile", type=float, default=0.05)
+    p.add_argument("--height-vmax-quantile", type=float, default=0.95)
+    p.add_argument("--height-colormap", type=str, default="YlGnBu_r")
 
     return p.parse_args()
 
@@ -733,7 +733,7 @@ def save_height_panel(
     *,
     out_path: Path,
     vmin_quantile: float,
-    vmax: float,
+    vmax_quantile: float,
     cmap_name: str,
 ) -> dict[str, Any]:
     valid = (valid_mask > 0.5)
@@ -741,9 +741,12 @@ def save_height_panel(
         joint = torch.cat([h_pred[valid], h_gt[valid]], dim=0).to(torch.float32)
     else:
         joint = torch.cat([h_pred.reshape(-1), h_gt.reshape(-1)], dim=0).to(torch.float32)
-    q = min(max(float(vmin_quantile), 0.0), 1.0)
-    vmin = float(torch.quantile(joint, q).item())
-    vmax_f = float(vmax)
+    ql = min(max(float(vmin_quantile), 0.0), 1.0)
+    qh = min(max(float(vmax_quantile), 0.0), 1.0)
+    if qh <= ql:
+        qh = min(1.0, ql + 1e-3)
+    vmin = float(torch.quantile(joint, ql).item())
+    vmax_f = float(torch.quantile(joint, qh).item())
     if vmax_f <= vmin + 1e-6:
         vmax_f = vmin + 1e-6
 
@@ -1126,7 +1129,7 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
                 valid_mask=h_mask,
                 out_path=out_panel,
                 vmin_quantile=float(args.height_vmin_quantile),
-                vmax=float(args.height_vmax),
+                vmax_quantile=float(args.height_vmax_quantile),
                 cmap_name=str(args.height_colormap),
             )
             panel_info["view_k"] = int(k)

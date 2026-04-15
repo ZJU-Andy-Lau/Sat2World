@@ -187,10 +187,20 @@ class Trainer:
             assert_tensor_tree_device(outputs, self.device, prefix="outputs")
             if "rpc_corrected" in outputs:
                 assert_rpc_tree_device(outputs["rpc_corrected"], self.device, prefix="outputs.rpc_corrected")
+        outputs_for_render = outputs
+        if (
+            "affine_pred" in outputs
+            and "rpc_init" in batch_dev
+            and hasattr(self.objective, "_replace_ref_affine_with_identity")
+            and hasattr(model_ref, "rpc_ops")
+        ):
+            aff_for_render = self.objective._replace_ref_affine_with_identity(outputs["affine_pred"], batch_dev.get("ref_view_idx", None))
+            outputs_for_render = dict(outputs)
+            outputs_for_render["rpc_corrected"] = model_ref.rpc_ops.apply_affine_correction_batch(batch_dev["rpc_init"], aff_for_render)
         use_render = (mode == "train" and self.enable_render_train) or (mode != "train" and self.enable_render_val)
         render_outputs = (
             self.renderer.render_paths(
-                outputs,
+                outputs_for_render,
                 batch_dev,
                 mode=mode,
                 global_step=self.global_step,

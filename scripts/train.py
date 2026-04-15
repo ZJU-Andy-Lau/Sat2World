@@ -145,7 +145,7 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
         render_ramp_steps=int(lcfg.get("render_ramp_steps", 2000)),
         stage1_steps=int(lcfg.get("stage1_steps", 5000)),
         stage2_steps=int(lcfg.get("stage2_steps", 20000)),
-        height_abs_keep_steps=int(lcfg.get("height_abs_keep_steps", 5000)),
+        abs_keep_steps=int(lcfg.get("abs_keep_steps", lcfg.get("height_abs_keep_steps", 5000))),
         base_weights={
             "lambda_affine_grid": float(lcfg.get("lambda_affine_grid", 1.0)),
             "lambda_affine_pair": float(lcfg.get("lambda_affine_pair", 1.0)),
@@ -154,6 +154,7 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
             "lambda_height": float(lcfg.get("lambda_height", 1.0)),
             "lambda_height_rel": float(lcfg.get("lambda_height_rel", 0.0)),
             "lambda_point": float(lcfg.get("lambda_point", 1.0)),
+            "lambda_point_reproj": float(lcfg.get("lambda_point_reproj", 0.2)),
             "lambda_point_pair": float(lcfg.get("lambda_point_pair", 0.2)),
             "lambda_normal_height": float(lcfg.get("lambda_normal_height", 0.2)),
             "lambda_normal_point": float(lcfg.get("lambda_normal_point", 0.2)),
