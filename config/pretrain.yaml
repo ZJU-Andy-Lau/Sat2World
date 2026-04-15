@@ -113,7 +113,7 @@ model:
   encoder_layerscale_init_values: 0.01
   affine_diag_scale: 0.01
   affine_offdiag_scale: 0.01
-  affine_trans_scale: 10.0
+  affine_trans_scale: 50.0
   height_bins: 33
   height_bin_size: 1.0
   height_fine_range: 0.5

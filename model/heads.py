@@ -267,9 +267,9 @@ class SharedDenseDecoder(DPTDenseDecoder):
 
 @dataclass
 class AffineHeadCfg:
-    diag_scale: float = 0.05
-    offdiag_scale: float = 0.05
-    trans_scale: float = 4.0
+    diag_scale: float = 0.01
+    offdiag_scale: float = 0.01
+    trans_scale: float = 50.0
 
 
 class AffineHead(nn.Module):
