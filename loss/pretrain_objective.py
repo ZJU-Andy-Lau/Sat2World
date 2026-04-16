@@ -21,9 +21,8 @@ from loss.affine_loss import (
 )
 from loss.feature_nce_loss import FeatureInfoNCELoss, FeatureInfoNCELossCfg
 from loss.height_loss import HeightHuberLoss
-from loss.height_pair_loss import HeightPairwiseLossCfg, HeightPairwiseRelativeLoss
 from loss.normal_loss import PointNormalLoss, PointNormalLossCfg
-from loss.point_pair_loss import PointPairwiseConsistencyLoss, PointPairwiseLossCfg, PointReprojectionLoss
+from loss.point_pair_loss import HeightReprojectionLoss, PointPairwiseConsistencyLoss, PointPairwiseLossCfg, PointReprojectionLoss
 from loss.point_loss import PointMapLoss
 
 
@@ -36,9 +35,9 @@ class GeometryPretrainWeightCfg:
     lambda_affine_reg: float = 0.1
     lambda_affine_ref: float = 0.1
     lambda_height: float = 1.0
-    lambda_height_rel: float = 0.0
     lambda_point: float = 1.0
     lambda_point_reproj: float = 0.2
+    lambda_height_reproj: float = 0.2
     lambda_point_pair: float = 0.1
     lambda_normal_height: float = 0.2
     lambda_normal_point: float = 0.2
@@ -65,7 +64,6 @@ class GeometryPretrainObjective:
         affine_grid_cfg: AffineGridLossCfg | None = None,
         affine_pair_cfg: AffinePairwiseGeometryLossCfg | None = None,
         point_pair_cfg: PointPairwiseLossCfg | None = None,
-        height_pair_cfg: HeightPairwiseLossCfg | None = None,
         feature_nce_cfg: FeatureInfoNCELossCfg | None = None,
         normal_cfg: PointNormalLossCfg | None = None,
         height_beta: float = 1.0,
@@ -81,7 +79,7 @@ class GeometryPretrainObjective:
         self.point_loss = PointMapLoss(geometry_ops=geometry_ops, beta=point_beta)
         self.point_reproj_loss = PointReprojectionLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.point_pair_loss = PointPairwiseConsistencyLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
-        self.height_pair_loss = HeightPairwiseRelativeLoss(geometry_ops=geometry_ops, cfg=height_pair_cfg or HeightPairwiseLossCfg())
+        self.height_reproj_loss = HeightReprojectionLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.feature_nce_loss = FeatureInfoNCELoss(geometry_ops=geometry_ops, cfg=feature_nce_cfg or FeatureInfoNCELossCfg())
         self.normal_loss = PointNormalLoss(geometry_ops=geometry_ops, cfg=normal_cfg or PointNormalLossCfg())
         self.weights = weights or GeometryPretrainWeightCfg()
@@ -176,7 +174,7 @@ class GeometryPretrainObjective:
             point_abs=outputs["point_abs"],
             batch=batch,
         )
-        l_hrel, p_hrel, aux_hrel = self.height_pair_loss(outputs["height_abs"], batch)
+        l_hreproj, p_hreproj, aux_hreproj = self.height_reproj_loss(outputs["height_abs"], batch)
         l_nce, p_nce, aux_nce = self.feature_nce_loss(
             patch_tokens_proj=outputs["patch_tokens_nce_proj"],
             patch_valid_mask=outputs["patch_valid_mask"],
@@ -196,9 +194,9 @@ class GeometryPretrainObjective:
             + w.lambda_affine_reg * l_aff_reg
             + w.lambda_affine_ref * l_aff_ref
             + w_h_abs * l_h
-            + w.lambda_height_rel * l_hrel
             + w_p_abs * l_p
             + w.lambda_point_reproj * l_preproj
+            + w.lambda_height_reproj * l_hreproj
             + w.lambda_point_pair * l_ppair
             + w.lambda_normal_height * l_nh
             + w.lambda_normal_point * l_np
@@ -213,9 +211,10 @@ class GeometryPretrainObjective:
             "loss_affine_reg": l_aff_reg,
             "loss_affine_ref": l_aff_ref,
             "loss_height": l_h,
-            "loss_height_rel": l_hrel,
+            "loss_height_rel": zero,
             "loss_point": l_p,
             "loss_point_reproj": l_preproj,
+            "loss_height_reproj": l_hreproj,
             "loss_point_pair": l_ppair,
             "loss_normal_height": l_nh,
             "loss_normal_point": l_np,
@@ -225,10 +224,12 @@ class GeometryPretrainObjective:
             "metric_ref_affine_identity_l2": p_aff_ref.get("ref_affine_identity_l2", zero),
             "metric_height_rmse": p_h.get("height_rmse", zero),
             "metric_height_mae": p_h.get("height_mae", zero),
-            "metric_height_rel_consistency": p_hrel.get("height_rel_consistency", zero),
-            "metric_height_rel_cycle_px": p_hrel.get("height_rel_cycle_px", zero),
-            "metric_height_rel_cycle_px_rmse": p_hrel.get("height_rel_cycle_px_rmse", zero),
-            "metric_height_rel_pairs_used": p_hrel.get("height_rel_num_pairs_used", zero),
+            "metric_height_rel_consistency": zero,
+            "metric_height_rel_cycle_px": zero,
+            "metric_height_rel_cycle_px_rmse": zero,
+            "metric_height_rel_pairs_used": zero,
+            "metric_height_reproj_px_mean": p_hreproj.get("height_reproj_px_mean", zero),
+            "metric_height_reproj_num_pairs_used": p_hreproj.get("height_reproj_num_pairs_used", zero),
             "metric_point_xyz_rmse": p_p.get("point_xyz_rmse", zero),
             "metric_point_xy_rmse": p_p.get("point_xy_rmse", zero),
             "metric_point_z_rmse": p_p.get("point_z_rmse", zero),
@@ -247,9 +248,10 @@ class GeometryPretrainObjective:
             "weight_affine_reg": float(w.lambda_affine_reg),
             "weight_affine_ref": float(w.lambda_affine_ref),
             "weight_height": float(w_h_abs),
-            "weight_height_rel": float(w.lambda_height_rel),
+            "weight_height_rel": 0.0,
             "weight_point": float(w_p_abs),
             "weight_point_reproj": float(w.lambda_point_reproj),
+            "weight_height_reproj": float(w.lambda_height_reproj),
             "weight_point_pair": float(w.lambda_point_pair),
             "weight_normal_height": float(w.lambda_normal_height),
             "weight_normal_point": float(w.lambda_normal_point),
@@ -277,7 +279,7 @@ class GeometryPretrainObjective:
         aux_dict.update(aux_preproj)
         aux_dict.update(aux_ppair)
         aux_dict.update(aux_norm)
-        aux_dict.update(aux_hrel)
+        aux_dict.update(aux_hreproj)
         aux_dict.update(aux_nce)
         scalar_dict["metric_feature_nce_valid_pairs"] = p_nce.get("feature_nce_valid_pairs", zero)
         scalar_dict["metric_feature_nce_acc_top1"] = p_nce.get("feature_nce_acc_top1", zero)

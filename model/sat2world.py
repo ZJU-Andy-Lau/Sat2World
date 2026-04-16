@@ -54,7 +54,8 @@ class Sat2WorldCfg:
     affine_head: AffineHeadCfg = field(default_factory=AffineHeadCfg)
 
     height_bins: int = 33
-    point_bins: int = 33
+    point_bins_xy: int = 33
+    point_bins_h: int = 33
     sh_dim: int = 48
 
     height_bin_size: float = 1.0
@@ -126,7 +127,7 @@ class Sat2World(nn.Module):
         self.gaussian_adapter = TaskAdapter(ch=256, depth=int(cfg.task_adapter_depth))
         self.affine_head = AffineHead(in_dim=self.backbone.embed_dim, hidden_dim=512, cfg=cfg.affine_head)
         self.height_head = HeightHead(in_ch=256, num_bins=cfg.height_bins)
-        self.point_head = PointHead(in_ch=256, num_bins=cfg.point_bins)
+        self.point_head = PointHead(in_ch=256, num_bins_xy=cfg.point_bins_xy, num_bins_h=cfg.point_bins_h)
         self.gaussian_head = GaussianHead(in_ch=256, sh_dim=cfg.sh_dim)
         self.nce_projector = nn.Sequential(
             nn.LayerNorm(self.backbone.embed_dim),
@@ -139,9 +140,9 @@ class Sat2World(nn.Module):
             SymmetricBinCoderCfg(num_bins=cfg.height_bins, bin_size=cfg.height_bin_size, fine_range=cfg.height_fine_range)
         )
         self.point_coder = PointCoder(
-            cfg_x=SymmetricBinCoderCfg(num_bins=cfg.point_bins, bin_size=cfg.point_bin_size_xy, fine_range=cfg.point_fine_range_xy),
-            cfg_y=SymmetricBinCoderCfg(num_bins=cfg.point_bins, bin_size=cfg.point_bin_size_xy, fine_range=cfg.point_fine_range_xy),
-            cfg_z=SymmetricBinCoderCfg(num_bins=cfg.point_bins, bin_size=cfg.point_bin_size_z, fine_range=cfg.point_fine_range_z),
+            cfg_x=SymmetricBinCoderCfg(num_bins=cfg.point_bins_xy, bin_size=cfg.point_bin_size_xy, fine_range=cfg.point_fine_range_xy),
+            cfg_y=SymmetricBinCoderCfg(num_bins=cfg.point_bins_xy, bin_size=cfg.point_bin_size_xy, fine_range=cfg.point_fine_range_xy),
+            cfg_z=SymmetricBinCoderCfg(num_bins=cfg.point_bins_h, bin_size=cfg.point_bin_size_z, fine_range=cfg.point_fine_range_z),
         )
 
         self.rpc_ops = RPCGeometryOps(rpc_dtype=torch.double, net_dtype=torch.float32)

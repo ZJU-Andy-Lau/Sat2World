@@ -310,12 +310,12 @@ class HeightHead(nn.Module):
 
 
 class PointHead(nn.Module):
-    def __init__(self, in_ch: int = 256, num_bins: int = 33) -> None:
+    def __init__(self, in_ch: int = 256, num_bins_xy: int = 33, num_bins_h: int = 33) -> None:
         super().__init__()
         self.trunk = ConvBlock(in_ch, in_ch)
-        self.x_logits = nn.Conv2d(in_ch, num_bins, kernel_size=1)
-        self.y_logits = nn.Conv2d(in_ch, num_bins, kernel_size=1)
-        self.z_logits = nn.Conv2d(in_ch, num_bins, kernel_size=1)
+        self.x_logits = nn.Conv2d(in_ch, num_bins_xy, kernel_size=1)
+        self.y_logits = nn.Conv2d(in_ch, num_bins_xy, kernel_size=1)
+        self.z_logits = nn.Conv2d(in_ch, num_bins_h, kernel_size=1)
         self.x_fine = nn.Conv2d(in_ch, 1, kernel_size=1)
         self.y_fine = nn.Conv2d(in_ch, 1, kernel_size=1)
         self.z_fine = nn.Conv2d(in_ch, 1, kernel_size=1)

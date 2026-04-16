@@ -63,7 +63,6 @@ def build_model(cfg: dict[str, Any]) -> Any:
 def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> Any:
     from loss.affine_loss import AffineGridLossCfg, AffinePairwiseGeometryLossCfg
     from loss.feature_nce_loss import FeatureInfoNCELossCfg
-    from loss.height_pair_loss import HeightPairwiseLossCfg
     from loss.normal_loss import PointNormalLossCfg
     from loss.point_pair_loss import PointPairwiseLossCfg
     from loss.pretrain_objective import GeometryPretrainObjective, GeometryPretrainWeightCfg
@@ -84,9 +83,9 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> Any:
         lambda_affine_reg=float(lcfg.get("lambda_affine_reg", 0.1)),
         lambda_affine_ref=float(lcfg.get("lambda_affine_ref", 0.1)),
         lambda_height=float(lcfg.get("lambda_height", 1.0)),
-        lambda_height_rel=float(lcfg.get("lambda_height_rel", 0.0)),
         lambda_point=float(lcfg.get("lambda_point", 1.0)),
         lambda_point_reproj=float(lcfg.get("lambda_point_reproj", 0.2)),
+        lambda_height_reproj=float(lcfg.get("lambda_height_reproj", 0.2)),
         lambda_point_pair=float(lcfg.get("lambda_point_pair", 0.1)),
         lambda_normal_height=float(lcfg.get("lambda_normal_height", 0.2)),
         lambda_normal_point=float(lcfg.get("lambda_normal_point", 0.2)),
@@ -108,20 +107,11 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> Any:
         sign_invariant=bool(lcfg.get("normal_sign_invariant", True)),
         detach_gt=bool(lcfg.get("normal_detach_gt", True)),
     )
-    height_pair_cfg = HeightPairwiseLossCfg(
-        anchors_per_pair=int(lcfg.get("height_rel_anchors_per_pair", lcfg.get("anchors_per_pair", 256))),
-        max_pairs=lcfg.get("height_rel_max_pairs", lcfg.get("max_pairs", None)),
-        sample_from_valid_only=bool(lcfg.get("height_rel_sample_from_valid_only", lcfg.get("sample_from_valid_only", True))),
-        beta=float(lcfg.get("height_rel_beta", 1.0)),
-        lambda_consistency=float(lcfg.get("lambda_height_rel_consistency", 1.0)),
-        lambda_cycle=float(lcfg.get("lambda_height_rel_cycle", 1.0)),
-    )
     return GeometryPretrainObjective(
         geometry_ops=geometry_ops,
         affine_grid_cfg=grid_cfg,
         affine_pair_cfg=pair_cfg,
         point_pair_cfg=point_pair_cfg,
-        height_pair_cfg=height_pair_cfg,
         feature_nce_cfg=feature_nce_cfg,
         normal_cfg=normal_cfg,
         height_beta=float(lcfg.get("height_beta", 1.0)),
