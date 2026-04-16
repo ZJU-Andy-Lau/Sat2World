@@ -158,7 +158,11 @@ class GeometryPretrainObjective:
         )
         l_aff_pair, p_aff_pair, aux_pair = self.affine_pair(outputs_for_affine_pair, batch)
         l_aff_reg, p_aff_reg = self.affine_reg(affine_pred_for_loss, ref_view_idx=ref_idx)
-        l_aff_ref, p_aff_ref = self.affine_ref(affine_pred, ref_view_idx=ref_idx)
+        l_aff_ref, p_aff_ref = self.affine_ref(
+            affine_pred,
+            image_hw=image_hw,
+            ref_view_idx=ref_idx,
+        )
 
         l_h, p_h = self.height_loss(
             outputs["height_abs"],
