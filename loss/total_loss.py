@@ -179,7 +179,8 @@ class RPCAnySplatTrainingObjective:
         self.affine_grid = AffineGridLoss(affine_grid_cfg)
         self.affine_pair = AffinePairwiseGeometryLoss(geometry_ops, affine_pair_cfg)
         self.affine_reg = AffineLinearRegularization()
-        self.affine_ref = RefAffineIdentityLoss()
+        # ref loss 改为“网格版 identity 约束”，并复用 affine_grid_cfg 的网格分辨率
+        self.affine_ref = RefAffineIdentityLoss(affine_grid_cfg)
 
         self.height_loss = HeightHuberLoss(beta=height_beta)
         self.point_loss = PointMapLoss(geometry_ops=geometry_ops, beta=point_beta)
@@ -316,7 +317,12 @@ class RPCAnySplatTrainingObjective:
         )
         l_aff_pair, p_aff_pair, aux_pair = self.affine_pair(outputs_for_affine_pair, batch)
         l_aff_reg, p_aff_reg = self.affine_reg(affine_pred_for_loss, ref_view_idx=ref_idx)
-        l_aff_ref, p_aff_ref = self.affine_ref(affine_pred, ref_view_idx=ref_idx)
+        # 这里改为网格版参考视图 identity 约束
+        l_aff_ref, p_aff_ref = self.affine_ref(
+            affine_pred,
+            image_hw=image_hw,
+            ref_view_idx=ref_idx,
+        )
 
         l_h, p_h = self.height_loss(
             outputs["height_abs"],
@@ -424,6 +430,10 @@ class RPCAnySplatTrainingObjective:
             "loss_ssim": l_ssim,
             "metric_affine_grid_error_px_mean": p_aff_grid.get("affine_grid_error_px_mean", zero),
             "metric_affine_pair_error_px_mean": p_aff_pair.get("affine_pair_error_px_mean", zero),
+            # 新增：更准确地记录 ref 网格误差
+            "metric_ref_affine_grid_error_px_mean": p_aff_ref.get("ref_affine_grid_error_px_mean", zero),
+            "metric_ref_affine_grid_error_px_rmse": p_aff_ref.get("ref_affine_grid_error_px_rmse", zero),
+            # 兼容旧 tag，值现在等于 ref 网格误差均值
             "metric_ref_affine_identity_l2": p_aff_ref.get("ref_affine_identity_l2", zero),
             "metric_height_rmse": p_h.get("height_rmse", zero),
             "metric_height_mae": p_h.get("height_mae", zero),
