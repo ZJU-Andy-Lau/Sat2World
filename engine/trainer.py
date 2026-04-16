@@ -460,7 +460,7 @@ class Trainer:
             "loss_affine_grid": 0.0,
             "loss_affine_pair": 0.0,
             "loss_height": 0.0,
-            "loss_height_rel": 0.0,
+            "loss_height_reproj": 0.0,
             "loss_point": 0.0,
         }
         n_loss_steps = 0
@@ -483,19 +483,19 @@ class Trainer:
             lag = logs.get("loss_affine_grid", None)
             lap = logs.get("loss_affine_pair", None)
             lh = logs.get("loss_height", None)
-            lhrel = logs.get("loss_height_rel", None)
+            lhrep = logs.get("loss_height_reproj", None)
             lp = logs.get("loss_point", None)
             lpp = logs.get("loss_point_pair", None)
             lpr = logs.get("loss_point_reproj", None)
             lnp = logs.get("loss_normal_point", None)
             lnce = logs.get("loss_feature_nce", None)
             lssim = logs.get("loss_ssim", None)
-            if lt is not None and lag is not None and lap is not None and lh is not None and lhrel is not None and lp is not None:
+            if lt is not None and lag is not None and lap is not None and lh is not None and lhrep is not None and lp is not None:
                 loss_sums["loss_total"] += float(lt)
                 loss_sums["loss_affine_grid"] += float(lag)
                 loss_sums["loss_affine_pair"] += float(lap)
                 loss_sums["loss_height"] += float(lh)
-                loss_sums["loss_height_rel"] += float(lhrel)
+                loss_sums["loss_height_reproj"] += float(lhrep)
                 loss_sums["loss_point"] += float(lp)
                 n_loss_steps += 1
 
@@ -511,7 +511,7 @@ class Trainer:
                     f"l_ag={float(lag) if lag is not None else float('nan'):.2f} "
                     f"l_ap={float(lap) if lap is not None else float('nan'):.2f} "
                     f"l_h={float(lh) if lh is not None else float('nan'):.2f} "
-                    f"l_hr={float(lhrel) if lhrel is not None else float('nan'):.2f} "
+                    f"l_hr={float(lhrep) if lhrep is not None else float('nan'):.2f} "
                     f"l_pt={float(lp) if lp is not None else float('nan'):.2f} "
                     f"l_pp={float(lpp) if lpp is not None else float('nan'):.2f} "
                     f"l_pr={float(lpr) if lpr is not None else float('nan'):.2f} "
@@ -536,7 +536,7 @@ class Trainer:
             avg_ag = loss_sums["loss_affine_grid"] / n_loss_steps
             avg_ap = loss_sums["loss_affine_pair"] / n_loss_steps
             avg_h_abs = loss_sums["loss_height"] / n_loss_steps
-            avg_h_rel = loss_sums["loss_height_rel"] / n_loss_steps
+            avg_h_rel = loss_sums["loss_height_reproj"] / n_loss_steps
             avg_pt = loss_sums["loss_point"] / n_loss_steps
             print(
                 "[train][epoch_summary] "
@@ -545,7 +545,7 @@ class Trainer:
                 f"l_ag={avg_ag:.2f} "
                 f"l_ap={avg_ap:.2f} "
                 f"l_h_abs={avg_h_abs:.2f} "
-                f"l_h_rel={avg_h_rel:.2f} "
+                f"l_h_rep={avg_h_rel:.2f} "
                 f"l_pt={avg_pt:.2f}"
             )
 
@@ -583,7 +583,7 @@ class Trainer:
             lag = float(agg.get("loss_affine_grid", float("nan")))
             lap = float(agg.get("loss_affine_pair", float("nan")))
             lh = float(agg.get("loss_height", float("nan")))
-            lhrel = float(agg.get("loss_height_rel", float("nan")))
+            lhrep = float(agg.get("loss_height_reproj", float("nan")))
             lp = float(agg.get("loss_point", float("nan")))
             lpp = float(agg.get("loss_point_pair", float("nan")))
             lnp = float(agg.get("loss_normal_point", float("nan")))
@@ -597,7 +597,7 @@ class Trainer:
                 f"l_ag={lag:.2f} "
                 f"l_ap={lap:.2f} "
                 f"l_h_abs={lh:.2f} "
-                f"l_h_rel={lhrel:.2f} "
+                f"l_h_rep={lhrep:.2f} "
                 f"l_pt={lp:.2f} "
                 f"l_pp={lpp:.2f}"
                 f"l_np={lnp:.2f} "
