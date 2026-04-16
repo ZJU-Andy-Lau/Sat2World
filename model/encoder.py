@@ -385,11 +385,7 @@ class AlternatingEncoder(nn.Module):
         if l != gh * gw:
             raise ValueError(f"patch token count mismatch for RoPE: L={l}, Gh*Gw={gh*gw}")
         patch_pos = self.position_getter(b * v, gh, gw, device=device).view(b, v, l, 2)
-        # 为 special tokens 注入视图索引位置信息，避免跨视图时 special token 位置完全相同。
-        # pos[...,0] 使用 view_idx；pos[...,1] 使用 special token 的槽位编号（0..patch_start_idx-1）。
-        view_idx = torch.arange(v, device=device, dtype=patch_pos.dtype).view(1, v, 1).expand(b, v, self.patch_start_idx)
-        slot_idx = torch.arange(self.patch_start_idx, device=device, dtype=patch_pos.dtype).view(1, 1, self.patch_start_idx).expand(b, v, self.patch_start_idx)
-        special_pos = torch.stack([view_idx, slot_idx], dim=-1)
+        special_pos = torch.zeros((b, v, self.patch_start_idx, 2), device=device, dtype=patch_pos.dtype)
         return torch.cat([special_pos, patch_pos], dim=2)
 
     def _run_frame(self, tokens: torch.Tensor, pos: torch.Tensor | None, layer_idx: int) -> torch.Tensor:
