@@ -117,7 +117,8 @@ model:
   height_bins: 33
   height_bin_size: 1.0
   height_fine_range: 0.5
-  point_bins: 33
+  point_bins_xy: 33
+  point_bins_h: 33
   point_bin_size_xy: 0.1
   point_bin_size_z: 1.0
   point_fine_range_xy: 0.05
@@ -136,15 +137,9 @@ loss:
   lambda_affine_ref: 0.1
   lambda_height: 1.0
   abs_keep_steps: 1000
-  lambda_height_rel: 1.0
-  lambda_height_rel_consistency: 1.0
-  lambda_height_rel_cycle: 1.0
-  height_rel_beta: 1.0
-  height_rel_anchors_per_pair: 256
-  height_rel_max_pairs: 12
-  height_rel_sample_from_valid_only: true
   lambda_point: 1.0
   lambda_point_reproj: 0.2
+  lambda_height_reproj: 0.2
   lambda_point_pair: 0.2
   lambda_normal_height: 10
   lambda_normal_point: 10

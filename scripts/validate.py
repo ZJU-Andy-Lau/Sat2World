@@ -62,7 +62,9 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
     scfg.affine_head.offdiag_scale = float(m.get("affine_offdiag_scale", scfg.affine_head.offdiag_scale))
     scfg.affine_head.trans_scale = float(m.get("affine_trans_scale", scfg.affine_head.trans_scale))
     scfg.height_bins = int(m.get("height_bins", scfg.height_bins))
-    scfg.point_bins = int(m.get("point_bins", scfg.point_bins))
+    point_bins_legacy = int(m.get("point_bins", scfg.point_bins_xy))
+    scfg.point_bins_xy = int(m.get("point_bins_xy", point_bins_legacy))
+    scfg.point_bins_h = int(m.get("point_bins_h", point_bins_legacy))
     scfg.sh_dim = int(m.get("sh_dim", scfg.sh_dim))
     return Sat2World(scfg)
 

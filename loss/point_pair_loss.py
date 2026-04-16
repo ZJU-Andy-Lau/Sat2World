@@ -284,3 +284,131 @@ class PointReprojectionLoss:
         }
         aux = {"point_reproj_num_pairs_used": int(num_pairs_used)}
         return loss, probe, aux
+
+
+class HeightReprojectionLoss:
+    """高程重投影损失。
+
+    定义：
+    - 对每个视图 i，选择 j=(i+1)%V；
+    - 使用 rpc_gt + h_pred(i) 从 src 像素采样点构造世界点，再投影到 view_j 得到 point_proj；
+    - 使用 rpc_gt + h_gt(i) 生成同一 src 采样点在 view_j 的 GT 投影 point_gt；
+    - 以两者像素距离作为重投影误差。
+    """
+
+    def __init__(self, geometry_ops: Any, cfg: PointPairwiseLossCfg | None = None) -> None:
+        self.geometry_ops = geometry_ops
+        self.cfg = cfg or PointPairwiseLossCfg()
+        self._grid_cache: dict[tuple[int, int, int, int, str, str], torch.Tensor] = {}
+
+    def _get_uniform_grid(self, h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (h, w, int(self.cfg.grid_h), int(self.cfg.grid_w), str(device), str(dtype))
+        if key in self._grid_cache:
+            return self._grid_cache[key]
+        ys = torch.linspace(0.0, float(max(h - 1, 0)), steps=int(self.cfg.grid_h), device=device, dtype=dtype)
+        xs = torch.linspace(0.0, float(max(w - 1, 0)), steps=int(self.cfg.grid_w), device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        pts = torch.stack([yy.reshape(-1), xx.reshape(-1)], dim=-1)
+        self._grid_cache[key] = pts
+        return pts
+
+    def __call__(self, height_abs: torch.Tensor, batch: dict[str, Any]) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
+        b, v, _, h, w = height_abs.shape
+        device = height_abs.device
+        dtype = height_abs.dtype
+        if v < 2:
+            zero = torch.zeros((), device=device, dtype=dtype)
+            return zero, {"height_reproj_px_mean": zero, "height_reproj_num_pairs_used": zero}, {"height_reproj_num_pairs_used": 0}
+
+        rpc_gt = batch["rpc_gt"]
+        height_gt = batch["height_gt"].to(device=device, dtype=dtype)
+        height_valid_mask = batch["height_valid_mask"].to(device=device, dtype=dtype)
+        scene_xy_center = batch.get("scene_xy_center", None)
+        scene_xy_scale = batch.get("scene_xy_scale", None)
+        if scene_xy_scale is not None and torch.is_tensor(scene_xy_scale):
+            scene_xy_scale = scene_xy_scale.to(device=device, dtype=dtype)
+
+        grid = self._get_uniform_grid(h, w, device=device, dtype=dtype).view(1, -1, 2)
+        losses: list[torch.Tensor] = []
+        num_pairs_used = 0
+
+        for bi in range(b):
+            for i in range(v):
+                j = (i + 1) % v
+                h_gt_i, in_h = sample_map_bilinear(height_gt[bi : bi + 1, i], grid)
+                m_i, in_m = sample_map_bilinear(height_valid_mask[bi : bi + 1, i], grid)
+                h_pred_i, in_hp = sample_map_bilinear(height_abs[bi : bi + 1, i], grid)
+                valid_i = in_h & in_m & in_hp & (m_i[:, 0] > 0.5)
+                if not bool(valid_i.any()):
+                    continue
+                src_pts = grid[:, valid_i[0]]
+                h_i_gt = h_gt_i[:, 0][:, valid_i[0]]
+                h_i_pred = h_pred_i[:, 0][:, valid_i[0]]
+
+                # GT world(来自 rpc_gt + h_gt) -> view_j
+                xs_gt, ys_gt = self.geometry_ops.linesamp_to_xy_batch(
+                    rpc_batch=[[rpc_gt[bi][i]]],
+                    lines=src_pts[..., 0].view(1, 1, -1),
+                    samps=src_pts[..., 1].view(1, 1, -1),
+                    heights=h_i_gt.view(1, 1, -1),
+                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
+                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
+                )
+                l_gt, s_gt = self.geometry_ops.xy_to_linesamp_batch(
+                    rpc_batch=[[rpc_gt[bi][j]]],
+                    xs=xs_gt,
+                    ys=ys_gt,
+                    heights=h_i_gt.view(1, 1, -1),
+                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
+                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
+                )
+                point_gt = torch.stack([l_gt.view(-1), s_gt.view(-1)], dim=-1)
+
+                # 预测高程(view_i) -> world -> view_j
+                xs_pred, ys_pred = self.geometry_ops.linesamp_to_xy_batch(
+                    rpc_batch=[[rpc_gt[bi][i]]],
+                    lines=src_pts[..., 0].view(1, 1, -1),
+                    samps=src_pts[..., 1].view(1, 1, -1),
+                    heights=h_i_pred.view(1, 1, -1),
+                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
+                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
+                )
+                l_proj, s_proj = self.geometry_ops.xy_to_linesamp_batch(
+                    rpc_batch=[[rpc_gt[bi][j]]],
+                    xs=xs_pred,
+                    ys=ys_pred,
+                    heights=h_i_pred.view(1, 1, -1),
+                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
+                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
+                )
+                point_proj = torch.stack([l_proj.view(-1), s_proj.view(-1)], dim=-1)
+
+                finite = torch.isfinite(point_proj).all(dim=-1) & torch.isfinite(point_gt).all(dim=-1)
+                in_bound = (
+                    (point_proj[:, 0] >= 0.0)
+                    & (point_proj[:, 0] <= float(max(h - 1, 0)))
+                    & (point_proj[:, 1] >= 0.0)
+                    & (point_proj[:, 1] <= float(max(w - 1, 0)))
+                    & (point_gt[:, 0] >= 0.0)
+                    & (point_gt[:, 0] <= float(max(h - 1, 0)))
+                    & (point_gt[:, 1] >= 0.0)
+                    & (point_gt[:, 1] <= float(max(w - 1, 0)))
+                )
+                keep = finite & in_bound
+                if not bool(keep.any()):
+                    continue
+                dist = torch.linalg.norm(point_proj[keep] - point_gt[keep], dim=-1)
+                losses.append(dist.mean())
+                num_pairs_used += 1
+
+        if len(losses) == 0:
+            zero = torch.zeros((), device=device, dtype=dtype)
+            return zero, {"height_reproj_px_mean": zero, "height_reproj_num_pairs_used": zero}, {"height_reproj_num_pairs_used": 0}
+
+        loss = torch.stack(losses).mean()
+        probe = {
+            "height_reproj_px_mean": loss.detach(),
+            "height_reproj_num_pairs_used": torch.tensor(float(num_pairs_used), device=device, dtype=dtype),
+        }
+        aux = {"height_reproj_num_pairs_used": int(num_pairs_used)}
+        return loss, probe, aux
