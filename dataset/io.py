@@ -458,13 +458,17 @@ def _read_tif(path: str, window: tuple[int, int, int, int] | None = None) -> tup
                 arr = ds.read(window=win)
             nodata = ds.nodata
         return arr, nodata
-    except Exception:
-        arr, nodata = _read_tif_with_tifffile(path)
-        if window is not None:
-            arr_chw = _to_chw(arr)
-            top, left, h, w = _normalize_window(window, int(arr_chw.shape[1]), int(arr_chw.shape[2]))
-            arr = arr_chw[:, top : top + h, left : left + w]
-        return arr, nodata
+    except Exception as e:
+        print(f"use rasterio error:{e}")
+        try:
+            arr, nodata = _read_tif_with_tifffile(path)
+            if window is not None:
+                arr_chw = _to_chw(arr)
+                top, left, h, w = _normalize_window(window, int(arr_chw.shape[1]), int(arr_chw.shape[2]))
+                arr = arr_chw[:, top : top + h, left : left + w]
+            return arr, nodata
+        except Exception as ee:
+            raise ValueError(f"loading image:{path} error: {ee}")
 
 
 def _to_chw(arr: np.ndarray) -> np.ndarray:
