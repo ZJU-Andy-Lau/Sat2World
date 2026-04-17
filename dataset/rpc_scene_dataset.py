@@ -73,6 +73,7 @@ class RPCSceneDataset(Dataset):
         base_seed: int = 0,
         reference_policy: str = "first",
         strict_same_hw: bool = True,
+        assume_all_views_same_hw: bool = True,
         crop_size: int = 512,
         anchors_per_view_per_sample: int = 0,
         fit_pinhole_in_dataset: Optional[bool] = None,
@@ -119,6 +120,7 @@ class RPCSceneDataset(Dataset):
             raise ValueError("Current stage only supports reference_policy='first'")
 
         self.strict_same_hw = bool(strict_same_hw)
+        self.assume_all_views_same_hw = bool(assume_all_views_same_hw)
         self.crop_size = int(crop_size)
         if self.crop_size <= 0:
             raise ValueError("crop_size must be > 0")
@@ -148,7 +150,10 @@ class RPCSceneDataset(Dataset):
                 )
                 init_t_last = now
 
-        all_scenes = load_or_scan_dataset_root(root)
+        all_scenes = load_or_scan_dataset_root(
+            root,
+            assume_all_views_same_hw=self.assume_all_views_same_hw,
+        )
         _init_log("load_or_scan_dataset_root_done")
         scenes = [s for s in all_scenes if len(s.views) >= self.min_views]
         _init_log("filter_min_views_done")
