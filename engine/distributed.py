@@ -11,6 +11,7 @@ import contextlib
 import os
 import random
 from typing import Any
+from datetime import timedelta
 
 import numpy as np
 import torch
@@ -34,7 +35,7 @@ def init_distributed(backend: str = "nccl") -> dict[str, Any]:
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
         if not dist.is_initialized():
-            dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size,timeout=timedelta(hours=2))
 
     if torch.cuda.is_available():
         device = torch.device("cuda", local_rank if distributed else 0)
