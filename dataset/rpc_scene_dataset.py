@@ -340,8 +340,8 @@ class RPCSceneDataset(Dataset):
             line_c = float(ls[0].item())
             samp_c = float(ls[1].item())
 
-            top = int(round(line_c - half))
-            left = int(round(samp_c - half))
+            top = int(round(line_c - half) + rng.uniform(-half // 2, half // 2))
+            left = int(round(samp_c - half) + rng.uniform(-half // 2, half // 2))
             top = min(max(top, 0), int(h_full - self.crop_size))
             left = min(max(left, 0), int(w_full - self.crop_size))
             windows.append((top, left, self.crop_size, self.crop_size))
