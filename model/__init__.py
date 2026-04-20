@@ -1,6 +1,15 @@
 """model 包导出。"""
 
-from .backbone import DINOv3Backbone, DINOv3BackboneCfg, GeometryTokenMLP, VisualGeometryFuser
+from .backbone import (
+    DINOv3Backbone,
+    DINOv3BackboneCfg,
+    GeometryTokenMLP,
+    LocalPatchDetailEncoder,
+    LocalPatchDetailEncoderCfg,
+    VisualGeometryDetailFuser,
+    VisualGeometryFuser,
+)
+from .patch_matcher import PatchHeatmapMatcher, PatchMatcherCfg
 from .coders import HeightCoder, PointCoder, SymmetricBinCoderCfg, SymmetricBinScalarCoder
 from .encoder import AlternatingEncoder, AlternatingEncoderCfg
 from .heads import (
@@ -20,7 +29,12 @@ __all__ = [
     "DINOv3Backbone",
     "DINOv3BackboneCfg",
     "GeometryTokenMLP",
+    "LocalPatchDetailEncoder",
+    "LocalPatchDetailEncoderCfg",
+    "VisualGeometryDetailFuser",
     "VisualGeometryFuser",
+    "PatchHeatmapMatcher",
+    "PatchMatcherCfg",
     "AlternatingEncoder",
     "AlternatingEncoderCfg",
     "SymmetricBinScalarCoder",

@@ -187,6 +187,91 @@ class GeometryTokenMLP(nn.Module):
         return self.net(geom_feat)
 
 
+@dataclass
+class LocalPatchDetailEncoderCfg:
+    """Patch 内细节编码器配置。"""
+
+    patch_size: int = 16
+    in_channels: int = 3
+    hidden_dim: int = 1024
+    out_dim: int = 1024
+
+
+class LocalPatchDetailEncoder(nn.Module):
+    """严格 patch-local 细节编码器。
+
+    实现约束：
+    - 先做与 DINO 一致的右下 padding；
+    - PixelUnshuffle(patch_size) 将每个 patch 重排到通道；
+    - 后续仅用 1x1 Conv 做 channel mixing，不做任何空间混合。
+    """
+
+    def __init__(self, cfg: LocalPatchDetailEncoderCfg | None = None) -> None:
+        super().__init__()
+        self.cfg = cfg or LocalPatchDetailEncoderCfg()
+        self.patch_size = int(self.cfg.patch_size)
+        in_dim = int(self.cfg.in_channels) * self.patch_size * self.patch_size
+        hidden = int(self.cfg.hidden_dim)
+        out_dim = int(self.cfg.out_dim)
+
+        self.pixel_unshuffle = nn.PixelUnshuffle(self.patch_size)
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_dim, hidden, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.GELU(),
+            nn.Conv2d(hidden, out_dim, kernel_size=1, stride=1, padding=0, bias=True),
+        )
+        self.norm = nn.LayerNorm(out_dim)
+
+    def _pad_to_patch_multiple(self, x: torch.Tensor, pad_hw: tuple[int, int] | None = None) -> tuple[torch.Tensor, tuple[int, int], tuple[int, int]]:
+        _, _, h, w = x.shape
+        if pad_hw is not None:
+            hp, wp = int(pad_hw[0]), int(pad_hw[1])
+            if hp < h or wp < w:
+                raise ValueError(f"pad_hw must be >= input hw, got pad_hw={pad_hw}, input={(h, w)}")
+            pad_h = hp - h
+            pad_w = wp - w
+        else:
+            p = self.patch_size
+            hp = ((h + p - 1) // p) * p
+            wp = ((w + p - 1) // p) * p
+            pad_h = hp - h
+            pad_w = wp - w
+        x_pad = F.pad(x, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
+        return x_pad, (h, w), (hp, wp)
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        *,
+        orig_hw: tuple[int, int] | None = None,
+        pad_hw: tuple[int, int] | None = None,
+    ) -> dict[str, torch.Tensor | tuple[int, int]]:
+        if images.ndim != 4 or images.shape[1] != 3:
+            raise ValueError(f"images must be [B*V,3,H,W], got {tuple(images.shape)}")
+
+        x_pad, inferred_orig_hw, inferred_pad_hw = self._pad_to_patch_multiple(images, pad_hw=pad_hw)
+        if orig_hw is not None and tuple(orig_hw) != tuple(inferred_orig_hw):
+            raise ValueError(f"orig_hw mismatch: got {orig_hw}, inferred {inferred_orig_hw}")
+
+        hp, wp = inferred_pad_hw
+        gh, gw = hp // self.patch_size, wp // self.patch_size
+        b_all = images.shape[0]
+
+        # 先严格 patch-local 重排，再做纯 channel mixing（1x1）。
+        x = self.pixel_unshuffle(x_pad)  # [B*V, 3*P*P, Gh, Gw]
+        x = self.encoder(x)
+        c = x.shape[1]
+        tokens = x.permute(0, 2, 3, 1).reshape(b_all, gh * gw, c).contiguous()
+        tokens = self.norm(tokens)
+
+        return {
+            "orig_hw": inferred_orig_hw,
+            "pad_hw": inferred_pad_hw,
+            "grid_hw": (gh, gw),
+            "patch_tokens_detail": tokens,
+        }
+
+
 class VisualGeometryFuser(nn.Module):
     """视觉-几何 token 融合模块。
 
@@ -213,4 +298,17 @@ class VisualGeometryFuser(nn.Module):
             fused_tokens: [B,V,N,1024]。
         """
         x = torch.cat([visual_tokens, geom_tokens], dim=-1)
+        return self.norm(self.proj(x))
+
+
+class VisualGeometryDetailFuser(nn.Module):
+    """视觉 / 细节 / 几何三路 token 直接拼接融合。"""
+
+    def __init__(self, visual_dim: int = 1024, detail_dim: int = 1024, geom_dim: int = 256, out_dim: int = 1024) -> None:
+        super().__init__()
+        self.proj = nn.Linear(visual_dim + detail_dim + geom_dim, out_dim)
+        self.norm = nn.LayerNorm(out_dim)
+
+    def forward(self, visual_tokens: torch.Tensor, detail_tokens: torch.Tensor, geom_tokens: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([visual_tokens, detail_tokens, geom_tokens], dim=-1)
         return self.norm(self.proj(x))

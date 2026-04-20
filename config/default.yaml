@@ -115,6 +115,12 @@ model:
   task_adapter_depth: 2
   nce_projector_dim: 256
   nce_projector_hidden_dim: 512
+  detail_patch_encoder_enable: true
+  detail_patch_size: 16
+  detail_token_dim: 1024
+  patch_match_dim: 256
+  patch_match_heads: 4
+  patch_match_layers: 2
   encoder_num_heads: 8
   encoder_ffn_ratio: 4.0
   encoder_dropout: 0.0
@@ -196,6 +202,9 @@ loss:
   lambda_normal_height: 10.0
   lambda_normal_point: 10.0
   lambda_feature_nce: 1.0
+  lambda_patch_match: 0.5
+  patch_match_subpix_weight: 0.25
+  patch_match_max_pairs: 4096
   normal_w_cos: 1.0
   normal_w_l1: 0.5
   normal_eps: 1.0e-6
