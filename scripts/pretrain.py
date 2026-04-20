@@ -60,10 +60,11 @@ def build_model(cfg: dict[str, Any]) -> Any:
     return _build_model(cfg)
 
 
-def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> Any:
+def build_objective(cfg: dict[str, Any], geometry_ops: Any, patch_matcher: torch.nn.Module) -> Any:
     from loss.affine_loss import AffineGridLossCfg, AffinePairwiseGeometryLossCfg
     from loss.feature_nce_loss import FeatureInfoNCELossCfg
     from loss.normal_loss import PointNormalLossCfg
+    from loss.patch_match_loss import PatchInternalMatchLossCfg
     from loss.point_pair_loss import PointPairwiseLossCfg
     from loss.pretrain_objective import GeometryPretrainObjective, GeometryPretrainWeightCfg
 
@@ -90,6 +91,7 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> Any:
         lambda_normal_height=float(lcfg.get("lambda_normal_height", 0.2)),
         lambda_normal_point=float(lcfg.get("lambda_normal_point", 0.2)),
         lambda_feature_nce=float(lcfg.get("lambda_feature_nce", 0.1)),
+        lambda_patch_match=float(lcfg.get("lambda_patch_match", 0.5)),
         abs_keep_steps=int(lcfg.get("abs_keep_steps", lcfg.get("height_abs_keep_steps", 5000))),
     )
     point_pair_cfg = PointPairwiseLossCfg(
@@ -107,12 +109,19 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> Any:
         sign_invariant=bool(lcfg.get("normal_sign_invariant", True)),
         detach_gt=bool(lcfg.get("normal_detach_gt", True)),
     )
+    patch_match_cfg = PatchInternalMatchLossCfg(
+        patch_size=int(cfg.get("model", {}).get("detail_patch_size", 16)),
+        subpix_weight=float(lcfg.get("patch_match_subpix_weight", 0.25)),
+        max_pairs=int(lcfg.get("patch_match_max_pairs", 4096)),
+    )
     return GeometryPretrainObjective(
         geometry_ops=geometry_ops,
         affine_grid_cfg=grid_cfg,
         affine_pair_cfg=pair_cfg,
         point_pair_cfg=point_pair_cfg,
         feature_nce_cfg=feature_nce_cfg,
+        patch_match_cfg=patch_match_cfg,
+        patch_matcher=patch_matcher,
         normal_cfg=normal_cfg,
         height_beta=float(lcfg.get("height_beta", 1.0)),
         point_beta=float(lcfg.get("point_beta", 1.0)),
@@ -216,7 +225,7 @@ def main() -> None:
     elif hasattr(model, "gaussian_head"):
         model.gaussian_head.requires_grad_(False)
     _startup_log("model_built_and_to_device", rank=int(dist_state["rank"]))
-    objective = build_objective(cfg, model.rpc_ops)
+    objective = build_objective(cfg, model.rpc_ops, model.patch_matcher)
     _startup_log("objective_built", rank=int(dist_state["rank"]))
     optimizer, scheduler = build_optimizer_and_scheduler(cfg, model)
     _startup_log("optimizer_and_scheduler_built", rank=int(dist_state["rank"]))

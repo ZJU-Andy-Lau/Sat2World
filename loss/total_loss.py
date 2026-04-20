@@ -27,6 +27,7 @@ from loss.affine_loss import (
 from loss.feature_nce_loss import FeatureInfoNCELoss, FeatureInfoNCELossCfg
 from loss.height_loss import HeightHuberLoss
 from loss.normal_loss import PointNormalLoss, PointNormalLossCfg
+from loss.patch_match_loss import PatchInternalMatchLoss, PatchInternalMatchLossCfg
 from loss.point_loss import PointMapLoss
 from loss.point_pair_loss import HeightReprojectionLoss, PointPairwiseConsistencyLoss, PointPairwiseLossCfg, PointReprojectionLoss
 from loss.regularization_loss import CenterConsistencyLoss, CoderProbe, GaussianRegularizationLoss
@@ -64,6 +65,7 @@ class LossWeightScheduler:
             "lambda_normal_height": 0.2,
             "lambda_normal_point": 0.2,
             "lambda_feature_nce": 0.1,
+            "lambda_patch_match": 0.5,
             "lambda_center": 0.2,
             "lambda_opacity_reg": 0.01,
             "lambda_scale_reg": 0.01,
@@ -169,6 +171,8 @@ class RPCAnySplatTrainingObjective:
         point_beta: float = 1.0,
         point_pair_cfg: PointPairwiseLossCfg | None = None,
         feature_nce_cfg: FeatureInfoNCELossCfg | None = None,
+        patch_match_cfg: PatchInternalMatchLossCfg | None = None,
+        patch_matcher: torch.nn.Module | None = None,
         normal_cfg: PointNormalLossCfg | None = None,
         scale_min: float = 1e-4,
         scale_max: float = 0.5,
@@ -188,6 +192,13 @@ class RPCAnySplatTrainingObjective:
         self.point_reproj_loss = PointReprojectionLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.height_reproj_loss = HeightReprojectionLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.feature_nce_loss = FeatureInfoNCELoss(geometry_ops=geometry_ops, cfg=feature_nce_cfg or FeatureInfoNCELossCfg())
+        if patch_matcher is None:
+            raise ValueError("patch_matcher must be provided for PatchInternalMatchLoss.")
+        self.patch_match_loss = PatchInternalMatchLoss(
+            geometry_ops=geometry_ops,
+            patch_matcher=patch_matcher,
+            cfg=patch_match_cfg or PatchInternalMatchLossCfg(),
+        )
         self.normal_loss = PointNormalLoss(geometry_ops=geometry_ops, cfg=normal_cfg or PointNormalLossCfg())
 
         self.center_loss = CenterConsistencyLoss()
@@ -284,6 +295,7 @@ class RPCAnySplatTrainingObjective:
                 "patch_centers",
                 "patch_grid_hw",
                 "patch_padded_hw",
+                "patch_tokens_detail",
             ],
             "outputs",
         )
@@ -347,6 +359,13 @@ class RPCAnySplatTrainingObjective:
             patch_padded_hw=outputs["patch_padded_hw"],
             batch=batch,
         )
+        l_patch_match, p_patch_match, aux_patch_match = self.patch_match_loss(
+            patch_tokens_detail=outputs["patch_tokens_detail"],
+            patch_valid_mask=outputs["patch_valid_mask"],
+            patch_centers=outputs["patch_centers"],
+            patch_grid_hw=outputs["patch_grid_hw"],
+            batch=batch,
+        )
 
         l_center, p_center = self.center_loss(
             outputs["gaussian_centers_rpc"],
@@ -400,6 +419,7 @@ class RPCAnySplatTrainingObjective:
             + weights.get("lambda_normal_height", 0.0) * l_nh
             + weights.get("lambda_normal_point", 0.0) * l_np
             + weights.get("lambda_feature_nce", 0.0) * l_nce
+            + weights.get("lambda_patch_match", 0.0) * l_patch_match
             + weights["lambda_center"] * l_center
             + weights["lambda_opacity_reg"] * l_opacity
             + weights["lambda_scale_reg"] * l_scale
@@ -422,6 +442,7 @@ class RPCAnySplatTrainingObjective:
             "loss_normal_height": l_nh,
             "loss_normal_point": l_np,
             "loss_feature_nce": l_nce,
+            "loss_patch_match": l_patch_match,
             "loss_center_consistency": l_center,
             "loss_gaussian_opacity_reg": l_opacity,
             "loss_gaussian_scale_reg": l_scale,
@@ -458,6 +479,9 @@ class RPCAnySplatTrainingObjective:
             "metric_normal_valid_ratio": p_norm.get("normal_valid_ratio", zero),
             "metric_feature_nce_valid_pairs": p_nce.get("feature_nce_valid_pairs", zero),
             "metric_feature_nce_acc_top1": p_nce.get("feature_nce_acc_top1", zero),
+            "metric_patch_match_valid_pairs": p_patch_match.get("patch_match_valid_pairs", zero),
+            "metric_patch_match_acc_top1_1px": p_patch_match.get("patch_match_acc_top1_1px", zero),
+            "metric_patch_match_l1_px": p_patch_match.get("patch_match_l1_px", zero),
             "metric_center_dist_mean": p_center.get("center_dist_mean", zero),
             "metric_center_dist_rmse": p_center.get("center_dist_rmse", zero),
             "probe_gaussian_opacity_mean": p_gauss.get("gaussian_opacity_mean", zero),
@@ -488,6 +512,7 @@ class RPCAnySplatTrainingObjective:
             "weight_normal_height": weights.get("lambda_normal_height", 0.0),
             "weight_normal_point": weights.get("lambda_normal_point", 0.0),
             "weight_feature_nce": weights.get("lambda_feature_nce", 0.0),
+            "weight_patch_match": weights.get("lambda_patch_match", 0.0),
             "weight_center": weights["lambda_center"],
             "weight_opacity_reg": weights["lambda_opacity_reg"],
             "weight_scale_reg": weights["lambda_scale_reg"],
@@ -506,6 +531,7 @@ class RPCAnySplatTrainingObjective:
         aux_dict.update(aux_norm)
         aux_dict.update(aux_hreproj)
         aux_dict.update(aux_nce)
+        aux_dict.update(aux_patch_match)
 
         return total, self._to_float_scalar_dict(scalar_dict), aux_dict
 

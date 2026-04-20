@@ -111,6 +111,12 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
     scfg.nce_layer_index = int(m.get("nce_layer_index", scfg.nce_layer_index))
     scfg.nce_projector_dim = int(m.get("nce_projector_dim", scfg.nce_projector_dim))
     scfg.nce_projector_hidden_dim = int(m.get("nce_projector_hidden_dim", scfg.nce_projector_hidden_dim))
+    scfg.detail_patch_encoder_enable = bool(m.get("detail_patch_encoder_enable", scfg.detail_patch_encoder_enable))
+    scfg.detail_patch_size = int(m.get("detail_patch_size", scfg.detail_patch_size))
+    scfg.detail_token_dim = int(m.get("detail_token_dim", scfg.detail_token_dim))
+    scfg.patch_match_dim = int(m.get("patch_match_dim", scfg.patch_match_dim))
+    scfg.patch_match_heads = int(m.get("patch_match_heads", scfg.patch_match_heads))
+    scfg.patch_match_layers = int(m.get("patch_match_layers", scfg.patch_match_layers))
     return Sat2World(scfg)
 
 
@@ -124,10 +130,11 @@ def build_renderer(cfg: dict[str, Any], geometry_ops: Any) -> RPCGaussianRendere
     return RPCGaussianRenderer(geometry_ops, rcfg)
 
 
-def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTrainingObjective:
+def build_objective(cfg: dict[str, Any], geometry_ops: Any, patch_matcher: torch.nn.Module) -> RPCAnySplatTrainingObjective:
     from loss.affine_loss import AffineGridLossCfg, AffinePairwiseGeometryLossCfg
     from loss.feature_nce_loss import FeatureInfoNCELossCfg
     from loss.normal_loss import PointNormalLossCfg
+    from loss.patch_match_loss import PatchInternalMatchLossCfg
     from loss.point_pair_loss import PointPairwiseLossCfg
     from loss.total_loss import LossWeightScheduler, RPCAnySplatTrainingObjective
 
@@ -160,6 +167,7 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
             "lambda_normal_height": float(lcfg.get("lambda_normal_height", 0.2)),
             "lambda_normal_point": float(lcfg.get("lambda_normal_point", 0.2)),
             "lambda_feature_nce": float(lcfg.get("lambda_feature_nce", 0.1)),
+            "lambda_patch_match": float(lcfg.get("lambda_patch_match", 0.5)),
             "lambda_center": float(lcfg.get("lambda_center", 0.2)),
             "lambda_opacity_reg": float(lcfg.get("lambda_opacity_reg", 0.01)),
             "lambda_scale_reg": float(lcfg.get("lambda_scale_reg", 0.01)),
@@ -187,12 +195,19 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
         grid_h=int(lcfg.get("point_pair_grid_h", 64)),
         grid_w=int(lcfg.get("point_pair_grid_w", 64)),
     )
+    patch_match_cfg = PatchInternalMatchLossCfg(
+        patch_size=int(cfg.get("model", {}).get("detail_patch_size", 16)),
+        subpix_weight=float(lcfg.get("patch_match_subpix_weight", 0.25)),
+        max_pairs=int(lcfg.get("patch_match_max_pairs", 4096)),
+    )
     return RPCAnySplatTrainingObjective(
         geometry_ops=geometry_ops,
         affine_grid_cfg=grid_cfg,
         affine_pair_cfg=pair_cfg,
         point_pair_cfg=point_pair_cfg,
         feature_nce_cfg=feature_nce_cfg,
+        patch_match_cfg=patch_match_cfg,
+        patch_matcher=patch_matcher,
         normal_cfg=normal_cfg,
         height_beta=float(lcfg.get("height_beta", 1.0)),
         point_beta=float(lcfg.get("point_beta", 1.0)),
@@ -381,7 +396,7 @@ def main() -> None:
     _startup_log("model_built_and_to_device", rank=int(dist_state["rank"]))
     renderer = build_renderer(cfg, model.rpc_ops)
     _startup_log("renderer_built", rank=int(dist_state["rank"]))
-    objective = build_objective(cfg, model.rpc_ops)
+    objective = build_objective(cfg, model.rpc_ops, model.patch_matcher)
     _startup_log("objective_built", rank=int(dist_state["rank"]))
     optimizer, scheduler = build_optimizer_and_scheduler(cfg, model)
     _startup_log("optimizer_and_scheduler_built", rank=int(dist_state["rank"]))

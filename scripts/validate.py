@@ -69,8 +69,9 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
     return Sat2World(scfg)
 
 
-def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTrainingObjective:
+def build_objective(cfg: dict[str, Any], geometry_ops: Any, patch_matcher: torch.nn.Module) -> RPCAnySplatTrainingObjective:
     from loss.affine_loss import AffineGridLossCfg, AffinePairwiseGeometryLossCfg
+    from loss.patch_match_loss import PatchInternalMatchLossCfg
     from loss.normal_loss import PointNormalLossCfg
     from loss.total_loss import LossWeightScheduler, RPCAnySplatTrainingObjective
 
@@ -95,10 +96,17 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any) -> RPCAnySplatTraini
         sign_invariant=bool(lcfg.get("normal_sign_invariant", True)),
         detach_gt=bool(lcfg.get("normal_detach_gt", True)),
     )
+    patch_match_cfg = PatchInternalMatchLossCfg(
+        patch_size=int(cfg.get("model", {}).get("detail_patch_size", 16)),
+        subpix_weight=float(lcfg.get("patch_match_subpix_weight", 0.25)),
+        max_pairs=int(lcfg.get("patch_match_max_pairs", 4096)),
+    )
     return RPCAnySplatTrainingObjective(
         geometry_ops=geometry_ops,
         affine_grid_cfg=grid_cfg,
         affine_pair_cfg=pair_cfg,
+        patch_match_cfg=patch_match_cfg,
+        patch_matcher=patch_matcher,
         normal_cfg=normal_cfg,
         height_beta=float(lcfg.get("height_beta", 1.0)),
         point_beta=float(lcfg.get("point_beta", 1.0)),
@@ -175,7 +183,7 @@ def main() -> None:
         if hasattr(rcfg, k):
             setattr(rcfg, k, v)
     renderer = RPCGaussianRenderer(model.rpc_ops, rcfg)
-    objective = build_objective(cfg, model.rpc_ops)
+    objective = build_objective(cfg, model.rpc_ops, model.patch_matcher)
     model = wrap_ddp(model, device)
 
     monitor = None
