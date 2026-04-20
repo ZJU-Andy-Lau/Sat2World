@@ -119,7 +119,7 @@ def main() -> None:
 
         model = build_model(cfg).to(device)
         renderer = build_renderer(cfg, model.rpc_ops)
-        objective = build_objective(cfg, model.rpc_ops)
+        objective = build_objective(cfg, model.rpc_ops, model.patch_matcher)
         model.train()
 
         batch = _build_real_batch_from_val(cfg, scene_id=args.scene_id, val_index=args.val_index)

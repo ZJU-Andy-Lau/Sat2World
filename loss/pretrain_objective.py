@@ -22,6 +22,7 @@ from loss.affine_loss import (
 from loss.feature_nce_loss import FeatureInfoNCELoss, FeatureInfoNCELossCfg
 from loss.height_loss import HeightHuberLoss
 from loss.normal_loss import PointNormalLoss, PointNormalLossCfg
+from loss.patch_match_loss import PatchInternalMatchLoss, PatchInternalMatchLossCfg
 from loss.point_pair_loss import HeightReprojectionLoss, PointPairwiseConsistencyLoss, PointPairwiseLossCfg, PointReprojectionLoss
 from loss.point_loss import PointMapLoss
 
@@ -42,6 +43,7 @@ class GeometryPretrainWeightCfg:
     lambda_normal_height: float = 0.2
     lambda_normal_point: float = 0.2
     lambda_feature_nce: float = 0.1
+    lambda_patch_match: float = 0.5
     abs_keep_steps: int = 5000
 
 
@@ -65,6 +67,8 @@ class GeometryPretrainObjective:
         affine_pair_cfg: AffinePairwiseGeometryLossCfg | None = None,
         point_pair_cfg: PointPairwiseLossCfg | None = None,
         feature_nce_cfg: FeatureInfoNCELossCfg | None = None,
+        patch_match_cfg: PatchInternalMatchLossCfg | None = None,
+        patch_matcher: torch.nn.Module | None = None,
         normal_cfg: PointNormalLossCfg | None = None,
         height_beta: float = 1.0,
         point_beta: float = 1.0,
@@ -81,6 +85,13 @@ class GeometryPretrainObjective:
         self.point_pair_loss = PointPairwiseConsistencyLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.height_reproj_loss = HeightReprojectionLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.feature_nce_loss = FeatureInfoNCELoss(geometry_ops=geometry_ops, cfg=feature_nce_cfg or FeatureInfoNCELossCfg())
+        if patch_matcher is None:
+            raise ValueError("patch_matcher must be provided for PatchInternalMatchLoss.")
+        self.patch_match_loss = PatchInternalMatchLoss(
+            geometry_ops=geometry_ops,
+            patch_matcher=patch_matcher,
+            cfg=patch_match_cfg or PatchInternalMatchLossCfg(),
+        )
         self.normal_loss = PointNormalLoss(geometry_ops=geometry_ops, cfg=normal_cfg or PointNormalLossCfg())
         self.weights = weights or GeometryPretrainWeightCfg()
 
@@ -136,6 +147,7 @@ class GeometryPretrainObjective:
                 "patch_centers",
                 "patch_grid_hw",
                 "patch_padded_hw",
+                "patch_tokens_match",
             ],
             "outputs",
         )
@@ -187,6 +199,13 @@ class GeometryPretrainObjective:
             patch_padded_hw=outputs["patch_padded_hw"],
             batch=batch,
         )
+        l_patch_match, p_patch_match, aux_patch_match = self.patch_match_loss(
+            patch_tokens_match=outputs["patch_tokens_match"],
+            patch_valid_mask=outputs["patch_valid_mask"],
+            patch_centers=outputs["patch_centers"],
+            patch_grid_hw=outputs["patch_grid_hw"],
+            batch=batch,
+        )
 
         w = self.weights
         abs_mul = 1.0 if int(global_step) < int(w.abs_keep_steps) else 0.1
@@ -205,6 +224,7 @@ class GeometryPretrainObjective:
             + w.lambda_normal_height * l_nh
             + w.lambda_normal_point * l_np
             + w.lambda_feature_nce * l_nce
+            + w.lambda_patch_match * l_patch_match
         )
 
         zero = torch.zeros((), device=total.device, dtype=total.dtype)
@@ -223,6 +243,7 @@ class GeometryPretrainObjective:
             "loss_normal_height": l_nh,
             "loss_normal_point": l_np,
             "loss_feature_nce": l_nce,
+            "loss_patch_match": l_patch_match,
             "metric_affine_grid_error_px_mean": p_aff_grid.get("affine_grid_error_px_mean", zero),
             "metric_affine_pair_error_px_mean": p_aff_pair.get("affine_pair_error_px_mean", zero),
             "metric_ref_affine_identity_l2": p_aff_ref.get("ref_affine_identity_l2", zero),
@@ -247,6 +268,9 @@ class GeometryPretrainObjective:
             "metric_normal_p_cos_mean": p_norm.get("normal_p_cos_mean", zero),
             "metric_normal_p_ang_deg_mean": p_norm.get("normal_p_ang_deg_mean", zero),
             "metric_normal_valid_ratio": p_norm.get("normal_valid_ratio", zero),
+            "metric_patch_match_valid_pairs": p_patch_match.get("patch_match_valid_pairs", zero),
+            "metric_patch_match_acc_top1_1px": p_patch_match.get("patch_match_acc_top1_1px", zero),
+            "metric_patch_match_l1_px": p_patch_match.get("patch_match_l1_px", zero),
             "weight_affine_grid": float(w.lambda_affine_grid),
             "weight_affine_pair": float(w.lambda_affine_pair),
             "weight_affine_reg": float(w.lambda_affine_reg),
@@ -260,6 +284,7 @@ class GeometryPretrainObjective:
             "weight_normal_height": float(w.lambda_normal_height),
             "weight_normal_point": float(w.lambda_normal_point),
             "weight_feature_nce": float(w.lambda_feature_nce),
+            "weight_patch_match": float(w.lambda_patch_match),
             # 显式输出关闭项，便于日志检查
             "weight_center": 0.0,
             "weight_opacity_reg": 0.0,
@@ -285,6 +310,7 @@ class GeometryPretrainObjective:
         aux_dict.update(aux_norm)
         aux_dict.update(aux_hreproj)
         aux_dict.update(aux_nce)
+        aux_dict.update(aux_patch_match)
         scalar_dict["metric_feature_nce_valid_pairs"] = p_nce.get("feature_nce_valid_pairs", zero)
         scalar_dict["metric_feature_nce_acc_top1"] = p_nce.get("feature_nce_acc_top1", zero)
 

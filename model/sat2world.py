@@ -30,7 +30,14 @@ from geometry import (
     reshape_bv_to_bvchw,
     reshape_bv_to_bvn,
 )
-from model.backbone import DINOv3Backbone, DINOv3BackboneCfg, GeometryTokenMLP, VisualGeometryFuser
+from model.backbone import (
+    DINOv3Backbone,
+    DINOv3BackboneCfg,
+    GeometryTokenMLP,
+    LocalPatchDetailEncoder,
+    LocalPatchDetailEncoderCfg,
+    VisualGeometryDetailFuser,
+)
 from model.coders import HeightCoder, PointCoder, SymmetricBinCoderCfg
 from model.encoder import AlternatingEncoder, AlternatingEncoderCfg
 from model.heads import (
@@ -43,6 +50,7 @@ from model.heads import (
     PointHead,
     TaskAdapter,
 )
+from model.patch_matcher import PatchHeatmapMatcher, PatchMatcherCfg
 
 
 @dataclass
@@ -78,6 +86,11 @@ class Sat2WorldCfg:
     nce_layer_index: int = 5  # 0-based，第 6 层
     nce_projector_dim: int = 256
     nce_projector_hidden_dim: int = 512
+    detail_patch_size: int = 16
+    detail_token_dim: int = 1024
+    patch_match_dim: int = 256
+    patch_match_heads: int = 4
+    patch_match_layers: int = 2
 
 
 class Sat2World(nn.Module):
@@ -98,8 +111,29 @@ class Sat2World(nn.Module):
         self.cfg = cfg
 
         self.backbone = DINOv3Backbone(cfg.backbone)
+        self.detail_encoder = LocalPatchDetailEncoder(
+            LocalPatchDetailEncoderCfg(
+                patch_size=int(cfg.detail_patch_size),
+                in_channels=3,
+                hidden_dim=int(cfg.detail_token_dim),
+                out_dim=int(cfg.detail_token_dim),
+            )
+        )
         self.geom_mlp = GeometryTokenMLP(in_dim=45, hidden_dim=256, out_dim=256)
-        self.fuser = VisualGeometryFuser(visual_dim=self.backbone.embed_dim, geom_dim=256, out_dim=self.backbone.embed_dim)
+        self.fuser = VisualGeometryDetailFuser(
+            visual_dim=self.backbone.embed_dim,
+            detail_dim=int(cfg.detail_token_dim),
+            geom_dim=256,
+            out_dim=self.backbone.embed_dim,
+        )
+        self.patch_matcher = PatchHeatmapMatcher(
+            PatchMatcherCfg(
+                in_dim=self.backbone.embed_dim,
+                match_dim=int(cfg.patch_match_dim),
+                num_heads=int(cfg.patch_match_heads),
+                num_layers=int(cfg.patch_match_layers),
+            )
+        )
 
         encoder_cfg = cfg.encoder
         if encoder_cfg.dim != self.backbone.embed_dim:
@@ -261,6 +295,12 @@ class Sat2World(nn.Module):
         images_bv = images.view(b * v, 3, h, w)
         backbone_out = self.backbone(images_bv)
         patch_tokens_vis = backbone_out["patch_tokens"].view(b, v, -1, self.backbone.embed_dim)
+        detail_out = self.detail_encoder(
+            images_bv,
+            orig_hw=backbone_out["orig_hw"],
+            pad_hw=backbone_out["pad_hw"],
+        )
+        patch_tokens_detail = detail_out["patch_tokens_detail"].view(b, v, -1, int(self.cfg.detail_token_dim))
         patch_valid_mask_backbone = reshape_bv_to_bvn(backbone_out["patch_valid_mask"], b, v)
 
         gh, gw = backbone_out["grid_hw"]
@@ -286,7 +326,7 @@ class Sat2World(nn.Module):
             scene_xy_scale=scene_xy_scale,
         )
         geom_tok = self.geom_mlp(geom_feat)
-        fused_tok = self.fuser(patch_tokens_vis, geom_tok)
+        fused_tok = self.fuser(patch_tokens_vis, patch_tokens_detail, geom_tok)
 
         enc_out = self.encoder(
             fused_tok,
@@ -376,6 +416,7 @@ class Sat2World(nn.Module):
             "point_fine_raw": {"x": x_fine, "y": y_fine, "z": z_fine},
             "patch_valid_mask": patch_valid_mask,
             "patch_tokens_final": patch_tokens_final,
+            "patch_tokens_match": patch_tokens_layer_sel,
             "patch_tokens_layer_for_nce": patch_tokens_layer_sel,
             "patch_tokens_nce_proj": patch_tokens_nce_proj,
             "view_tokens_final": view_tokens_final,
