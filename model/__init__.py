@@ -7,7 +7,7 @@ from .backbone import (
     LocalPatchDetailEncoder,
     LocalPatchDetailEncoderCfg,
     VisualGeometryDetailFuser,
-    VisualGeometryFuser,
+    # VisualGeometryFuser,
 )
 from .patch_matcher import PatchHeatmapMatcher, PatchMatcherCfg
 from .coders import HeightCoder, PointCoder, SymmetricBinCoderCfg, SymmetricBinScalarCoder
@@ -32,7 +32,7 @@ __all__ = [
     "LocalPatchDetailEncoder",
     "LocalPatchDetailEncoderCfg",
     "VisualGeometryDetailFuser",
-    "VisualGeometryFuser",
+    # "VisualGeometryFuser",
     "PatchHeatmapMatcher",
     "PatchMatcherCfg",
     "AlternatingEncoder",
