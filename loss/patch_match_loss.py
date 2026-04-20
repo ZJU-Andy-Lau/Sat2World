@@ -143,7 +143,6 @@ class PatchInternalMatchLoss:
         param_stub = torch.zeros((), device=device, dtype=dtype)
         for p_match in self.patch_matcher.parameters():
             param_stub = param_stub + p_match.sum().to(device=device, dtype=dtype) * 0.0
-            break
         loss_stub = patch_tokens_detail.sum() * 0.0 + param_stub
 
         if len(src_tok_all) == 0:
