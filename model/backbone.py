@@ -272,33 +272,33 @@ class LocalPatchDetailEncoder(nn.Module):
         }
 
 
-class VisualGeometryFuser(nn.Module):
-    """视觉-几何 token 融合模块。
+# class VisualGeometryFuser(nn.Module):
+#     """视觉-几何 token 融合模块。
 
-    功能:
-    - 拼接视觉 token (1024) 与几何 token (256) 到 1280；
-    - 线性压回 1024；
-    - LayerNorm 稳定分布。
-    """
+#     功能:
+#     - 拼接视觉 token (1024) 与几何 token (256) 到 1280；
+#     - 线性压回 1024；
+#     - LayerNorm 稳定分布。
+#     """
 
-    def __init__(self, visual_dim: int = 1024, geom_dim: int = 256, out_dim: int = 1024) -> None:
-        """初始化融合模块。"""
-        super().__init__()
-        self.proj = nn.Linear(visual_dim + geom_dim, out_dim)
-        self.norm = nn.LayerNorm(out_dim)
+#     def __init__(self, visual_dim: int = 1024, geom_dim: int = 256, out_dim: int = 1024) -> None:
+#         """初始化融合模块。"""
+#         super().__init__()
+#         self.proj = nn.Linear(visual_dim + geom_dim, out_dim)
+#         self.norm = nn.LayerNorm(out_dim)
 
-    def forward(self, visual_tokens: torch.Tensor, geom_tokens: torch.Tensor) -> torch.Tensor:
-        """融合视觉与几何 token。
+#     def forward(self, visual_tokens: torch.Tensor, geom_tokens: torch.Tensor) -> torch.Tensor:
+#         """融合视觉与几何 token。
 
-        参数:
-            visual_tokens: [B,V,N,1024]。
-            geom_tokens: [B,V,N,256]。
+#         参数:
+#             visual_tokens: [B,V,N,1024]。
+#             geom_tokens: [B,V,N,256]。
 
-        返回:
-            fused_tokens: [B,V,N,1024]。
-        """
-        x = torch.cat([visual_tokens, geom_tokens], dim=-1)
-        return self.norm(self.proj(x))
+#         返回:
+#             fused_tokens: [B,V,N,1024]。
+#         """
+#         x = torch.cat([visual_tokens, geom_tokens], dim=-1)
+#         return self.norm(self.proj(x))
 
 
 class VisualGeometryDetailFuser(nn.Module):
@@ -306,7 +306,13 @@ class VisualGeometryDetailFuser(nn.Module):
 
     def __init__(self, visual_dim: int = 1024, detail_dim: int = 1024, geom_dim: int = 256, out_dim: int = 1024) -> None:
         super().__init__()
-        self.proj = nn.Linear(visual_dim + detail_dim + geom_dim, out_dim)
+        total_dim = visual_dim + detail_dim + geom_dim
+        self.proj = nn.Sequential(
+            nn.Linear(total_dim,total_dim),
+            nn.GELU(),
+            nn.Linear(total_dim,out_dim)
+        )
+        # self.proj = nn.Linear(visual_dim + detail_dim + geom_dim, out_dim)
         self.norm = nn.LayerNorm(out_dim)
 
     def forward(self, visual_tokens: torch.Tensor, detail_tokens: torch.Tensor, geom_tokens: torch.Tensor) -> torch.Tensor:
