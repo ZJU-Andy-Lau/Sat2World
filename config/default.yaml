@@ -115,7 +115,6 @@ model:
   task_adapter_depth: 2
   nce_projector_dim: 256
   nce_projector_hidden_dim: 512
-  detail_patch_encoder_enable: true
   detail_patch_size: 16
   detail_token_dim: 1024
   patch_match_dim: 256

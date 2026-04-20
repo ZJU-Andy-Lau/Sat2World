@@ -147,7 +147,7 @@ class GeometryPretrainObjective:
                 "patch_centers",
                 "patch_grid_hw",
                 "patch_padded_hw",
-                "patch_tokens_detail",
+                "patch_tokens_match",
             ],
             "outputs",
         )
@@ -200,7 +200,7 @@ class GeometryPretrainObjective:
             batch=batch,
         )
         l_patch_match, p_patch_match, aux_patch_match = self.patch_match_loss(
-            patch_tokens_detail=outputs["patch_tokens_detail"],
+            patch_tokens_match=outputs["patch_tokens_match"],
             patch_valid_mask=outputs["patch_valid_mask"],
             patch_centers=outputs["patch_centers"],
             patch_grid_hw=outputs["patch_grid_hw"],

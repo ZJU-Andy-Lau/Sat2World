@@ -1,6 +1,6 @@
 """loss.patch_match_loss
 
-基于 patch-local detail token 的 patch 内匹配监督。
+基于交替注意力编码器同层 patch token 的 patch 内匹配监督。
 """
 
 from __future__ import annotations
@@ -39,19 +39,19 @@ class PatchInternalMatchLoss:
     def __call__(
         self,
         *,
-        patch_tokens_detail: torch.Tensor,
+        patch_tokens_match: torch.Tensor,
         patch_valid_mask: torch.Tensor,
         patch_centers: torch.Tensor,
         patch_grid_hw: tuple[int, int],
         batch: dict[str, Any],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
-        b, v, n, _ = patch_tokens_detail.shape
+        b, v, n, _ = patch_tokens_match.shape
         gh, gw = int(patch_grid_hw[0]), int(patch_grid_hw[1])
         if n != gh * gw:
             raise ValueError(f"patch token count mismatch: N={n}, Gh*Gw={gh * gw}")
 
-        device = patch_tokens_detail.device
-        dtype = patch_tokens_detail.dtype
+        device = patch_tokens_match.device
+        dtype = patch_tokens_match.dtype
         p = int(self.cfg.patch_size)
         ref_idx = self._expand_ref_idx(batch.get("ref_view_idx", None), b, v, device)
 
@@ -135,15 +135,15 @@ class PatchInternalMatchLoss:
                 local_samp = (s_ref - top_samp).clamp(0.0, float(p) - 1e-4)
                 tgt_local = torch.stack([local_line, local_samp], dim=-1)
 
-                src_tok_all.append(patch_tokens_detail[bi, vi, src_idx])
-                ref_tok_all.append(patch_tokens_detail[bi, ref, ref_flat])
+                src_tok_all.append(patch_tokens_match[bi, vi, src_idx])
+                ref_tok_all.append(patch_tokens_match[bi, ref, ref_flat])
                 tgt_local_all.append(tgt_local)
 
         # 空样本安全：与 matcher 参数保持图连接，避免 DDP unused parameter
         param_stub = torch.zeros((), device=device, dtype=dtype)
         for p_match in self.patch_matcher.parameters():
             param_stub = param_stub + p_match.sum().to(device=device, dtype=dtype) * 0.0
-        loss_stub = patch_tokens_detail.sum() * 0.0 + param_stub
+        loss_stub = patch_tokens_match.sum() * 0.0 + param_stub
 
         if len(src_tok_all) == 0:
             zero = torch.zeros((), device=device, dtype=dtype)

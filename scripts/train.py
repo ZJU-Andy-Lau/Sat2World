@@ -111,7 +111,6 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
     scfg.nce_layer_index = int(m.get("nce_layer_index", scfg.nce_layer_index))
     scfg.nce_projector_dim = int(m.get("nce_projector_dim", scfg.nce_projector_dim))
     scfg.nce_projector_hidden_dim = int(m.get("nce_projector_hidden_dim", scfg.nce_projector_hidden_dim))
-    scfg.detail_patch_encoder_enable = bool(m.get("detail_patch_encoder_enable", scfg.detail_patch_encoder_enable))
     scfg.detail_patch_size = int(m.get("detail_patch_size", scfg.detail_patch_size))
     scfg.detail_token_dim = int(m.get("detail_token_dim", scfg.detail_token_dim))
     scfg.patch_match_dim = int(m.get("patch_match_dim", scfg.patch_match_dim))

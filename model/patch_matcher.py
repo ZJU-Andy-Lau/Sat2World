@@ -1,7 +1,7 @@
 """patch_matcher.py
 
 轻量 patch 内匹配器：
-- 输入一批 src/ref patch token 对 [M,1024]；
+- 输入一批 src/ref patch token 对 [M,1024]（来自 encoder 同层 patch token）；
 - 使用联合双 token 序列 self-attn + ref<-src cross-attn 交替更新；
 - 仅从更新后的 ref token 解码 16x16 heatmap logits。
 """

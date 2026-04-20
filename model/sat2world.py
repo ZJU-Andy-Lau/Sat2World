@@ -86,7 +86,6 @@ class Sat2WorldCfg:
     nce_layer_index: int = 5  # 0-based，第 6 层
     nce_projector_dim: int = 256
     nce_projector_hidden_dim: int = 512
-    detail_patch_encoder_enable: bool = True
     detail_patch_size: int = 16
     detail_token_dim: int = 1024
     patch_match_dim: int = 256
@@ -112,7 +111,6 @@ class Sat2World(nn.Module):
         self.cfg = cfg
 
         self.backbone = DINOv3Backbone(cfg.backbone)
-        self.detail_encoder_enabled = bool(cfg.detail_patch_encoder_enable)
         self.detail_encoder = LocalPatchDetailEncoder(
             LocalPatchDetailEncoderCfg(
                 patch_size=int(cfg.detail_patch_size),
@@ -130,7 +128,7 @@ class Sat2World(nn.Module):
         )
         self.patch_matcher = PatchHeatmapMatcher(
             PatchMatcherCfg(
-                in_dim=int(cfg.detail_token_dim),
+                in_dim=self.backbone.embed_dim,
                 match_dim=int(cfg.patch_match_dim),
                 num_heads=int(cfg.patch_match_heads),
                 num_layers=int(cfg.patch_match_layers),
@@ -297,15 +295,12 @@ class Sat2World(nn.Module):
         images_bv = images.view(b * v, 3, h, w)
         backbone_out = self.backbone(images_bv)
         patch_tokens_vis = backbone_out["patch_tokens"].view(b, v, -1, self.backbone.embed_dim)
-        if self.detail_encoder_enabled:
-            detail_out = self.detail_encoder(
-                images_bv,
-                orig_hw=backbone_out["orig_hw"],
-                pad_hw=backbone_out["pad_hw"],
-            )
-            patch_tokens_detail = detail_out["patch_tokens_detail"].view(b, v, -1, int(self.cfg.detail_token_dim))
-        else:
-            patch_tokens_detail = patch_tokens_vis.new_zeros(b, v, patch_tokens_vis.shape[2], int(self.cfg.detail_token_dim))
+        detail_out = self.detail_encoder(
+            images_bv,
+            orig_hw=backbone_out["orig_hw"],
+            pad_hw=backbone_out["pad_hw"],
+        )
+        patch_tokens_detail = detail_out["patch_tokens_detail"].view(b, v, -1, int(self.cfg.detail_token_dim))
         patch_valid_mask_backbone = reshape_bv_to_bvn(backbone_out["patch_valid_mask"], b, v)
 
         gh, gw = backbone_out["grid_hw"]
@@ -421,7 +416,7 @@ class Sat2World(nn.Module):
             "point_fine_raw": {"x": x_fine, "y": y_fine, "z": z_fine},
             "patch_valid_mask": patch_valid_mask,
             "patch_tokens_final": patch_tokens_final,
-            "patch_tokens_detail": patch_tokens_detail,
+            "patch_tokens_match": patch_tokens_layer_sel,
             "patch_tokens_layer_for_nce": patch_tokens_layer_sel,
             "patch_tokens_nce_proj": patch_tokens_nce_proj,
             "view_tokens_final": view_tokens_final,
