@@ -16,7 +16,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import numpy as np
 import torch
@@ -77,7 +77,11 @@ def _select_unique_file(view_dir: Path, pattern: re.Pattern[str], desc: str) -> 
     return matches[0]
 
 
-def scan_dataset_root(root_dir: str | os.PathLike[str]) -> list[SceneRecord]:
+def scan_dataset_root(
+    root_dir: str | os.PathLike[str],
+    *,
+    assume_all_views_same_hw: bool = False,
+) -> list[SceneRecord]:
     """扫描数据根目录并构建结构化元信息。
 
     目录规则（严格校验）：
@@ -90,6 +94,10 @@ def scan_dataset_root(root_dir: str | os.PathLike[str]) -> list[SceneRecord]:
 
     参数:
         root_dir: 数据集根目录（例如 train_data 或 test_data）。
+        assume_all_views_same_hw:
+            若为 True，则仅在扫描到第一个有效 view 时读取一次 image tif 的 full_hw，
+            并将该 HW 复用于整个数据集。该模式要求调用者保证整个数据集中所有视图
+            分辨率完全一致；否则 manifest 中记录的 full_hw 将不正确。
 
     返回:
         scenes: SceneRecord 列表，按 scene_id 升序；每个场景内 views 按 view_id 升序。
@@ -120,12 +128,16 @@ def scan_dataset_root(root_dir: str | os.PathLike[str]) -> list[SceneRecord]:
             scene_dirs.append((sid, p))
 
     scene_dirs.sort(key=lambda x: x[0])
-    _scan_log(f"scene_dirs_enumerated(num_scene_dirs={len(scene_dirs)})")
+    _scan_log(
+        f"scene_dirs_enumerated(num_scene_dirs={len(scene_dirs)}, assume_all_views_same_hw={assume_all_views_same_hw})"
+    )
     if len(scene_dirs) == 0:
         raise RuntimeError(f"No scene_* directories found under: {root}")
 
     shape_probe_total = 0.0
     shape_probe_count = 0
+    dataset_full_hw: tuple[int, int] | None = None
+
     for scene_id, scene_dir in scene_dirs:
         scene_t0 = time.perf_counter()
         view_dirs: list[tuple[int, Path]] = []
@@ -149,10 +161,19 @@ def scan_dataset_root(root_dir: str | os.PathLike[str]) -> list[SceneRecord]:
             image_path = _select_unique_file(view_dir, image_pat, "image tif")
             height_path = _select_unique_file(view_dir, height_pat, "height tif")
             rpc_path = _select_unique_file(view_dir, rpc_pat, "rpc txt")
-            t_shape0 = time.perf_counter()
-            full_hw = inspect_raster_shape(str(image_path))[:2]
-            shape_probe_total += (time.perf_counter() - t_shape0)
-            shape_probe_count += 1
+
+            if assume_all_views_same_hw:
+                if dataset_full_hw is None:
+                    t_shape0 = time.perf_counter()
+                    dataset_full_hw = inspect_raster_shape(str(image_path))[:2]
+                    shape_probe_total += (time.perf_counter() - t_shape0)
+                    shape_probe_count += 1
+                full_hw = dataset_full_hw
+            else:
+                t_shape0 = time.perf_counter()
+                full_hw = inspect_raster_shape(str(image_path))[:2]
+                shape_probe_total += (time.perf_counter() - t_shape0)
+                shape_probe_count += 1
 
             views.append(
                 ViewRecord(
@@ -169,6 +190,9 @@ def scan_dataset_root(root_dir: str | os.PathLike[str]) -> list[SceneRecord]:
         _scan_log(
             f"scene_scanned(scene_id={scene_id}, num_views={len(views)}, elapsed={time.perf_counter() - scene_t0:.2f}s)"
         )
+
+    if assume_all_views_same_hw and dataset_full_hw is None:
+        raise RuntimeError(f"Failed to infer dataset-wide full_hw from root={root_dir}")
 
     _scan_log(
         f"scan_done(num_scenes={len(scenes)}, shape_probe_count={shape_probe_count}, "
@@ -273,7 +297,12 @@ def _write_manifest(root_dir: str | os.PathLike[str], scenes: Sequence[SceneReco
     os.replace(tmp, p)
 
 
-def load_or_scan_dataset_root(root_dir: str | os.PathLike[str], manifest_name: str = "manifest.json") -> list[SceneRecord]:
+def load_or_scan_dataset_root(
+    root_dir: str | os.PathLike[str],
+    manifest_name: str = "manifest.json",
+    *,
+    assume_all_views_same_hw: bool = False,
+) -> list[SceneRecord]:
     """优先读 manifest；若缺失/损坏则扫描；分布式下仅 rank0 读写并广播结果。"""
     load_t0 = time.perf_counter()
     load_t_last = load_t0
@@ -296,8 +325,10 @@ def load_or_scan_dataset_root(root_dir: str | os.PathLike[str], manifest_name: s
             scenes = _manifest_dict_to_scenes(root_dir, payload)
             return scenes
         except Exception:
-            _load_log("manifest_read_failed_fallback_scan")
-            scenes = scan_dataset_root(root_dir)
+            _load_log(
+                f"manifest_read_failed_fallback_scan(assume_all_views_same_hw={assume_all_views_same_hw})"
+            )
+            scenes = scan_dataset_root(root_dir, assume_all_views_same_hw=assume_all_views_same_hw)
             _load_log(f"scan_finished(num_scenes={len(scenes)})")
             try:
                 _write_manifest(root_dir, scenes, manifest_name=manifest_name)
@@ -315,8 +346,11 @@ def load_or_scan_dataset_root(root_dir: str | os.PathLike[str], manifest_name: s
             scenes = _manifest_dict_to_scenes(root_dir, payload)
             obj_list[0] = payload
         except Exception:
-            _load_log("manifest_read_failed_fallback_scan", rank=rank)
-            scenes = scan_dataset_root(root_dir)
+            _load_log(
+                f"manifest_read_failed_fallback_scan(assume_all_views_same_hw={assume_all_views_same_hw})",
+                rank=rank,
+            )
+            scenes = scan_dataset_root(root_dir, assume_all_views_same_hw=assume_all_views_same_hw)
             _load_log(f"scan_finished(num_scenes={len(scenes)})", rank=rank)
             try:
                 _write_manifest(root_dir, scenes, manifest_name=manifest_name)
@@ -347,7 +381,11 @@ def _read_tif_with_rasterio(path: str) -> tuple[np.ndarray, Optional[float]]:
 
 
 def inspect_raster_shape(path: str) -> tuple[int, int, int, str]:
-    """读取栅格元信息，返回 (H, W, C, dtype_str)。"""
+    """读取栅格元信息，返回 (H, W, C, dtype_str)。
+
+    优先使用 rasterio；若失败，则回退到 tifffile 的元信息接口，
+    只读取 header/series 信息，不做整图像素读取。
+    """
     try:
         import rasterio
 
@@ -356,9 +394,36 @@ def inspect_raster_shape(path: str) -> tuple[int, int, int, str]:
     except Exception:
         import tifffile
 
-        arr = tifffile.imread(path)
-        arr_chw = _to_chw(arr)
-        return int(arr_chw.shape[1]), int(arr_chw.shape[2]), int(arr_chw.shape[0]), str(arr.dtype)
+        with tifffile.TiffFile(path) as tf:
+            if len(tf.series) == 0:
+                raise ValueError(f"Empty TIFF series: {path}")
+            s = tf.series[0]
+            shape = tuple(int(v) for v in s.shape)
+            axes = str(getattr(s, "axes", ""))
+            dtype_str = str(s.dtype)
+
+        if len(shape) == 2:
+            h, w = shape
+            c = 1
+            return int(h), int(w), int(c), dtype_str
+
+        if len(shape) == 3:
+            # 常见 tifffile 轴约定：
+            # - YXS / YXC : HWC
+            # - SYX / CYX : CHW
+            if axes in {"YXS", "YXC"}:
+                h, w, c = shape
+            elif axes in {"SYX", "CYX"}:
+                c, h, w = shape
+            else:
+                # 保守启发式：若第 0 维很小，视作通道维；否则视作 HWC
+                if shape[0] <= 8 and shape[1] > 8 and shape[2] > 8:
+                    c, h, w = shape
+                else:
+                    h, w, c = shape
+            return int(h), int(w), int(c), dtype_str
+
+        raise ValueError(f"Unsupported TIFF shape={shape}, axes={axes} for path={path}")
 
 
 def _normalize_window(window: tuple[int, int, int, int], image_h: int, image_w: int) -> tuple[int, int, int, int]:
@@ -393,13 +458,17 @@ def _read_tif(path: str, window: tuple[int, int, int, int] | None = None) -> tup
                 arr = ds.read(window=win)
             nodata = ds.nodata
         return arr, nodata
-    except Exception:
-        arr, nodata = _read_tif_with_tifffile(path)
-        if window is not None:
-            arr_chw = _to_chw(arr)
-            top, left, h, w = _normalize_window(window, int(arr_chw.shape[1]), int(arr_chw.shape[2]))
-            arr = arr_chw[:, top : top + h, left : left + w]
-        return arr, nodata
+    except Exception as e:
+        print(f"use rasterio error:{e}")
+        try:
+            arr, nodata = _read_tif_with_tifffile(path)
+            if window is not None:
+                arr_chw = _to_chw(arr)
+                top, left, h, w = _normalize_window(window, int(arr_chw.shape[1]), int(arr_chw.shape[2]))
+                arr = arr_chw[:, top : top + h, left : left + w]
+            return arr, nodata
+        except Exception as ee:
+            raise ValueError(f"loading image:{path} error: {ee}")
 
 
 def _to_chw(arr: np.ndarray) -> np.ndarray:
