@@ -10,8 +10,10 @@ TensorBoard 可视化统一入口。
 
 from __future__ import annotations
 
+import errno
 import math
 from typing import Any
+import warnings
 
 import numpy as np
 import torch
@@ -69,6 +71,68 @@ class TensorBoardMonitor:
                 return float(v)
         return None
 
+    def _is_disk_write_error(self, exc: Exception) -> bool:
+        """判断是否为磁盘空间/配额类写入错误。"""
+        if isinstance(exc, OSError):
+            if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+                return True
+        msg = str(exc).lower()
+        return ("no space left on device" in msg) or ("disk quota exceeded" in msg) or ("quota exceeded" in msg)
+
+    def _warn_write_failure(self, op: str, tag: str | None, exc: Exception) -> None:
+        tag_msg = f", tag={tag}" if tag is not None else ""
+        if self._is_disk_write_error(exc):
+            warnings.warn(f"TensorBoard {op} failed due to disk issue{tag_msg}: {exc}", RuntimeWarning, stacklevel=2)
+        else:
+            warnings.warn(f"TensorBoard {op} failed{tag_msg}: {exc}", RuntimeWarning, stacklevel=2)
+
+    def _safe_call(self, op: str, fn, *, tag: str | None = None) -> bool:
+        try:
+            fn()
+            return True
+        except Exception as e:
+            self._warn_write_failure(op, tag, e)
+            return False
+
+    def _route_scalar_tag(self, split: str, key: str) -> str | None:
+        """将标量键路由到结构化 tag；返回 None 表示丢弃。"""
+        essential_losses = {
+            "loss_total",
+            "loss_affine_grid",
+            "loss_affine_pair",
+            "loss_height",
+            "loss_point",
+            "loss_point_reproj",
+            "loss_height_reproj",
+            "loss_point_pair",
+            "loss_normal_point",
+            "loss_feature_nce",
+            "loss_patch_match",
+            "loss_render_rpc",
+            "loss_render_point",
+            "loss_ssim",
+        }
+        essential_metrics = {
+            "metric_affine_grid_error_px_mean",
+            "metric_affine_pair_error_px_mean",
+            "metric_height_rmse",
+            "metric_height_mae",
+            "metric_point_xyz_rmse",
+            "metric_point_z_rmse",
+            "metric_point_reproj_px_mean",
+            "metric_height_reproj_px_mean",
+            "metric_patch_match_acc_top1_1px",
+            "metric_feature_nce_acc_top1",
+            "metric_center_dist_mean",
+        }
+        if key in essential_losses:
+            return f"{split}/loss/{key.removeprefix('loss_')}"
+        if key in essential_metrics:
+            return f"{split}/metrics/{key.removeprefix('metric_')}"
+        if key.startswith("optim/") or key.startswith("time/") or key.startswith("system/"):
+            return key
+        return None
+
     def log_scalars(self, tag_prefix: str, scalar_dict: dict[str, Any], global_step: int) -> None:
         """记录标量。"""
         if not self.is_enabled or self.writer is None:
@@ -77,8 +141,13 @@ class TensorBoardMonitor:
             fv = self._to_float(v)
             if fv is None:
                 continue
-            tag = k if "/" in k else f"{tag_prefix}/{k}"
-            self.writer.add_scalar(tag, fv, global_step)
+            if tag_prefix in {"train", "val"}:
+                tag = self._route_scalar_tag(tag_prefix, k)
+                if tag is None:
+                    continue
+            else:
+                tag = k if "/" in k else f"{tag_prefix}/{k}"
+            self._safe_call("add_scalar", lambda tag=tag, fv=fv: self.writer.add_scalar(tag, fv, global_step), tag=tag)
 
     def log_histograms(self, hist_dict: dict[str, Any], global_step: int) -> None:
         """记录直方图。"""
@@ -86,7 +155,7 @@ class TensorBoardMonitor:
             return
         for k, v in hist_dict.items():
             if torch.is_tensor(v) and v.numel() > 0:
-                self.writer.add_histogram(k, v.detach().float().cpu(), global_step)
+                self._safe_call("add_histogram", lambda k=k, v=v: self.writer.add_histogram(k, v.detach().float().cpu(), global_step), tag=k)
 
     def make_rgb_montage(self, images_vchw: torch.Tensor) -> torch.Tensor:
         """将 [V,3,H,W] 多视图图像拼接成横向 montage。"""
@@ -431,7 +500,7 @@ class TensorBoardMonitor:
         pred_p = outputs.get("point_abs", None)
 
         # 兼容旧面板（第一个样本） + 新面板（整个 batch 的全部视图）。
-        self.writer.add_image(f"vis/{split}/input_rgb", self.make_rgb_montage(images[0]), global_step)
+        self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/input_rgb", self.make_rgb_montage(images[0]), global_step), tag=f"vis/{split}/input_rgb")
         b, v = int(images.shape[0]), int(images.shape[1])
         labeled_rows = []
         for bi in range(b):
@@ -440,7 +509,7 @@ class TensorBoardMonitor:
                 vid = int(view_ids[bi, vi].item()) if torch.is_tensor(view_ids) else vi
                 row.append(self._draw_label_on_image(images[bi, vi], f"view={vid}"))
             labeled_rows.append(torch.cat(row, dim=-1))
-        self.writer.add_image(f"vis/{split}/I_crop", torch.cat(labeled_rows, dim=-2), global_step)
+        self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/I_crop", torch.cat(labeled_rows, dim=-2), global_step), tag=f"vis/{split}/I_crop")
 
         if "affine_gt_forward" in batch:
             aff_fwd = batch["affine_gt_forward"]
@@ -454,7 +523,7 @@ class TensorBoardMonitor:
                     vid = int(view_ids[bi, vi].item()) if torch.is_tensor(view_ids) else vi
                     warped_row.append(self._draw_label_on_image(wi, f"view={vid}"))
                 warped.append(torch.cat(warped_row, dim=-1))
-            self.writer.add_image(f"vis/{split}/I_crop_af", torch.cat(warped, dim=-2), global_step)
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/I_crop_af", torch.cat(warped, dim=-2), global_step), tag=f"vis/{split}/I_crop_af")
 
         if "anchor_line_samp_true" in batch:
             anchors = batch["anchor_line_samp_true"]  # [B,V,K,2]
@@ -464,7 +533,7 @@ class TensorBoardMonitor:
             for bi in range(b):
                 row = [self._overlay_points_on_image(images[bi, vi], anchors[bi, vi]) for vi in range(v)]
                 overlays.append(torch.cat(row, dim=-1))
-            self.writer.add_image(f"vis/{split}/crop_anchor_overlay", torch.cat(overlays, dim=-2), global_step)
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/crop_anchor_overlay", torch.cat(overlays, dim=-2), global_step), tag=f"vis/{split}/crop_anchor_overlay")
 
         if height_gt is not None and pred_h is not None:
             gt = height_gt[0, 0]
@@ -472,9 +541,9 @@ class TensorBoardMonitor:
             hmask = batch.get("height_valid_mask", None)
             vm = hmask[0, 0] if torch.is_tensor(hmask) else None
             vmin, vmax = self._group_vrange([gt, ph], masks=[vm, vm], q_low=0.05, q_high=0.95)
-            self.writer.add_image(f"vis/{split}/height_gt", self.make_colormap_image(gt, vmin=vmin, vmax=vmax), global_step)
-            self.writer.add_image(f"vis/{split}/height_pred", self.make_colormap_image(ph, vmin=vmin, vmax=vmax), global_step)
-            self.writer.add_image(f"vis/{split}/height_error", self.make_abs_error_map(ph, gt), global_step)
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/height_gt", self.make_colormap_image(gt, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/height_gt")
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/height_pred", self.make_colormap_image(ph, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/height_pred")
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/height_error", self.make_abs_error_map(ph, gt), global_step), tag=f"vis/{split}/height_error")
 
         if pred_p is not None and aux.get("gt_point_map", None) is not None:
             pz = pred_p[0, 0, 2]
@@ -482,50 +551,50 @@ class TensorBoardMonitor:
             hmask = batch.get("height_valid_mask", None)
             vm = hmask[0, 0] if torch.is_tensor(hmask) else None
             vmin, vmax = self._group_vrange([pz, gz], masks=[vm, vm], q_low=0.05, q_high=0.95)
-            self.writer.add_image(f"vis/{split}/point_z_pred", self.make_colormap_image(pz, vmin=vmin, vmax=vmax), global_step)
-            self.writer.add_image(f"vis/{split}/point_z_gt", self.make_colormap_image(gz, vmin=vmin, vmax=vmax), global_step)
-            self.writer.add_image(f"vis/{split}/point_z_error", self.make_abs_error_map(pz, gz), global_step)
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_z_pred", self.make_colormap_image(pz, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/point_z_pred")
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_z_gt", self.make_colormap_image(gz, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/point_z_gt")
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_z_error", self.make_abs_error_map(pz, gz), global_step), tag=f"vis/{split}/point_z_error")
 
         if render_outputs is not None and render_outputs.get("rpc", None) is not None:
             rr = render_outputs["rpc"]
             rp = render_outputs["point"]
             if rr.get("num_targets", 0) > 0:
-                self.writer.add_image(f"vis/{split}/render_rpc_rgb", rr["rendered_rgb"][0], global_step)
-                self.writer.add_image(f"vis/{split}/render_target_rgb", rr["target_rgb"][0], global_step)
-                self.writer.add_image(f"vis/{split}/render_rpc_alpha", rr["rendered_alpha"][0], global_step)
+                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_rpc_rgb", rr["rendered_rgb"][0], global_step), tag=f"vis/{split}/render_rpc_rgb")
+                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_target_rgb", rr["target_rgb"][0], global_step), tag=f"vis/{split}/render_target_rgb")
+                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_rpc_alpha", rr["rendered_alpha"][0], global_step), tag=f"vis/{split}/render_rpc_alpha")
                 if not rr["rendered_height"] is None:
                     rh_maps = [rr["rendered_height"][0]]
                     if rp is not None and rp.get("rendered_height", None) is not None:
                         rh_maps.append(rp["rendered_height"][0])
                     rvmin, rvmax = self._group_vrange(rh_maps, q_low=0.05, q_high=0.95)
-                    self.writer.add_image(f"vis/{split}/render_rpc_height", self.make_colormap_image(rr["rendered_height"][0], vmin=rvmin, vmax=rvmax), global_step)
+                    self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_rpc_height", self.make_colormap_image(rr["rendered_height"][0], vmin=rvmin, vmax=rvmax), global_step), tag=f"vis/{split}/render_rpc_height")
             if rp.get("num_targets", 0) > 0:
-                self.writer.add_image(f"vis/{split}/render_point_rgb", rp["rendered_rgb"][0], global_step)
-                self.writer.add_image(f"vis/{split}/render_point_alpha", rp["rendered_alpha"][0], global_step)
+                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_point_rgb", rp["rendered_rgb"][0], global_step), tag=f"vis/{split}/render_point_rgb")
+                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_point_alpha", rp["rendered_alpha"][0], global_step), tag=f"vis/{split}/render_point_alpha")
                 if not rp["rendered_height"] is None:
                     rh_maps = [rp["rendered_height"][0]]
                     if rr is not None and rr.get("rendered_height", None) is not None:
                         rh_maps.append(rr["rendered_height"][0])
                     rvmin, rvmax = self._group_vrange(rh_maps, q_low=0.05, q_high=0.95)
-                    self.writer.add_image(f"vis/{split}/render_point_height", self.make_colormap_image(rp["rendered_height"][0], vmin=rvmin, vmax=rvmax), global_step)
+                    self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_point_height", self.make_colormap_image(rp["rendered_height"][0], vmin=rvmin, vmax=rvmax), global_step), tag=f"vis/{split}/render_point_height")
 
         if "gaussian_confidence_rpc" in outputs:
-            self.writer.add_image(f"vis/{split}/gaussian_conf_rpc", self.make_colormap_image(outputs["gaussian_confidence_rpc"][0, 0]), global_step)
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/gaussian_conf_rpc", self.make_colormap_image(outputs["gaussian_confidence_rpc"][0, 0]), global_step), tag=f"vis/{split}/gaussian_conf_rpc")
         if "gaussian_confidence_point" in outputs:
-            self.writer.add_image(f"vis/{split}/gaussian_conf_point", self.make_colormap_image(outputs["gaussian_confidence_point"][0, 0]), global_step)
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/gaussian_conf_point", self.make_colormap_image(outputs["gaussian_confidence_point"][0, 0]), global_step), tag=f"vis/{split}/gaussian_conf_point")
         if "gaussian_opacity" in outputs:
-            self.writer.add_image(f"vis/{split}/gaussian_opacity", self.make_colormap_image(outputs["gaussian_opacity"][0, 0]), global_step)
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/gaussian_opacity", self.make_colormap_image(outputs["gaussian_opacity"][0, 0]), global_step), tag=f"vis/{split}/gaussian_opacity")
         if "gaussian_scale" in outputs:
             mag = outputs["gaussian_scale"][0, 0].norm(dim=0, keepdim=True)
-            self.writer.add_image(f"vis/{split}/gaussian_scale_mag", self.make_colormap_image(mag), global_step)
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/gaussian_scale_mag", self.make_colormap_image(mag), global_step), tag=f"vis/{split}/gaussian_scale_mag")
         if "gaussian_centers_rpc" in outputs and "gaussian_centers_point" in outputs:
             d = (outputs["gaussian_centers_rpc"][0, 0] - outputs["gaussian_centers_point"][0, 0]).norm(dim=0, keepdim=True)
-            self.writer.add_image(f"vis/{split}/center_disagreement", self.make_colormap_image(d), global_step)
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/center_disagreement", self.make_colormap_image(d), global_step), tag=f"vis/{split}/center_disagreement")
 
         if "affine_gt_forward" in batch and "affine_pred" in outputs:
             h, w = images.shape[-2:]
             hm = self.make_affine_residual_heatmap(batch["affine_gt_forward"][0, 0], outputs["affine_pred"][0, 0], h, w)
-            self.writer.add_image(f"vis/{split}/affine_residual", hm, global_step)
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/affine_residual", hm, global_step), tag=f"vis/{split}/affine_residual")
 
             checker_pack = self._make_pairwise_affine_rpc_checkerboard(batch, outputs, global_step=global_step)
             if checker_pack is not None:
@@ -536,14 +605,14 @@ class TensorBoardMonitor:
                 else:
                     view_i, view_j = int(i), int(j)
                 checker_labeled = self._draw_label_on_image(checker, f"checker: view_i={view_i} / view_j={view_j}")
-                self.writer.add_image(f"vis/{split}/pair_rpc_j_corr", image_j_corr, global_step)
-                self.writer.add_image(f"vis/{split}/pair_rpc_i_to_j", image_i_to_j, global_step)
-                self.writer.add_image(f"vis/{split}/pair_rpc_checker", checker_labeled, global_step)
-                self.writer.add_text(f"vis/{split}/pair_rpc_meta", f"pair(i,j)=({i},{j}), view=({view_i},{view_j})", global_step)
+                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/pair_rpc_j_corr", image_j_corr, global_step), tag=f"vis/{split}/pair_rpc_j_corr")
+                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/pair_rpc_i_to_j", image_i_to_j, global_step), tag=f"vis/{split}/pair_rpc_i_to_j")
+                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/pair_rpc_checker", checker_labeled, global_step), tag=f"vis/{split}/pair_rpc_checker")
+                self._safe_call("add_text", lambda: self.writer.add_text(f"vis/{split}/pair_rpc_meta", f"pair(i,j)=({i},{j}), view=({view_i},{view_j})", global_step), tag=f"vis/{split}/pair_rpc_meta")
 
         pairwise = self.make_pairwise_error_matrix(aux, v=int(images.shape[0]))
         if pairwise is not None:
-            self.writer.add_image(f"vis/{split}/pairwise_error_matrix", pairwise, global_step)
+            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/pairwise_error_matrix", pairwise, global_step), tag=f"vis/{split}/pairwise_error_matrix")
 
     def _sample_pointcloud(self, xyz_hw3: torch.Tensor, rgb_hw3: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h, w = xyz_hw3.shape[:2]
@@ -574,11 +643,13 @@ class TensorBoardMonitor:
         def _mesh(tag: str, xyz_hw3: torch.Tensor):
             xyz, rgb = self._sample_pointcloud(xyz_hw3, img)
             if self.enable_mesh:
-                try:
-                    self.writer.add_mesh(tag, vertices=xyz.unsqueeze(0), colors=(rgb.clamp(0, 1) * 255).to(torch.uint8).unsqueeze(0), global_step=global_step)
+                ok = self._safe_call(
+                    "add_mesh",
+                    lambda: self.writer.add_mesh(tag, vertices=xyz.unsqueeze(0), colors=(rgb.clamp(0, 1) * 255).to(torch.uint8).unsqueeze(0), global_step=global_step),
+                    tag=tag,
+                )
+                if ok:
                     return
-                except Exception:
-                    pass
             # fallback: BEV
             bev = torch.zeros(3, 512, 512)
             x = xyz[:, 0]
@@ -592,7 +663,7 @@ class TensorBoardMonitor:
             bev[0, yi, xi] = zi
             bev[1, yi, xi] = 1.0 - zi
             bev[2, yi, xi] = 0.5
-            self.writer.add_image(tag + "_bev", bev, global_step)
+            self._safe_call("add_image", lambda: self.writer.add_image(tag + "_bev", bev, global_step), tag=tag + "_bev")
 
         if gt is not None:
             _mesh(f"vis/{split}/pc_gt", gt)
@@ -606,20 +677,14 @@ class TensorBoardMonitor:
     def log_text(self, tag: str, text: str, global_step: int) -> None:
         """记录文本事件。"""
         if self.is_enabled and self.writer is not None:
-            self.writer.add_text(tag, text, global_step)
+            self._safe_call("add_text", lambda: self.writer.add_text(tag, text, global_step), tag=tag)
 
     def flush(self) -> None:
         """强制 flush。"""
         if self.is_enabled and self.writer is not None:
-            try:
-                self.writer.flush()
-            except Exception as e:
-                print(f"[WARN] TensorBoard flush failed (likely disk full): {e}")
+            self._safe_call("flush", lambda: self.writer.flush())
 
     def close(self) -> None:
         """关闭 writer。"""
         if self.is_enabled and self.writer is not None:
-            try:
-                self.writer.close()
-            except Exception as e:
-                print(f"[WARN] TensorBoard close failed: {e}")
+            self._safe_call("close", lambda: self.writer.close())

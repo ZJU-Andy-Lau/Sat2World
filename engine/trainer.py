@@ -379,13 +379,12 @@ class Trainer:
         with torch.no_grad():
             batch_dev = move_batch_to_device(copy.deepcopy(fixed), self.device)
             with self._autocast_context():
-                outputs, render_outputs, _, scalar, aux = self._forward_batch(batch_dev, mode="val")
+                outputs, render_outputs, _, _, aux = self._forward_batch(batch_dev, mode="val")
             gt_point = self._compute_gt_point_map(batch_dev)
             if gt_point is not None:
                 aux["gt_point_map"] = gt_point
             self.monitor.log_visual_panels(batch_dev, outputs, render_outputs, aux, self.global_step, split)
             self.monitor.log_pointclouds(batch_dev, outputs, aux, self.global_step, split)
-            self.monitor.log_scalars(split, scalar, self.global_step)
         self.model.train()
 
     def _save_last_checkpoint(self, step_in_epoch: int, *, save_reason: str | None = None) -> None:
