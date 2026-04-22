@@ -65,7 +65,7 @@ def run_free_ba_pipeline(
             ref_view_idx=0,
             rng=rng,
             perturb_cfg=perturb_cfg,
-            dtype=np.float32,
+            dtype=torch.float32,
             device=None,
         )
         aff_gt_fwd_np = aff_gt_fwd.detach().cpu().numpy().astype(np.float64)
