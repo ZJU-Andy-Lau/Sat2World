@@ -68,6 +68,11 @@ class PatchInternalMatchLoss:
         src_tok_all: list[torch.Tensor] = []
         ref_tok_all: list[torch.Tensor] = []
         tgt_local_all: list[torch.Tensor] = []
+        meta_batch_all: list[torch.Tensor] = []
+        meta_src_view_all: list[torch.Tensor] = []
+        meta_ref_view_all: list[torch.Tensor] = []
+        src_global_pts_all: list[torch.Tensor] = []
+        ref_global_pts_all: list[torch.Tensor] = []
 
         for bi in range(b):
             ref = int(ref_idx[bi].item())
@@ -139,6 +144,16 @@ class PatchInternalMatchLoss:
                 ref_tok_all.append(patch_tokens_match[bi, ref, ref_flat])
                 tgt_local_all.append(tgt_local)
 
+                # patch-match 可视化元数据：使用真实参与监督构造的全局像素对应点 [line, samp]。
+                n_pair = int(src_idx.shape[0])
+                src_global = centers[0, src_idx]
+                ref_global = torch.stack([l_ref, s_ref], dim=-1)
+                meta_batch_all.append(torch.full((n_pair,), int(bi), dtype=torch.long, device=device))
+                meta_src_view_all.append(torch.full((n_pair,), int(vi), dtype=torch.long, device=device))
+                meta_ref_view_all.append(torch.full((n_pair,), int(ref), dtype=torch.long, device=device))
+                src_global_pts_all.append(src_global)
+                ref_global_pts_all.append(ref_global)
+
         # 空样本安全：与 matcher 参数保持图连接，避免 DDP unused parameter
         param_stub = torch.zeros((), device=device, dtype=dtype)
         for p_match in self.patch_matcher.parameters():
@@ -158,6 +173,11 @@ class PatchInternalMatchLoss:
         src_tok = torch.cat(src_tok_all, dim=0)
         ref_tok = torch.cat(ref_tok_all, dim=0)
         tgt_local = torch.cat(tgt_local_all, dim=0)
+        meta_batch = torch.cat(meta_batch_all, dim=0)
+        meta_src_view = torch.cat(meta_src_view_all, dim=0)
+        meta_ref_view = torch.cat(meta_ref_view_all, dim=0)
+        src_global_pts = torch.cat(src_global_pts_all, dim=0)
+        ref_global_pts = torch.cat(ref_global_pts_all, dim=0)
         total_before_cap = int(src_tok.shape[0])
 
         if src_tok.shape[0] > int(self.cfg.max_pairs):
@@ -165,6 +185,11 @@ class PatchInternalMatchLoss:
             src_tok = src_tok[perm]
             ref_tok = ref_tok[perm]
             tgt_local = tgt_local[perm]
+            meta_batch = meta_batch[perm]
+            meta_src_view = meta_src_view[perm]
+            meta_ref_view = meta_ref_view[perm]
+            src_global_pts = src_global_pts[perm]
+            ref_global_pts = ref_global_pts[perm]
 
         logits = self.patch_matcher(src_tok, ref_tok)  # [M,16,16]
         logits_flat = logits.view(logits.shape[0], -1)
@@ -202,4 +227,26 @@ class PatchInternalMatchLoss:
             "patch_match_valid_pairs": int(src_tok.shape[0]),
             "patch_match_valid_pairs_before_cap": total_before_cap,
         }
+
+        # 从“截断后真正参与 loss 的匹配集合”中选择一个真实视图对，供 TensorBoard 可视化。
+        with torch.no_grad():
+            if meta_batch.numel() > 0:
+                anchor_idx = 0
+                bi_sel = int(meta_batch[anchor_idx].item())
+                src_sel = int(meta_src_view[anchor_idx].item())
+                ref_sel = int(meta_ref_view[anchor_idx].item())
+                sel_mask = (meta_batch == bi_sel) & (meta_src_view == src_sel) & (meta_ref_view == ref_sel)
+                if bool(sel_mask.any()):
+                    src_vis = src_global_pts[sel_mask].detach()
+                    ref_vis = ref_global_pts[sel_mask].detach()
+                    aux["patch_match_vis"] = {
+                        "batch_index": bi_sel,
+                        "src_view_index": src_sel,
+                        "ref_view_index": ref_sel,
+                        "src_points": src_vis,
+                        "ref_points": ref_vis,
+                        "num_pairs_selected_view_pair": int(src_vis.shape[0]),
+                        "num_pairs_total_after_cap": int(src_tok.shape[0]),
+                        "num_pairs_total_before_cap": int(total_before_cap),
+                    }
         return loss, probe, aux
