@@ -23,6 +23,10 @@ def _affine_from_3pts(corners: np.ndarray, offset_corners: np.ndarray) -> np.nda
 
 class RPCModelParameterTorch:
     def __init__(self, data=torch.zeros(170, dtype=torch.double)):
+        if data is None:
+            data = torch.zeros(170, dtype=torch.double)
+        else:
+            data = torch.as_tensor(data, dtype=torch.double).clone()
         self.LINE_OFF = data[0]
         self.SAMP_OFF = data[1]
         self.LAT_OFF = data[2]
@@ -89,6 +93,10 @@ class RPCModelParameterTorch:
             self.LONNUM = data[130:150]
             self.LONDEM = data[150:170]
         else:
+            self.LATNUM = torch.zeros(20, dtype=torch.double, device=data.device)
+            self.LATDEM = torch.zeros(20, dtype=torch.double, device=data.device)
+            self.LONNUM = torch.zeros(20, dtype=torch.double, device=data.device)
+            self.LONDEM = torch.zeros(20, dtype=torch.double, device=data.device)
             self.Calculate_Inverse_RPC()
 
         if rfm_line > 0:
