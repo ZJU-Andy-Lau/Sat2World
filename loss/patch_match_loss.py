@@ -65,10 +65,19 @@ class PatchInternalMatchLoss:
         points_j_gt_all: list[torch.Tensor] = []
         top_line_all: list[torch.Tensor] = []
         top_samp_all: list[torch.Tensor] = []
+        dir_total = 0
+        dir_no_src_valid = 0
+        dir_no_valid_src = 0
+        dir_zero_overlap = 0
+        dir_no_tgt_valid_patch = 0
+        dir_used = 0
 
         def _collect_direction(bi: int, view_i: int, view_j: int) -> None:
+            nonlocal dir_total, dir_no_src_valid, dir_no_valid_src, dir_zero_overlap, dir_no_tgt_valid_patch, dir_used
+            dir_total += 1
             src_valid = patch_valid_mask[bi : bi + 1, view_i]
             if not bool(src_valid.any()):
+                dir_no_src_valid += 1
                 return
 
             h_src, in_h = sample_map_bilinear(hgt[bi : bi + 1, view_i], centers)
@@ -76,6 +85,7 @@ class PatchInternalMatchLoss:
             h_src = h_src[:, 0]
             valid_src = src_valid & in_h & in_m & (m_src[:, 0] > 0.5)
             if not bool(valid_src.any()):
+                dir_no_valid_src += 1
                 return
 
             src_idx = valid_src[0].nonzero(as_tuple=False).squeeze(1)
@@ -103,6 +113,7 @@ class PatchInternalMatchLoss:
 
             in_j = (l_j >= 0) & (l_j <= (h_img - 1)) & (s_j >= 0) & (s_j <= (w_img - 1))
             if not bool(in_j.any()):
+                dir_zero_overlap += 1
                 return
 
             src_idx = src_idx[in_j]
@@ -114,6 +125,7 @@ class PatchInternalMatchLoss:
 
             view_j_valid = patch_valid_mask[bi, view_j, view_j_flat]
             if not bool(view_j_valid.any()):
+                dir_no_tgt_valid_patch += 1
                 return
 
             src_idx = src_idx[view_j_valid]
@@ -140,6 +152,7 @@ class PatchInternalMatchLoss:
             points_j_gt_all.append(torch.stack([l_j, s_j], dim=-1))
             top_line_all.append(top_line)
             top_samp_all.append(top_samp)
+            dir_used += 1
 
         for bi in range(b):
             view_pairs = random_pairwise_view_pairs(v=v, max_pairs=self.cfg.view_pair_max_pairs, device=device)
@@ -152,15 +165,35 @@ class PatchInternalMatchLoss:
         for p_match in self.patch_matcher.parameters():
             param_stub = param_stub + p_match.sum().to(device=device, dtype=dtype) * 0.0
         loss_stub = patch_tokens_match.sum() * 0.0 + param_stub
+        input_nonfinite_ratio = (~torch.isfinite(patch_tokens_match)).to(dtype=dtype).mean()
 
         if len(src_tok_all) == 0:
             zero = torch.zeros((), device=device, dtype=dtype)
+            dir_total_t = torch.tensor(float(dir_total), device=device, dtype=dtype)
+            dir_zero_overlap_t = torch.tensor(float(dir_zero_overlap), device=device, dtype=dtype)
+            dir_used_t = torch.tensor(float(dir_used), device=device, dtype=dtype)
             probe = {
                 "patch_match_valid_pairs": zero,
                 "patch_match_acc_top1_1px": zero,
                 "patch_match_l1_px": zero,
+                "patch_match_input_nonfinite_ratio": input_nonfinite_ratio.detach(),
+                "patch_match_src_nonfinite_ratio": zero,
+                "patch_match_ref_nonfinite_ratio": zero,
+                "patch_match_logits_nonfinite_ratio": zero,
+                "patch_match_num_directions_total": dir_total_t,
+                "patch_match_num_directions_zero_overlap": dir_zero_overlap_t,
+                "patch_match_num_directions_used": dir_used_t,
             }
-            aux = {"patch_match_valid_pairs": 0, "patch_match_valid_pairs_before_cap": 0}
+            aux = {
+                "patch_match_valid_pairs": 0,
+                "patch_match_valid_pairs_before_cap": 0,
+                "patch_match_num_directions_total": dir_total,
+                "patch_match_num_directions_no_src_valid": dir_no_src_valid,
+                "patch_match_num_directions_no_valid_src": dir_no_valid_src,
+                "patch_match_num_directions_zero_overlap": dir_zero_overlap,
+                "patch_match_num_directions_no_tgt_valid_patch": dir_no_tgt_valid_patch,
+                "patch_match_num_directions_used": dir_used,
+            }
             return loss_stub, probe, aux
 
         src_tok = torch.cat(src_tok_all, dim=0)
@@ -187,9 +220,12 @@ class PatchInternalMatchLoss:
             points_j_gt = points_j_gt[perm]
             top_line = top_line[perm]
             top_samp = top_samp[perm]
+        src_nonfinite_ratio = (~torch.isfinite(src_tok)).to(dtype=dtype).mean()
+        ref_nonfinite_ratio = (~torch.isfinite(ref_tok)).to(dtype=dtype).mean()
 
         logits = self.patch_matcher(src_tok, ref_tok)  # [M,16,16]
         logits_flat = logits.view(logits.shape[0], -1)
+        logits_nonfinite_ratio = (~torch.isfinite(logits_flat)).to(dtype=dtype).mean()
 
         tgt_y = torch.floor(tgt_local[:, 0]).long().clamp(0, p - 1)
         tgt_x = torch.floor(tgt_local[:, 1]).long().clamp(0, p - 1)
@@ -215,15 +251,31 @@ class PatchInternalMatchLoss:
             acc_1px = (err <= 1.0).to(dtype=dtype).mean()
             l1_px = (pred_local - tgt_local).abs().sum(dim=-1).mean()
             valid_pairs = torch.tensor(float(src_tok.shape[0]), device=device, dtype=dtype)
+            dir_total_t = torch.tensor(float(dir_total), device=device, dtype=dtype)
+            dir_zero_overlap_t = torch.tensor(float(dir_zero_overlap), device=device, dtype=dtype)
+            dir_used_t = torch.tensor(float(dir_used), device=device, dtype=dtype)
 
         probe = {
             "patch_match_valid_pairs": valid_pairs.detach(),
             "patch_match_acc_top1_1px": acc_1px.detach(),
             "patch_match_l1_px": l1_px.detach(),
+            "patch_match_input_nonfinite_ratio": input_nonfinite_ratio.detach(),
+            "patch_match_src_nonfinite_ratio": src_nonfinite_ratio.detach(),
+            "patch_match_ref_nonfinite_ratio": ref_nonfinite_ratio.detach(),
+            "patch_match_logits_nonfinite_ratio": logits_nonfinite_ratio.detach(),
+            "patch_match_num_directions_total": dir_total_t,
+            "patch_match_num_directions_zero_overlap": dir_zero_overlap_t,
+            "patch_match_num_directions_used": dir_used_t,
         }
         aux = {
             "patch_match_valid_pairs": int(src_tok.shape[0]),
             "patch_match_valid_pairs_before_cap": total_before_cap,
+            "patch_match_num_directions_total": dir_total,
+            "patch_match_num_directions_no_src_valid": dir_no_src_valid,
+            "patch_match_num_directions_no_valid_src": dir_no_valid_src,
+            "patch_match_num_directions_zero_overlap": dir_zero_overlap,
+            "patch_match_num_directions_no_tgt_valid_patch": dir_no_tgt_valid_patch,
+            "patch_match_num_directions_used": dir_used,
         }
 
         # 从“截断后真正参与 loss 的匹配集合”中选择一个真实视图对，供 TensorBoard 可视化。

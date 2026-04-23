@@ -68,6 +68,11 @@ class FeatureInfoNCELoss:
         anchors_all: list[torch.Tensor] = []
         positives_all: list[torch.Tensor] = []
         valid_pairs_total = 0
+        dir_total = 0
+        dir_no_src_valid = 0
+        dir_no_valid_src = 0
+        dir_zero_overlap = 0
+        dir_used = 0
 
         centers = patch_centers.to(device=device, dtype=dtype).view(1, n, 2)
         feat_map_all = patch_tokens_proj.view(b, v, gh, gw, d).permute(0, 1, 4, 2, 3).contiguous()
@@ -80,11 +85,14 @@ class FeatureInfoNCELoss:
         patch_h = float(hp) / float(max(gh, 1))
         patch_w = float(wp) / float(max(gw, 1))
         loss_stub = patch_tokens_proj.sum() * 0.0
+        input_nonfinite_ratio = (~torch.isfinite(patch_tokens_proj)).to(dtype=dtype).mean()
 
         def _collect_direction(bi: int, view_i: int, view_j: int) -> None:
-            nonlocal valid_pairs_total
+            nonlocal valid_pairs_total, dir_total, dir_no_src_valid, dir_no_valid_src, dir_zero_overlap, dir_used
+            dir_total += 1
             src_valid = patch_valid_mask[bi : bi + 1, view_i]
             if not bool(src_valid.any()):
+                dir_no_src_valid += 1
                 return
 
             h_src, in_h = sample_map_bilinear(hgt[bi : bi + 1, view_i], centers)
@@ -92,6 +100,7 @@ class FeatureInfoNCELoss:
             h_src = h_src[:, 0]
             valid_src = src_valid & in_h & in_m & (m_src[:, 0] > 0.5)
             if not bool(valid_src.any()):
+                dir_no_valid_src += 1
                 return
 
             pts_src = centers[:, valid_src[0]]
@@ -118,6 +127,7 @@ class FeatureInfoNCELoss:
             pts_tgt_patch[..., 1] = (pts_tgt_patch[..., 1] + 0.5) / patch_w - 0.5
             tgt_feat, in_tgt = sample_map_bilinear(feat_map_all[bi : bi + 1, view_j], pts_tgt_patch)
             if not bool(in_tgt.any()):
+                dir_zero_overlap += 1
                 return
 
             pos = tgt_feat[0].transpose(0, 1)[in_tgt[0]]
@@ -127,6 +137,7 @@ class FeatureInfoNCELoss:
             anchors_all.append(anchor)
             positives_all.append(pos)
             valid_pairs_total += int(pos.shape[0])
+            dir_used += 1
 
         for bi in range(b):
             view_pairs = random_pairwise_view_pairs(v=v, max_pairs=self.cfg.view_pair_max_pairs, device=device)
@@ -136,7 +147,28 @@ class FeatureInfoNCELoss:
 
         if len(anchors_all) == 0:
             zero = torch.zeros((), device=device, dtype=dtype)
-            return loss_stub, {"feature_nce_valid_pairs": zero}, {"feature_nce_valid_pairs": 0}
+            dir_total_t = torch.tensor(float(dir_total), device=device, dtype=dtype)
+            dir_zero_overlap_t = torch.tensor(float(dir_zero_overlap), device=device, dtype=dtype)
+            dir_used_t = torch.tensor(float(dir_used), device=device, dtype=dtype)
+            probe = {
+                "feature_nce_valid_pairs": zero,
+                "feature_nce_input_nonfinite_ratio": input_nonfinite_ratio.detach(),
+                "feature_nce_anchor_nonfinite_ratio": zero,
+                "feature_nce_positive_nonfinite_ratio": zero,
+                "feature_nce_logits_nonfinite_ratio": zero,
+                "feature_nce_num_directions_total": dir_total_t,
+                "feature_nce_num_directions_zero_overlap": dir_zero_overlap_t,
+                "feature_nce_num_directions_used": dir_used_t,
+            }
+            aux = {
+                "feature_nce_valid_pairs": 0,
+                "feature_nce_num_directions_total": dir_total,
+                "feature_nce_num_directions_no_src_valid": dir_no_src_valid,
+                "feature_nce_num_directions_no_valid_src": dir_no_valid_src,
+                "feature_nce_num_directions_zero_overlap": dir_zero_overlap,
+                "feature_nce_num_directions_used": dir_used,
+            }
+            return loss_stub, probe, aux
 
         anchors = torch.cat(anchors_all, dim=0)
         positives = torch.cat(positives_all, dim=0)
@@ -148,8 +180,11 @@ class FeatureInfoNCELoss:
 
         anchors = F.normalize(anchors, dim=-1, eps=1e-6)
         positives = F.normalize(positives, dim=-1, eps=1e-6)
+        anchor_nonfinite_ratio = (~torch.isfinite(anchors)).to(dtype=dtype).mean()
+        positive_nonfinite_ratio = (~torch.isfinite(positives)).to(dtype=dtype).mean()
 
         logits = torch.matmul(anchors.float(), positives.float().transpose(0, 1)) / float(self.cfg.temperature)
+        logits_nonfinite_ratio = (~torch.isfinite(logits)).to(dtype=dtype).mean()
         targets = torch.arange(logits.shape[0], device=device, dtype=torch.long)
         loss = F.cross_entropy(logits, targets).to(dtype=dtype) + loss_stub
 
@@ -157,13 +192,28 @@ class FeatureInfoNCELoss:
             pred = logits.argmax(dim=1)
             acc = (pred == targets).float().mean()
             valid_pairs = torch.tensor(float(anchors.shape[0]), device=device, dtype=dtype)
+            dir_total_t = torch.tensor(float(dir_total), device=device, dtype=dtype)
+            dir_zero_overlap_t = torch.tensor(float(dir_zero_overlap), device=device, dtype=dtype)
+            dir_used_t = torch.tensor(float(dir_used), device=device, dtype=dtype)
 
         probe = {
             "feature_nce_valid_pairs": valid_pairs.detach(),
             "feature_nce_acc_top1": acc.detach().to(dtype=dtype),
+            "feature_nce_input_nonfinite_ratio": input_nonfinite_ratio.detach(),
+            "feature_nce_anchor_nonfinite_ratio": anchor_nonfinite_ratio.detach(),
+            "feature_nce_positive_nonfinite_ratio": positive_nonfinite_ratio.detach(),
+            "feature_nce_logits_nonfinite_ratio": logits_nonfinite_ratio.detach(),
+            "feature_nce_num_directions_total": dir_total_t,
+            "feature_nce_num_directions_zero_overlap": dir_zero_overlap_t,
+            "feature_nce_num_directions_used": dir_used_t,
         }
         aux = {
             "feature_nce_valid_pairs": int(anchors.shape[0]),
             "feature_nce_valid_pairs_before_cap": int(valid_pairs_total),
+            "feature_nce_num_directions_total": dir_total,
+            "feature_nce_num_directions_no_src_valid": dir_no_src_valid,
+            "feature_nce_num_directions_no_valid_src": dir_no_valid_src,
+            "feature_nce_num_directions_zero_overlap": dir_zero_overlap,
+            "feature_nce_num_directions_used": dir_used,
         }
         return loss, probe, aux

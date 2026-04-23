@@ -489,6 +489,16 @@ class Trainer:
             lnp = logs.get("loss_normal_point", None)
             lnce = logs.get("loss_feature_nce", None)
             lssim = logs.get("loss_ssim", None)
+            nce_pairs = float(logs.get("metric_feature_nce_valid_pairs", 0.0))
+            nce_dir_total = float(logs.get("metric_feature_nce_num_directions_total", 0.0))
+            nce_dir_zero = float(logs.get("metric_feature_nce_num_directions_zero_overlap", 0.0))
+            nce_in_nf = float(logs.get("metric_feature_nce_input_nonfinite_ratio", 0.0))
+            nce_logit_nf = float(logs.get("metric_feature_nce_logits_nonfinite_ratio", 0.0))
+            pm_pairs = float(logs.get("metric_patch_match_valid_pairs", 0.0))
+            pm_dir_total = float(logs.get("metric_patch_match_num_directions_total", 0.0))
+            pm_dir_zero = float(logs.get("metric_patch_match_num_directions_zero_overlap", 0.0))
+            pm_in_nf = float(logs.get("metric_patch_match_input_nonfinite_ratio", 0.0))
+            pm_logit_nf = float(logs.get("metric_patch_match_logits_nonfinite_ratio", 0.0))
             if lt is not None and lag is not None and lap is not None and lh is not None and lhrep is not None and lp is not None:
                 loss_sums["loss_total"] += float(lt)
                 loss_sums["loss_affine_grid"] += float(lag)
@@ -517,6 +527,10 @@ class Trainer:
                     f"l_np={float(lnp) if lnp is not None else float('nan'):.2f} "
                     f"l_nce={float(lnce) if lnce is not None else float('nan'):.2f} "
                     f"l_ssim={float(lssim) if lssim is not None else float('nan'):.2f} "
+                    f"nce_pairs={nce_pairs:.0f} nce_zero={nce_dir_zero:.0f}/{nce_dir_total:.0f} "
+                    f"nce_nf(in/logit)={nce_in_nf:.2e}/{nce_logit_nf:.2e} "
+                    f"pm_pairs={pm_pairs:.0f} pm_zero={pm_dir_zero:.0f}/{pm_dir_total:.0f} "
+                    f"pm_nf(in/logit)={pm_in_nf:.2e}/{pm_logit_nf:.2e} "
                     f"lr={lr:.2e} "
                     f"time={self._format_hhmmss(elapsed)} "
                     f"eta={self._format_hhmmss(eta)}"

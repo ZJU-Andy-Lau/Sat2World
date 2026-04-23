@@ -313,6 +313,20 @@ class GeometryPretrainObjective:
         aux_dict.update(aux_patch_match)
         scalar_dict["metric_feature_nce_valid_pairs"] = p_nce.get("feature_nce_valid_pairs", zero)
         scalar_dict["metric_feature_nce_acc_top1"] = p_nce.get("feature_nce_acc_top1", zero)
+        scalar_dict["metric_feature_nce_input_nonfinite_ratio"] = p_nce.get("feature_nce_input_nonfinite_ratio", zero)
+        scalar_dict["metric_feature_nce_anchor_nonfinite_ratio"] = p_nce.get("feature_nce_anchor_nonfinite_ratio", zero)
+        scalar_dict["metric_feature_nce_positive_nonfinite_ratio"] = p_nce.get("feature_nce_positive_nonfinite_ratio", zero)
+        scalar_dict["metric_feature_nce_logits_nonfinite_ratio"] = p_nce.get("feature_nce_logits_nonfinite_ratio", zero)
+        scalar_dict["metric_feature_nce_num_directions_total"] = p_nce.get("feature_nce_num_directions_total", zero)
+        scalar_dict["metric_feature_nce_num_directions_zero_overlap"] = p_nce.get("feature_nce_num_directions_zero_overlap", zero)
+        scalar_dict["metric_feature_nce_num_directions_used"] = p_nce.get("feature_nce_num_directions_used", zero)
+        scalar_dict["metric_patch_match_input_nonfinite_ratio"] = p_patch_match.get("patch_match_input_nonfinite_ratio", zero)
+        scalar_dict["metric_patch_match_src_nonfinite_ratio"] = p_patch_match.get("patch_match_src_nonfinite_ratio", zero)
+        scalar_dict["metric_patch_match_ref_nonfinite_ratio"] = p_patch_match.get("patch_match_ref_nonfinite_ratio", zero)
+        scalar_dict["metric_patch_match_logits_nonfinite_ratio"] = p_patch_match.get("patch_match_logits_nonfinite_ratio", zero)
+        scalar_dict["metric_patch_match_num_directions_total"] = p_patch_match.get("patch_match_num_directions_total", zero)
+        scalar_dict["metric_patch_match_num_directions_zero_overlap"] = p_patch_match.get("patch_match_num_directions_zero_overlap", zero)
+        scalar_dict["metric_patch_match_num_directions_used"] = p_patch_match.get("patch_match_num_directions_used", zero)
 
         return total, self._to_float_scalar_dict(scalar_dict), aux_dict
 
