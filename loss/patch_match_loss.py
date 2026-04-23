@@ -11,7 +11,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from loss.common import sample_map_bilinear
+from loss.common import random_pairwise_view_pairs, sample_map_bilinear
 
 
 @dataclass
@@ -19,6 +19,7 @@ class PatchInternalMatchLossCfg:
     patch_size: int = 16
     subpix_weight: float = 0.25
     max_pairs: int = 4096
+    view_pair_max_pairs: int | None = None
 
 
 class PatchInternalMatchLoss:
@@ -26,15 +27,6 @@ class PatchInternalMatchLoss:
         self.geometry_ops = geometry_ops
         self.patch_matcher = patch_matcher
         self.cfg = cfg or PatchInternalMatchLossCfg()
-
-    @staticmethod
-    def _expand_ref_idx(ref_view_idx: torch.Tensor | None, b: int, v: int, device: torch.device) -> torch.Tensor:
-        if ref_view_idx is None:
-            return torch.zeros((b,), dtype=torch.long, device=device)
-        ref = ref_view_idx.long().to(device=device).view(-1)
-        if ref.numel() == 1:
-            ref = ref.expand(b)
-        return ref.clamp(0, v - 1)
 
     def __call__(
         self,
@@ -53,8 +45,6 @@ class PatchInternalMatchLoss:
         device = patch_tokens_match.device
         dtype = patch_tokens_match.dtype
         p = int(self.cfg.patch_size)
-        ref_idx = self._expand_ref_idx(batch.get("ref_view_idx", None), b, v, device)
-
         hgt = batch["height_gt"].to(device=device, dtype=dtype)
         hmask = batch["height_valid_mask"].to(device=device, dtype=dtype)
         rpc_gt = batch["rpc_gt"]
@@ -69,90 +59,93 @@ class PatchInternalMatchLoss:
         ref_tok_all: list[torch.Tensor] = []
         tgt_local_all: list[torch.Tensor] = []
         meta_batch_all: list[torch.Tensor] = []
-        meta_src_view_all: list[torch.Tensor] = []
-        meta_ref_view_all: list[torch.Tensor] = []
-        src_global_pts_all: list[torch.Tensor] = []
-        ref_global_pts_all: list[torch.Tensor] = []
+        meta_view_i_all: list[torch.Tensor] = []
+        meta_view_j_all: list[torch.Tensor] = []
+        points_i_all: list[torch.Tensor] = []
+        points_j_gt_all: list[torch.Tensor] = []
+        top_line_all: list[torch.Tensor] = []
+        top_samp_all: list[torch.Tensor] = []
+
+        def _collect_direction(bi: int, view_i: int, view_j: int) -> None:
+            src_valid = patch_valid_mask[bi : bi + 1, view_i]
+            if not bool(src_valid.any()):
+                return
+
+            h_src, in_h = sample_map_bilinear(hgt[bi : bi + 1, view_i], centers)
+            m_src, in_m = sample_map_bilinear(hmask[bi : bi + 1, view_i], centers)
+            h_src = h_src[:, 0]
+            valid_src = src_valid & in_h & in_m & (m_src[:, 0] > 0.5)
+            if not bool(valid_src.any()):
+                return
+
+            src_idx = valid_src[0].nonzero(as_tuple=False).squeeze(1)
+            src_pts = centers[:, src_idx]
+            h_valid = h_src[:, src_idx]
+
+            xs, ys = self.geometry_ops.linesamp_to_xy_batch(
+                rpc_batch=[[rpc_gt[bi][view_i]]],
+                lines=src_pts[..., 0].view(1, 1, -1),
+                samps=src_pts[..., 1].view(1, 1, -1),
+                heights=h_valid.view(1, 1, -1),
+                scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
+                scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
+            )
+            l_j, s_j = self.geometry_ops.xy_to_linesamp_batch(
+                rpc_batch=[[rpc_gt[bi][view_j]]],
+                xs=xs,
+                ys=ys,
+                heights=h_valid.view(1, 1, -1),
+                scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
+                scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
+            )
+            l_j = l_j.view(-1)
+            s_j = s_j.view(-1)
+
+            in_j = (l_j >= 0) & (l_j <= (h_img - 1)) & (s_j >= 0) & (s_j <= (w_img - 1))
+            if not bool(in_j.any()):
+                return
+
+            src_idx = src_idx[in_j]
+            l_j = l_j[in_j]
+            s_j = s_j[in_j]
+            view_j_row = torch.round((l_j + 0.5) / float(p) - 0.5).long().clamp(0, gh - 1)
+            view_j_col = torch.round((s_j + 0.5) / float(p) - 0.5).long().clamp(0, gw - 1)
+            view_j_flat = view_j_row * gw + view_j_col
+
+            view_j_valid = patch_valid_mask[bi, view_j, view_j_flat]
+            if not bool(view_j_valid.any()):
+                return
+
+            src_idx = src_idx[view_j_valid]
+            view_j_flat = view_j_flat[view_j_valid]
+            l_j = l_j[view_j_valid]
+            s_j = s_j[view_j_valid]
+            view_j_row = view_j_row[view_j_valid]
+            view_j_col = view_j_col[view_j_valid]
+            top_line = view_j_row.to(dtype=dtype) * float(p)
+            top_samp = view_j_col.to(dtype=dtype) * float(p)
+            local_line = (l_j - top_line).clamp(0.0, float(p) - 1e-4)
+            local_samp = (s_j - top_samp).clamp(0.0, float(p) - 1e-4)
+            tgt_local = torch.stack([local_line, local_samp], dim=-1)
+
+            src_tok_all.append(patch_tokens_match[bi, view_i, src_idx])
+            ref_tok_all.append(patch_tokens_match[bi, view_j, view_j_flat])
+            tgt_local_all.append(tgt_local)
+
+            n_pair = int(src_idx.shape[0])
+            meta_batch_all.append(torch.full((n_pair,), int(bi), dtype=torch.long, device=device))
+            meta_view_i_all.append(torch.full((n_pair,), int(view_i), dtype=torch.long, device=device))
+            meta_view_j_all.append(torch.full((n_pair,), int(view_j), dtype=torch.long, device=device))
+            points_i_all.append(centers[0, src_idx])
+            points_j_gt_all.append(torch.stack([l_j, s_j], dim=-1))
+            top_line_all.append(top_line)
+            top_samp_all.append(top_samp)
 
         for bi in range(b):
-            ref = int(ref_idx[bi].item())
-            for vi in range(v):
-                if vi == ref:
-                    continue
-                src_valid = patch_valid_mask[bi : bi + 1, vi]
-                if not bool(src_valid.any()):
-                    continue
-
-                h_src, in_h = sample_map_bilinear(hgt[bi : bi + 1, vi], centers)
-                m_src, in_m = sample_map_bilinear(hmask[bi : bi + 1, vi], centers)
-                h_src = h_src[:, 0]
-                valid_src = src_valid & in_h & in_m & (m_src[:, 0] > 0.5)
-                if not bool(valid_src.any()):
-                    continue
-
-                src_idx = valid_src[0].nonzero(as_tuple=False).squeeze(1)
-                src_pts = centers[:, src_idx]
-                h_valid = h_src[:, src_idx]
-
-                xs, ys = self.geometry_ops.linesamp_to_xy_batch(
-                    rpc_batch=[[rpc_gt[bi][vi]]],
-                    lines=src_pts[..., 0].view(1, 1, -1),
-                    samps=src_pts[..., 1].view(1, 1, -1),
-                    heights=h_valid.view(1, 1, -1),
-                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
-                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
-                )
-                l_ref, s_ref = self.geometry_ops.xy_to_linesamp_batch(
-                    rpc_batch=[[rpc_gt[bi][ref]]],
-                    xs=xs,
-                    ys=ys,
-                    heights=h_valid.view(1, 1, -1),
-                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
-                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
-                )
-                l_ref = l_ref.view(-1)
-                s_ref = s_ref.view(-1)
-
-                in_ref = (l_ref >= 0) & (l_ref <= (h_img - 1)) & (s_ref >= 0) & (s_ref <= (w_img - 1))
-                if not bool(in_ref.any()):
-                    continue
-
-                src_idx = src_idx[in_ref]
-                l_ref = l_ref[in_ref]
-                s_ref = s_ref[in_ref]
-
-                ref_row = torch.round((l_ref + 0.5) / float(p) - 0.5).long().clamp(0, gh - 1)
-                ref_col = torch.round((s_ref + 0.5) / float(p) - 0.5).long().clamp(0, gw - 1)
-                ref_flat = ref_row * gw + ref_col
-
-                ref_valid = patch_valid_mask[bi, ref, ref_flat]
-                if not bool(ref_valid.any()):
-                    continue
-
-                src_idx = src_idx[ref_valid]
-                ref_flat = ref_flat[ref_valid]
-                l_ref = l_ref[ref_valid]
-                s_ref = s_ref[ref_valid]
-
-                top_line = ref_row[ref_valid].to(dtype=dtype) * float(p)
-                top_samp = ref_col[ref_valid].to(dtype=dtype) * float(p)
-                local_line = (l_ref - top_line).clamp(0.0, float(p) - 1e-4)
-                local_samp = (s_ref - top_samp).clamp(0.0, float(p) - 1e-4)
-                tgt_local = torch.stack([local_line, local_samp], dim=-1)
-
-                src_tok_all.append(patch_tokens_match[bi, vi, src_idx])
-                ref_tok_all.append(patch_tokens_match[bi, ref, ref_flat])
-                tgt_local_all.append(tgt_local)
-
-                # patch-match 可视化元数据：使用真实参与监督构造的全局像素对应点 [line, samp]。
-                n_pair = int(src_idx.shape[0])
-                src_global = centers[0, src_idx]
-                ref_global = torch.stack([l_ref, s_ref], dim=-1)
-                meta_batch_all.append(torch.full((n_pair,), int(bi), dtype=torch.long, device=device))
-                meta_src_view_all.append(torch.full((n_pair,), int(vi), dtype=torch.long, device=device))
-                meta_ref_view_all.append(torch.full((n_pair,), int(ref), dtype=torch.long, device=device))
-                src_global_pts_all.append(src_global)
-                ref_global_pts_all.append(ref_global)
+            view_pairs = random_pairwise_view_pairs(v=v, max_pairs=self.cfg.view_pair_max_pairs, device=device)
+            for view_i, view_j in view_pairs:
+                _collect_direction(bi, view_i, view_j)
+                _collect_direction(bi, view_j, view_i)
 
         # 空样本安全：与 matcher 参数保持图连接，避免 DDP unused parameter
         param_stub = torch.zeros((), device=device, dtype=dtype)
@@ -174,10 +167,12 @@ class PatchInternalMatchLoss:
         ref_tok = torch.cat(ref_tok_all, dim=0)
         tgt_local = torch.cat(tgt_local_all, dim=0)
         meta_batch = torch.cat(meta_batch_all, dim=0)
-        meta_src_view = torch.cat(meta_src_view_all, dim=0)
-        meta_ref_view = torch.cat(meta_ref_view_all, dim=0)
-        src_global_pts = torch.cat(src_global_pts_all, dim=0)
-        ref_global_pts = torch.cat(ref_global_pts_all, dim=0)
+        meta_view_i = torch.cat(meta_view_i_all, dim=0)
+        meta_view_j = torch.cat(meta_view_j_all, dim=0)
+        points_i = torch.cat(points_i_all, dim=0)
+        points_j_gt = torch.cat(points_j_gt_all, dim=0)
+        top_line = torch.cat(top_line_all, dim=0)
+        top_samp = torch.cat(top_samp_all, dim=0)
         total_before_cap = int(src_tok.shape[0])
 
         if src_tok.shape[0] > int(self.cfg.max_pairs):
@@ -186,10 +181,12 @@ class PatchInternalMatchLoss:
             ref_tok = ref_tok[perm]
             tgt_local = tgt_local[perm]
             meta_batch = meta_batch[perm]
-            meta_src_view = meta_src_view[perm]
-            meta_ref_view = meta_ref_view[perm]
-            src_global_pts = src_global_pts[perm]
-            ref_global_pts = ref_global_pts[perm]
+            meta_view_i = meta_view_i[perm]
+            meta_view_j = meta_view_j[perm]
+            points_i = points_i[perm]
+            points_j_gt = points_j_gt[perm]
+            top_line = top_line[perm]
+            top_samp = top_samp[perm]
 
         logits = self.patch_matcher(src_tok, ref_tok)  # [M,16,16]
         logits_flat = logits.view(logits.shape[0], -1)
@@ -205,6 +202,7 @@ class PatchInternalMatchLoss:
         pred_y = (prob * yy).sum(dim=(1, 2))
         pred_x = (prob * xx).sum(dim=(1, 2))
         pred_local = torch.stack([pred_y, pred_x], dim=-1).to(dtype=dtype)
+        points_j_pred = torch.stack([top_line + pred_local[:, 0], top_samp + pred_local[:, 1]], dim=-1)
         loss_subpix = F.smooth_l1_loss(pred_local, tgt_local)
 
         loss = loss_ce + float(self.cfg.subpix_weight) * loss_subpix + loss_stub
@@ -231,21 +229,26 @@ class PatchInternalMatchLoss:
         # 从“截断后真正参与 loss 的匹配集合”中选择一个真实视图对，供 TensorBoard 可视化。
         with torch.no_grad():
             if meta_batch.numel() > 0:
-                anchor_idx = 0
-                bi_sel = int(meta_batch[anchor_idx].item())
-                src_sel = int(meta_src_view[anchor_idx].item())
-                ref_sel = int(meta_ref_view[anchor_idx].item())
-                sel_mask = (meta_batch == bi_sel) & (meta_src_view == src_sel) & (meta_ref_view == ref_sel)
+                pair_keys = torch.stack([meta_batch, meta_view_i, meta_view_j], dim=1)
+                uniq_pairs = torch.unique(pair_keys, dim=0)
+                pick = torch.randint(0, int(uniq_pairs.shape[0]), size=(1,), device=device)[0]
+                pair_sel = uniq_pairs[pick]
+                bi_sel = int(pair_sel[0].item())
+                view_i_sel = int(pair_sel[1].item())
+                view_j_sel = int(pair_sel[2].item())
+                sel_mask = (meta_batch == bi_sel) & (meta_view_i == view_i_sel) & (meta_view_j == view_j_sel)
                 if bool(sel_mask.any()):
-                    src_vis = src_global_pts[sel_mask].detach()
-                    ref_vis = ref_global_pts[sel_mask].detach()
+                    points_i_vis = points_i[sel_mask].detach()
+                    points_j_gt_vis = points_j_gt[sel_mask].detach()
+                    points_j_pred_vis = points_j_pred[sel_mask].detach()
                     aux["patch_match_vis"] = {
                         "batch_index": bi_sel,
-                        "src_view_index": src_sel,
-                        "ref_view_index": ref_sel,
-                        "src_points": src_vis,
-                        "ref_points": ref_vis,
-                        "num_pairs_selected_view_pair": int(src_vis.shape[0]),
+                        "view_i_index": view_i_sel,
+                        "view_j_index": view_j_sel,
+                        "points_i": points_i_vis,
+                        "points_j_gt": points_j_gt_vis,
+                        "points_j_pred": points_j_pred_vis,
+                        "num_pairs_selected_view_pair": int(points_i_vis.shape[0]),
                         "num_pairs_total_after_cap": int(src_tok.shape[0]),
                         "num_pairs_total_before_cap": int(total_before_cap),
                     }

@@ -486,9 +486,9 @@ class TensorBoardMonitor:
         aux: dict[str, Any],
         *,
         global_step: int,
-        max_points: int = 32,
+        max_points: int = 16,
     ) -> tuple[torch.Tensor, str] | None:
-        """构造 patch-match 真实几何对应点连线图。"""
+        """构造 patch-match 预测结果 patch-grid 面板。"""
         vis = aux.get("patch_match_vis", None)
         if not isinstance(vis, dict):
             return None
@@ -497,120 +497,149 @@ class TensorBoardMonitor:
 
         try:
             bi = int(vis.get("batch_index", 0))
-            src_view = int(vis.get("src_view_index", 0))
-            ref_view = int(vis.get("ref_view_index", 0))
-            src_points = vis.get("src_points", None)
-            ref_points = vis.get("ref_points", None)
-            if not torch.is_tensor(src_points) or not torch.is_tensor(ref_points):
+            view_i = int(vis.get("view_i_index", 0))
+            view_j = int(vis.get("view_j_index", 0))
+            points_i = vis.get("points_i", None)
+            points_j_gt = vis.get("points_j_gt", None)
+            points_j_pred = vis.get("points_j_pred", None)
+            if (not torch.is_tensor(points_i)) or (not torch.is_tensor(points_j_gt)) or (not torch.is_tensor(points_j_pred)):
                 return None
-            if src_points.ndim != 2 or ref_points.ndim != 2 or src_points.shape[-1] != 2 or ref_points.shape[-1] != 2:
+            if (
+                points_i.ndim != 2
+                or points_j_gt.ndim != 2
+                or points_j_pred.ndim != 2
+                or points_i.shape[-1] != 2
+                or points_j_gt.shape[-1] != 2
+                or points_j_pred.shape[-1] != 2
+            ):
                 return None
-            if src_points.shape[0] == 0 or ref_points.shape[0] == 0:
+            if points_i.shape[0] == 0 or points_j_gt.shape[0] == 0 or points_j_pred.shape[0] == 0:
                 return None
-            n_pair = min(int(src_points.shape[0]), int(ref_points.shape[0]))
+            n_pair = min(int(points_i.shape[0]), int(points_j_gt.shape[0]), int(points_j_pred.shape[0]))
             if n_pair <= 0:
                 return None
-            src_points = src_points[:n_pair].detach().float().cpu()
-            ref_points = ref_points[:n_pair].detach().float().cpu()
+            points_i = points_i[:n_pair].detach().float().cpu()
+            points_j_gt = points_j_gt[:n_pair].detach().float().cpu()
+            points_j_pred = points_j_pred[:n_pair].detach().float().cpu()
             images = batch["images"]
             if images.ndim != 5:
                 return None
             b, v = int(images.shape[0]), int(images.shape[1])
-            if bi < 0 or bi >= b or src_view < 0 or src_view >= v or ref_view < 0 or ref_view >= v:
+            if bi < 0 or bi >= b or view_i < 0 or view_i >= v or view_j < 0 or view_j >= v:
                 return None
         except Exception:
             return None
 
-        src_img = images[bi, src_view].detach().float().cpu().clamp(0, 1)
-        ref_img = images[bi, ref_view].detach().float().cpu().clamp(0, 1)
-        if src_img.ndim != 3 or ref_img.ndim != 3 or src_img.shape[0] != 3 or ref_img.shape[0] != 3:
+        view_i_img = images[bi, view_i].detach().float().cpu().clamp(0, 1)
+        view_j_img = images[bi, view_j].detach().float().cpu().clamp(0, 1)
+        if view_i_img.ndim != 3 or view_j_img.ndim != 3 or view_i_img.shape[0] != 3 or view_j_img.shape[0] != 3:
             return None
 
-        h_src, w_src = int(src_img.shape[-2]), int(src_img.shape[-1])
-        h_ref, w_ref = int(ref_img.shape[-2]), int(ref_img.shape[-1])
+        h_i, w_i = int(view_i_img.shape[-2]), int(view_i_img.shape[-1])
+        h_j, w_j = int(view_j_img.shape[-2]), int(view_j_img.shape[-1])
+        if h_i < 128 or w_i < 128 or h_j < 128 or w_j < 128:
+            return None
         valid = (
-            torch.isfinite(src_points[:, 0])
-            & torch.isfinite(src_points[:, 1])
-            & torch.isfinite(ref_points[:, 0])
-            & torch.isfinite(ref_points[:, 1])
-            & (src_points[:, 0] >= 0)
-            & (src_points[:, 0] <= h_src - 1)
-            & (src_points[:, 1] >= 0)
-            & (src_points[:, 1] <= w_src - 1)
-            & (ref_points[:, 0] >= 0)
-            & (ref_points[:, 0] <= h_ref - 1)
-            & (ref_points[:, 1] >= 0)
-            & (ref_points[:, 1] <= w_ref - 1)
+            torch.isfinite(points_i[:, 0])
+            & torch.isfinite(points_i[:, 1])
+            & torch.isfinite(points_j_gt[:, 0])
+            & torch.isfinite(points_j_gt[:, 1])
+            & torch.isfinite(points_j_pred[:, 0])
+            & torch.isfinite(points_j_pred[:, 1])
+            & (points_i[:, 0] >= 0)
+            & (points_i[:, 0] <= h_i - 1)
+            & (points_i[:, 1] >= 0)
+            & (points_i[:, 1] <= w_i - 1)
+            & (points_j_gt[:, 0] >= 0)
+            & (points_j_gt[:, 0] <= h_j - 1)
+            & (points_j_gt[:, 1] >= 0)
+            & (points_j_gt[:, 1] <= w_j - 1)
         )
         if not bool(valid.any()):
             return None
-        src_points = src_points[valid]
-        ref_points = ref_points[valid]
-        n_valid = int(src_points.shape[0])
+        points_i = points_i[valid]
+        points_j_gt = points_j_gt[valid]
+        points_j_pred = points_j_pred[valid]
+        n_valid = int(points_i.shape[0])
         if n_valid <= 0:
             return None
 
         n_draw = min(int(max_points), n_valid)
         gen = torch.Generator(device="cpu")
-        gen.manual_seed(int(global_step) + int(bi) * 1009 + int(src_view) * 97 + int(ref_view) * 31 + 20260422)
+        gen.manual_seed(int(global_step) + int(bi) * 1009 + int(view_i) * 97 + int(view_j) * 31 + 20260422)
         if n_valid > n_draw:
             idx = torch.randperm(n_valid, generator=gen)[:n_draw]
-            src_points = src_points[idx]
-            ref_points = ref_points[idx]
+            points_i = points_i[idx]
+            points_j_gt = points_j_gt[idx]
+            points_j_pred = points_j_pred[idx]
 
-        h = max(h_src, h_ref)
-        canvas = torch.zeros(3, h, w_src + w_ref, dtype=torch.float32)
-        canvas[:, :h_src, :w_src] = src_img
-        canvas[:, :h_ref, w_src : w_src + w_ref] = ref_img
-        pil = Image.fromarray((canvas.permute(1, 2, 0).numpy() * 255.0).astype("uint8"))
-        draw = ImageDraw.Draw(pil)
+        def _crop_window(h: int, w: int, center_line: float, center_samp: float, crop: int = 128) -> tuple[int, int]:
+            half = crop // 2
+            top = int(round(center_line)) - half
+            left = int(round(center_samp)) - half
+            top = max(0, min(top, h - crop))
+            left = max(0, min(left, w - crop))
+            return top, left
 
-        palette = [
-            (255, 82, 82),
-            (129, 199, 132),
-            (79, 195, 247),
-            (255, 213, 79),
-            (186, 104, 200),
-            (255, 138, 101),
-            (77, 208, 225),
-            (174, 213, 129),
-            (244, 143, 177),
-            (144, 202, 249),
-            (255, 171, 64),
-            (149, 117, 205),
-        ]
-        radius = 3
-        for k in range(int(src_points.shape[0])):
-            color = palette[k % len(palette)]
-            y1 = float(src_points[k, 0].item())
-            x1 = float(src_points[k, 1].item())
-            y2 = float(ref_points[k, 0].item())
-            x2 = float(ref_points[k, 1].item()) + float(w_src)
-            draw.line([(x1, y1), (x2, y2)], fill=color, width=1)
-            draw.ellipse([(x1 - radius, y1 - radius), (x1 + radius, y1 + radius)], outline=color, fill=color)
-            draw.ellipse([(x2 - radius, y2 - radius), (x2 + radius, y2 + radius)], outline=color, fill=color)
+        def _draw_cross(patch: torch.Tensor, y: float, x: float, color: tuple[float, float, float], half: int = 4) -> None:
+            yi = int(round(float(y)))
+            xi = int(round(float(x)))
+            yi = max(0, min(yi, 127))
+            xi = max(0, min(xi, 127))
+            y0, y1 = max(0, yi - half), min(127, yi + half)
+            x0, x1 = max(0, xi - half), min(127, xi + half)
+            patch[0, y0 : y1 + 1, xi] = color[0]
+            patch[1, y0 : y1 + 1, xi] = color[1]
+            patch[2, y0 : y1 + 1, xi] = color[2]
+            patch[0, yi, x0 : x1 + 1] = color[0]
+            patch[1, yi, x0 : x1 + 1] = color[1]
+            patch[2, yi, x0 : x1 + 1] = color[2]
+
+        left_canvas = torch.zeros(3, 512, 512, dtype=torch.float32)
+        right_canvas = torch.zeros(3, 512, 512, dtype=torch.float32)
+        for k in range(int(points_i.shape[0])):
+            row, col = divmod(k, 4)
+            y0 = row * 128
+            x0 = col * 128
+
+            pi = points_i[k]
+            pj_gt = points_j_gt[k]
+            pj_pred = points_j_pred[k]
+
+            top_i, left_i = _crop_window(h_i, w_i, float(pi[0].item()), float(pi[1].item()), crop=128)
+            patch_i = view_i_img[:, top_i : top_i + 128, left_i : left_i + 128].clone()
+            _draw_cross(patch_i, float(pi[0].item()) - float(top_i), float(pi[1].item()) - float(left_i), color=(1.0, 0.2, 0.2))
+            left_canvas[:, y0 : y0 + 128, x0 : x0 + 128] = patch_i
+
+            top_j, left_j = _crop_window(h_j, w_j, float(pj_gt[0].item()), float(pj_gt[1].item()), crop=128)
+            patch_j = view_j_img[:, top_j : top_j + 128, left_j : left_j + 128].clone()
+            _draw_cross(
+                patch_j,
+                float(pj_pred[0].item()) - float(top_j),
+                float(pj_pred[1].item()) - float(left_j),
+                color=(0.2, 1.0, 0.2),
+            )
+            right_canvas[:, y0 : y0 + 128, x0 : x0 + 128] = patch_j
 
         view_ids = batch.get("view_ids", None)
         if torch.is_tensor(view_ids) and view_ids.ndim >= 2 and bi < int(view_ids.shape[0]):
-            src_view_id = int(view_ids[bi, src_view].item())
-            ref_view_id = int(view_ids[bi, ref_view].item())
+            view_i_id = int(view_ids[bi, view_i].item())
+            view_j_id = int(view_ids[bi, view_j].item())
         else:
-            src_view_id = int(src_view)
-            ref_view_id = int(ref_view)
+            view_i_id = int(view_i)
+            view_j_id = int(view_j)
 
-        src_label = f"src view={src_view} (id={src_view_id})"
-        ref_label = f"ref view={ref_view} (id={ref_view_id})"
-        canvas_t = torch.from_numpy(np.array(pil)).permute(2, 0, 1).to(torch.float32) / 255.0
-        canvas_t = self._draw_label_on_image(canvas_t, src_label, xy=(6, 6))
-        canvas_t = self._draw_label_on_image(canvas_t, ref_label, xy=(w_src + 6, 6))
+        canvas_t = torch.cat([left_canvas, right_canvas], dim=-1).clamp(0, 1)
+        canvas_t = self._draw_label_on_image(canvas_t, f"view_i={view_i} (id={view_i_id})", xy=(6, 6))
+        canvas_t = self._draw_label_on_image(canvas_t, f"view_j={view_j} (id={view_j_id}), cross=prediction", xy=(518, 6))
 
         meta = (
-            f"batch_index={bi}, src_view_index={src_view}, ref_view_index={ref_view}, "
-            f"src_view_id={src_view_id}, ref_view_id={ref_view_id}, "
+            f"batch_index={bi}, view_i_index={view_i}, view_j_index={view_j}, "
+            f"view_i_id={view_i_id}, view_j_id={view_j_id}, "
             f"num_pairs_selected_view_pair={int(vis.get('num_pairs_selected_view_pair', n_valid))}, "
             f"num_pairs_total_after_cap={int(vis.get('num_pairs_total_after_cap', n_valid))}, "
             f"num_pairs_total_before_cap={int(vis.get('num_pairs_total_before_cap', n_valid))}, "
-            f"num_pairs_drawn={int(src_points.shape[0])}"
+            f"num_pairs_drawn={int(points_i.shape[0])}"
         )
         return canvas_t.clamp(0, 1), meta
 

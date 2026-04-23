@@ -1,9 +1,9 @@
 """loss.feature_nce_loss
 
-基于中间层 patch 特征的单向 InfoNCE 监督：
-- anchor: 非参考视图 patch 特征；
-- positive: 通过 rpc_gt + h_gt 投影到参考视图后，从参考特征图双线性采样得到的特征；
-- mask: 仅保留投影落在参考图像内、且源 patch 有效的样本。
+基于中间层 patch 特征的双向 InfoNCE 监督：
+- 对每个样本先从无序视图对集合随机采样若干对；
+- 每个视图对同时累积 i->j 与 j->i 两个方向；
+- mask: 仅保留投影落在目标图像内、且源 patch 有效的样本。
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from loss.common import sample_map_bilinear
+from loss.common import random_pairwise_view_pairs, sample_map_bilinear
 
 
 @dataclass
@@ -23,6 +23,7 @@ class FeatureInfoNCELossCfg:
 
     temperature: float = 0.1
     max_pairs: int = 4096
+    view_pair_max_pairs: int | None = None
 
 
 class FeatureInfoNCELoss:
@@ -31,15 +32,6 @@ class FeatureInfoNCELoss:
     def __init__(self, geometry_ops: Any, cfg: FeatureInfoNCELossCfg | None = None) -> None:
         self.geometry_ops = geometry_ops
         self.cfg = cfg or FeatureInfoNCELossCfg()
-
-    @staticmethod
-    def _expand_ref_idx(ref_view_idx: torch.Tensor | None, b: int, v: int, device: torch.device) -> torch.Tensor:
-        if ref_view_idx is None:
-            return torch.zeros((b,), dtype=torch.long, device=device)
-        ref = ref_view_idx.long().to(device=device).view(-1)
-        if ref.numel() == 1:
-            ref = ref.expand(b)
-        return ref.clamp(0, v - 1)
 
     def __call__(
         self,
@@ -58,7 +50,7 @@ class FeatureInfoNCELoss:
             patch_valid_mask: [B,V,N]。
             patch_centers: [N,2]，(line,samp)。
             patch_grid_hw: (Gh,Gw)。
-            batch: 需包含 rpc_gt/height_gt/height_valid_mask/ref_view_idx。
+            batch: 需包含 rpc_gt/height_gt/height_valid_mask。
         """
         b, v, n, d = patch_tokens_proj.shape
         gh, gw = patch_grid_hw
@@ -67,8 +59,6 @@ class FeatureInfoNCELoss:
 
         device = patch_tokens_proj.device
         dtype = patch_tokens_proj.dtype
-        ref_idx = self._expand_ref_idx(batch.get("ref_view_idx", None), b, v, device)
-
         hgt = batch["height_gt"].to(device=device, dtype=dtype)
         hmask = batch["height_valid_mask"].to(device=device, dtype=dtype)
         rpc_gt = batch["rpc_gt"]
@@ -80,7 +70,7 @@ class FeatureInfoNCELoss:
         valid_pairs_total = 0
 
         centers = patch_centers.to(device=device, dtype=dtype).view(1, n, 2)
-        ref_feat_map_all = patch_tokens_proj.view(b, v, gh, gw, d).permute(0, 1, 4, 2, 3).contiguous()
+        feat_map_all = patch_tokens_proj.view(b, v, gh, gw, d).permute(0, 1, 4, 2, 3).contiguous()
         # 关键：将像素坐标投影点映射到 patch-grid 坐标系后再采样 ref_feat_map。
         if patch_padded_hw is not None:
             hp, wp = int(patch_padded_hw[0]), int(patch_padded_hw[1])
@@ -91,59 +81,58 @@ class FeatureInfoNCELoss:
         patch_w = float(wp) / float(max(gw, 1))
         loss_stub = patch_tokens_proj.sum() * 0.0
 
+        def _collect_direction(bi: int, view_i: int, view_j: int) -> None:
+            nonlocal valid_pairs_total
+            src_valid = patch_valid_mask[bi : bi + 1, view_i]
+            if not bool(src_valid.any()):
+                return
+
+            h_src, in_h = sample_map_bilinear(hgt[bi : bi + 1, view_i], centers)
+            m_src, in_m = sample_map_bilinear(hmask[bi : bi + 1, view_i], centers)
+            h_src = h_src[:, 0]
+            valid_src = src_valid & in_h & in_m & (m_src[:, 0] > 0.5)
+            if not bool(valid_src.any()):
+                return
+
+            pts_src = centers[:, valid_src[0]]
+            h_valid = h_src[:, valid_src[0]]
+            xs, ys = self.geometry_ops.linesamp_to_xy_batch(
+                rpc_batch=[[rpc_gt[bi][view_i]]],
+                lines=pts_src[..., 0].view(1, 1, -1),
+                samps=pts_src[..., 1].view(1, 1, -1),
+                heights=h_valid.view(1, 1, -1),
+                scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
+                scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
+            )
+            l_tgt, s_tgt = self.geometry_ops.xy_to_linesamp_batch(
+                rpc_batch=[[rpc_gt[bi][view_j]]],
+                xs=xs,
+                ys=ys,
+                heights=h_valid.view(1, 1, -1),
+                scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
+                scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
+            )
+            pts_tgt_pix = torch.stack([l_tgt.view(1, -1), s_tgt.view(1, -1)], dim=-1).to(device=device, dtype=dtype)
+            pts_tgt_patch = pts_tgt_pix.clone()
+            pts_tgt_patch[..., 0] = (pts_tgt_patch[..., 0] + 0.5) / patch_h - 0.5
+            pts_tgt_patch[..., 1] = (pts_tgt_patch[..., 1] + 0.5) / patch_w - 0.5
+            tgt_feat, in_tgt = sample_map_bilinear(feat_map_all[bi : bi + 1, view_j], pts_tgt_patch)
+            if not bool(in_tgt.any()):
+                return
+
+            pos = tgt_feat[0].transpose(0, 1)[in_tgt[0]]
+            anchor = patch_tokens_proj[bi, view_i, valid_src[0]][in_tgt[0]]
+            if pos.numel() == 0 or anchor.numel() == 0:
+                return
+            anchors_all.append(anchor)
+            positives_all.append(pos)
+            valid_pairs_total += int(pos.shape[0])
+
         for bi in range(b):
-            ref = int(ref_idx[bi].item())
-            ref_feat_map = ref_feat_map_all[bi : bi + 1, ref]  # [1,D,Gh,Gw]
-
-            for vi in range(v):
-                if vi == ref:
-                    continue
-
-                src_valid = patch_valid_mask[bi : bi + 1, vi]  # [1,N]
-                if not bool(src_valid.any()):
-                    continue
-
-                h_src, in_h = sample_map_bilinear(hgt[bi : bi + 1, vi], centers)
-                m_src, in_m = sample_map_bilinear(hmask[bi : bi + 1, vi], centers)
-                h_src = h_src[:, 0]
-                valid_src = src_valid & in_h & in_m & (m_src[:, 0] > 0.5)
-                if not bool(valid_src.any()):
-                    continue
-
-                pts_src = centers[:, valid_src[0]]
-                h_valid = h_src[:, valid_src[0]]
-
-                xs, ys = self.geometry_ops.linesamp_to_xy_batch(
-                    rpc_batch=[[rpc_gt[bi][vi]]],
-                    lines=pts_src[..., 0].view(1, 1, -1),
-                    samps=pts_src[..., 1].view(1, 1, -1),
-                    heights=h_valid.view(1, 1, -1),
-                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
-                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
-                )
-                l_ref, s_ref = self.geometry_ops.xy_to_linesamp_batch(
-                    rpc_batch=[[rpc_gt[bi][ref]]],
-                    xs=xs,
-                    ys=ys,
-                    heights=h_valid.view(1, 1, -1),
-                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
-                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
-                )
-                pts_ref_pix = torch.stack([l_ref.view(1, -1), s_ref.view(1, -1)], dim=-1).to(device=device, dtype=dtype)
-                pts_ref_patch = pts_ref_pix.clone()
-                pts_ref_patch[..., 0] = (pts_ref_patch[..., 0] + 0.5) / patch_h - 0.5
-                pts_ref_patch[..., 1] = (pts_ref_patch[..., 1] + 0.5) / patch_w - 0.5
-                pos_feat, in_ref = sample_map_bilinear(ref_feat_map, pts_ref_patch)
-                if not bool(in_ref.any()):
-                    continue
-
-                pos = pos_feat[0].transpose(0, 1)[in_ref[0]]  # [M,D]
-                src_proj = patch_tokens_proj[bi, vi, valid_src[0]][in_ref[0]]  # [M,D]
-                if pos.numel() == 0 or src_proj.numel() == 0:
-                    continue
-                anchors_all.append(src_proj)
-                positives_all.append(pos)
-                valid_pairs_total += int(pos.shape[0])
+            view_pairs = random_pairwise_view_pairs(v=v, max_pairs=self.cfg.view_pair_max_pairs, device=device)
+            for view_i, view_j in view_pairs:
+                _collect_direction(bi, view_i, view_j)
+                _collect_direction(bi, view_j, view_i)
 
         if len(anchors_all) == 0:
             zero = torch.zeros((), device=device, dtype=dtype)

@@ -288,6 +288,17 @@ def pairwise_view_pairs(v: int, max_pairs: int | None = None) -> list[tuple[int,
     return [all_pairs[i] for i in idx]
 
 
+def random_pairwise_view_pairs(v: int, max_pairs: int | None, device: torch.device) -> list[tuple[int, int]]:
+    """随机采样无序视图对列表。"""
+    all_pairs = list(combinations(range(v), 2))
+    if max_pairs is None or max_pairs >= len(all_pairs):
+        return all_pairs
+    if max_pairs <= 0:
+        return []
+    pick = torch.randperm(len(all_pairs), device=device)[: int(max_pairs)].tolist()
+    return [all_pairs[i] for i in pick]
+
+
 def safe_rmse(squared_error: torch.Tensor, mask: torch.Tensor | None = None, eps: float = 1e-8) -> torch.Tensor:
     """计算安全 RMSE: sqrt(masked_mean(se)+eps)。"""
     mse = masked_reduce(squared_error, mask=mask, reduce="mean")
