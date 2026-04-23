@@ -564,7 +564,8 @@ class TensorBoardMonitor:
         if n_valid <= 0:
             return None
 
-        n_draw = min(int(max_points), n_valid)
+        num_tiles = 16  # 4x4 固定面板
+        n_draw = min(int(max_points), n_valid, num_tiles)
         gen = torch.Generator(device="cpu")
         gen.manual_seed(int(global_step) + int(bi) * 1009 + int(view_i) * 97 + int(view_j) * 31 + 20260422)
         if n_valid > n_draw:
