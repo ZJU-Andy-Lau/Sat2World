@@ -101,6 +101,7 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any, patch_matcher: torch
     feature_nce_cfg = FeatureInfoNCELossCfg(
         temperature=float(lcfg.get("feature_nce_temperature", 0.1)),
         max_pairs=int(lcfg.get("feature_nce_max_pairs", 4096)),
+        view_pair_max_pairs=lcfg.get("max_pairs", None),
     )
     normal_cfg = PointNormalLossCfg(
         w_cos=float(lcfg.get("normal_w_cos", 1.0)),
@@ -113,6 +114,7 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any, patch_matcher: torch
         patch_size=int(cfg.get("model", {}).get("detail_patch_size", 16)),
         subpix_weight=float(lcfg.get("patch_match_subpix_weight", 0.25)),
         max_pairs=int(lcfg.get("patch_match_max_pairs", 4096)),
+        view_pair_max_pairs=lcfg.get("max_pairs", None),
     )
     return GeometryPretrainObjective(
         geometry_ops=geometry_ops,
