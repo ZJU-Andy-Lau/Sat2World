@@ -10,16 +10,18 @@ from .backbone import (
     # VisualGeometryFuser,
 )
 from .patch_matcher import PatchHeatmapMatcher, PatchMatcherCfg
-from .coders import HeightCoder, PointCoder, SymmetricBinCoderCfg, SymmetricBinScalarCoder
+from .coders import BoundedSinhOffsetDecoder, HeightCoder, PointCoder, SymmetricBinCoderCfg, SymmetricBinScalarCoder
 from .encoder import AlternatingEncoder, AlternatingEncoderCfg
 from .heads import (
     AffineHead,
     AffineHeadCfg,
     DPTDenseDecoder,
     DPTDenseDecoderCfg,
+    DenseHeightLocalHead,
     GaussianHead,
-    HeightHead,
-    PointHead,
+    PointXYHead,
+    PointZLocalHead,
+    SceneHeightAnchorHead,
     SharedDenseDecoder,
     TaskAdapter,
 )
@@ -39,6 +41,7 @@ __all__ = [
     "AlternatingEncoderCfg",
     "SymmetricBinScalarCoder",
     "SymmetricBinCoderCfg",
+    "BoundedSinhOffsetDecoder",
     "HeightCoder",
     "PointCoder",
     "SharedDenseDecoder",
@@ -47,8 +50,10 @@ __all__ = [
     "TaskAdapter",
     "AffineHead",
     "AffineHeadCfg",
-    "HeightHead",
-    "PointHead",
+    "SceneHeightAnchorHead",
+    "DenseHeightLocalHead",
+    "PointXYHead",
+    "PointZLocalHead",
     "GaussianHead",
     "Sat2World",
     "Sat2WorldCfg",

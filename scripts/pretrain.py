@@ -84,6 +84,7 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any, patch_matcher: torch
         lambda_affine_reg=float(lcfg.get("lambda_affine_reg", 0.1)),
         lambda_affine_ref=float(lcfg.get("lambda_affine_ref", 0.1)),
         lambda_height=float(lcfg.get("lambda_height", 1.0)),
+        lambda_height_anchor=float(lcfg.get("lambda_height_anchor", 0.5)),
         lambda_point=float(lcfg.get("lambda_point", 1.0)),
         lambda_point_reproj=float(lcfg.get("lambda_point_reproj", 0.2)),
         lambda_height_reproj=float(lcfg.get("lambda_height_reproj", 0.2)),

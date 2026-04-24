@@ -137,15 +137,12 @@ model:
   affine_diag_scale: 0.01
   affine_offdiag_scale: 0.01
   affine_trans_scale: 30.0
-  height_bins: 101
-  height_bin_size: 1.0
-  height_fine_range: 0.5
+  height_anchor_scale: 200.0
+  height_local_scale: 30.0
+  height_z_max: 4.0
   point_bins_xy: 33
-  point_bins_h: 101
   point_bin_size_xy: 0.1
-  point_bin_size_z: 1.0
   point_fine_range_xy: 0.05
-  point_fine_range_z: 0.5
   center_downsample_stage_steps: [0, 10, 20]
   center_downsample_factors: [4, 2, 1]
   enable_gaussian_branch: true
@@ -194,6 +191,7 @@ loss:
   lambda_affine_reg: 0.1
   lambda_affine_ref: 1.0
   lambda_height: 1.0
+  lambda_height_anchor: 0.5
   abs_keep_steps: 100000
   lambda_point: 1.0
   lambda_point_pair: 0.2

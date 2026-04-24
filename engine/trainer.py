@@ -271,8 +271,10 @@ class Trainer:
             d["hist/affine_pred"] = outputs["affine_pred"].detach()
         if "height_abs" in outputs:
             d["hist/height_abs"] = outputs["height_abs"].detach()
-        if "point_delta_fine" in outputs:
-            d["hist/point_delta_fine"] = outputs["point_delta_fine"].detach()
+        if "point_delta_xy_fine" in outputs:
+            d["hist/point_delta_xy_fine"] = outputs["point_delta_xy_fine"].detach()
+        if "point_z_local_offset" in outputs:
+            d["hist/point_z_local_offset"] = outputs["point_z_local_offset"].detach()
         if "gaussian_opacity" in outputs:
             d["hist/gaussian_opacity"] = outputs["gaussian_opacity"].detach()
         if "gaussian_scale" in outputs:

@@ -425,6 +425,9 @@ class RPCSceneDataset(Dataset):
         images_t = torch.stack(images, dim=0).to(torch.float32)  # [V,3,512,512]
         height_gt_t = torch.stack(heights, dim=0).to(torch.float32)  # [V,1,512,512]
         height_mask_t = torch.stack(height_masks, dim=0).to(torch.float32)  # [V,1,512,512]
+        valid_mask = height_mask_t > 0.5
+        finite_mask = torch.isfinite(height_gt_t)
+        valid = valid_mask & finite_mask
 
         # 4) 先构造 rpc_init；scene_xy_center/scale 将按“参考视图 + rpc_init”估计
         do_perturb = (self.mode == "train" and self.apply_perturbation) or (
@@ -449,6 +452,13 @@ class RPCSceneDataset(Dataset):
 
         # 5) 统一按参考视图（ref_view_idx）在 rpc_init 上估计 scene_xy_center/scale
         height_ref = self._infer_height_ref(rpc_init_views)
+        ref_view_idx_int = int(ref_view_idx)
+        height_ref_anchor = height_ref[ref_view_idx_int].to(torch.float32).view(1)
+        if bool(valid.any().item()):
+            height_anchor_gt = height_gt_t[valid].median().to(torch.float32).view(1)
+        else:
+            height_anchor_gt = height_ref_anchor.clone()
+        height_anchor_offset_gt = (height_anchor_gt - height_ref_anchor).to(torch.float32)
         image_shapes_crop = [(self.crop_size, self.crop_size) for _ in selected_views]
         scene_xy_center, scene_xy_scale = estimate_scene_xy_center_scale(
             selected_views_rpc_gt=rpc_init_views,
@@ -495,6 +505,9 @@ class RPCSceneDataset(Dataset):
             "affine_gt_forward": aff_fwd.to(torch.float32),
             "affine_gt_correction": aff_corr.to(torch.float32),
             "height_ref": height_ref.to(torch.float32),
+            "height_ref_anchor": height_ref_anchor.to(torch.float32),
+            "height_anchor_gt": height_anchor_gt.to(torch.float32),
+            "height_anchor_offset_gt": height_anchor_offset_gt.to(torch.float32),
             "scene_xy_center": scene_xy_center.to(torch.float32),
             "scene_xy_scale": scene_xy_scale.to(torch.float32),
             "ref_view_idx": int(ref_view_idx),
@@ -547,6 +560,7 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
 
     images_b, height_b, mask_b = [], [], []
     aff_fwd_b, aff_cor_b, href_b = [], [], []
+    href_anchor_b, h_anchor_gt_b, h_anchor_off_gt_b = [], [], []
     rpc_gt_b, rpc_init_b = [], []
     view_ids_b, image_paths_b = [], []
     scene_center_b, scene_scale_b, ref_idx_b, scene_id_b = [], [], [], []
@@ -566,6 +580,19 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         aff_fwd_b.append(sample["affine_gt_forward"][idx])
         aff_cor_b.append(sample["affine_gt_correction"][idx])
         href_b.append(sample["height_ref"][idx])
+        ref_idx_i = int(sample.get("ref_view_idx", 0))
+        ref_idx_i = min(max(ref_idx_i, 0), v_out - 1)
+        height_ref_anchor_i = sample["height_ref"][ref_idx_i].to(torch.float32).view(1)
+        valid_i = (sample["height_valid_mask"][idx] > 0.5) & torch.isfinite(sample["height_gt"][idx])
+        if bool(valid_i.any().item()):
+            height_anchor_gt_i = sample["height_gt"][idx][valid_i].median().to(torch.float32).view(1)
+        else:
+            height_anchor_gt_i = height_ref_anchor_i.clone()
+        height_anchor_off_gt_i = (height_anchor_gt_i - height_ref_anchor_i).to(torch.float32)
+
+        href_anchor_b.append(height_ref_anchor_i)
+        h_anchor_gt_b.append(height_anchor_gt_i)
+        h_anchor_off_gt_b.append(height_anchor_off_gt_i)
 
         rpc_gt_b.append([sample["rpc_gt"][int(i)] for i in idx.tolist()])
         rpc_init_b.append([sample["rpc_init"][int(i)] for i in idx.tolist()])
@@ -611,6 +638,9 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "affine_gt_forward": torch.stack(aff_fwd_b, dim=0).to(torch.float32),
         "affine_gt_correction": torch.stack(aff_cor_b, dim=0).to(torch.float32),
         "height_ref": torch.stack(href_b, dim=0).to(torch.float32),
+        "height_ref_anchor": torch.stack(href_anchor_b, dim=0).to(torch.float32),
+        "height_anchor_gt": torch.stack(h_anchor_gt_b, dim=0).to(torch.float32),
+        "height_anchor_offset_gt": torch.stack(h_anchor_off_gt_b, dim=0).to(torch.float32),
         "scene_xy_center": torch.stack(scene_center_b, dim=0).to(torch.float32),
         "scene_xy_scale": torch.stack(scene_scale_b, dim=0).to(torch.float32),
         "rpc_gt": rpc_gt_b,
