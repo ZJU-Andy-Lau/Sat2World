@@ -1,9 +1,9 @@
 system:
   project_name: Sat2World
   experiment_name: default_exp
-  work_dir: work_dirs/train_0414_0
-  output_dir: work_dirs/train_0414_0
-  seed: 42
+  work_dir: work_dirs/train_0420_0
+  output_dir: work_dirs/train_0420_0
+  seed: 13
   deterministic: false
   cudnn_benchmark: true
   allow_tf32: true
@@ -14,14 +14,14 @@ system:
   checkpoint_match_by_shape: false
   checkpoint_load_model_only: true
   checkpoint_model_strict: true
-  resume_path: "work_dirs/train_0413/checkpoints/last.pt"
-  checkpoint_path: "work_dirs/train_0413/checkpoints/last.pt"
+  resume_path: ""
+  checkpoint_path: ""
   eval_only: false
 
 data:
   train:
     root: ./data/JAX_train
-    max_view_num: 6
+    max_view_num: 4
     min_view_num: 2
     samples_per_scene: 10
     min_views: 2
@@ -30,7 +30,7 @@ data:
     cache_rpc: true
     cache_image: false
     cache_height: false
-    base_seed: 12345
+    base_seed: 13
     reference_policy: first
     strict_same_hw: true
     crop_size: 512
@@ -55,13 +55,13 @@ data:
     max_view_num: 6
     min_view_num: 2
     samples_per_scene: 1
-    min_views: 10
+    min_views: 2
     apply_perturbation: true
     synthetic_perturbation_in_eval: true
     cache_rpc: true
     cache_image: false
     cache_height: false
-    base_seed: 22345
+    base_seed: 17
     reference_policy: first
     strict_same_hw: true
     crop_size: 512
@@ -89,7 +89,7 @@ data:
     val_batch_size: 1
     num_workers: 4
     pin_memory: true
-    persistent_workers: true
+    persistent_workers: false
     prefetch_factor: 2
     drop_last: true
 
@@ -115,6 +115,7 @@ model:
   task_adapter_depth: 2
   nce_projector_dim: 256
   nce_projector_hidden_dim: 512
+  detail_patch_encoder_enable: true
   detail_patch_size: 16
   detail_token_dim: 1024
   patch_match_dim: 256
@@ -135,12 +136,12 @@ model:
   encoder_layerscale_init_values: 0.01
   affine_diag_scale: 0.01
   affine_offdiag_scale: 0.01
-  affine_trans_scale: 50.0
-  height_bins: 33
+  affine_trans_scale: 30.0
+  height_bins: 101
   height_bin_size: 1.0
   height_fine_range: 0.5
   point_bins_xy: 33
-  point_bins_h: 33
+  point_bins_h: 101
   point_bin_size_xy: 0.1
   point_bin_size_z: 1.0
   point_fine_range_xy: 0.05
@@ -153,7 +154,7 @@ model:
   output_raw_logits: true
 
 renderer:
-  train_num_target_views: 3
+  train_num_target_views: 2
   val_num_target_views: 1
   use_all_targets_in_val: false
   exclude_self_source: true
@@ -164,8 +165,8 @@ renderer:
   enable_voxelization: false
   voxel_xy: 2.0
   voxel_z: 1.0
-  render_downsample_factor_train: 2
-  render_downsample_factor_val: 2
+  render_downsample_factor_train: 1
+  render_downsample_factor_val: 1
   nsigma: 2.5
   alpha_clamp_max: 0.98
   eps_xy_fd: 0.01
@@ -191,16 +192,16 @@ loss:
   lambda_affine_grid: 1.0
   lambda_affine_pair: 1.0
   lambda_affine_reg: 0.1
-  lambda_affine_ref: 0.1
+  lambda_affine_ref: 1.0
   lambda_height: 1.0
-  abs_keep_steps: 5000
+  abs_keep_steps: 100000
   lambda_point: 1.0
-  lambda_point_reproj: 0.2
-  lambda_height_reproj: 0.2
   lambda_point_pair: 0.2
+  lambda_height_reproj: 0.2
+  lambda_point_reproj: 0.2
   lambda_normal_height: 10.0
   lambda_normal_point: 10.0
-  lambda_feature_nce: 1.0
+  lambda_feature_nce: 10.0
   lambda_patch_match: 0.5
   patch_match_subpix_weight: 0.25
   patch_match_max_pairs: 4096
@@ -241,13 +242,13 @@ optim:
   betas: [0.9, 0.999]
   eps: 1.0e-8
   scheduler: warmup_cosine
-  warmup_steps: 1000
-  max_steps: 20000
+  warmup_steps: 100
+  max_steps: 6000
   min_lr_ratio: 0.01
 
 train:
   max_epochs: 200
-  accumulate_steps: 1
+  accumulate_steps: 5
   grad_clip_norm: 1.0
   amp_dtype: fp16
   enable_grad_scaler: true
@@ -255,12 +256,12 @@ train:
   enable_render_val: true
   skip_nan_batch: true
   log_interval: 1
-  hist_interval: 200
-  vis_interval: 50
-  val_interval: 10
-  ckpt_interval: 1000
+  hist_interval: 100000
+  vis_interval: 10
+  val_interval: 1000000
+  ckpt_interval: 1000000
   save_every_epoch: true
-  validate_first: true
+  validate_first: false
   validate_each_epoch: true
   best_metric: loss_total
   best_mode: min
@@ -272,7 +273,7 @@ train:
 logging:
   tensorboard:
     enable: true
-    log_dir: work_dirs/train_0414_0/tb
+    log_dir: work_dirs/train_0420_0/tb
     enable_mesh: true
     image_max_views: 4
     max_pointcloud_points: 8192
@@ -282,7 +283,7 @@ logging:
     record_pointcloud: true
 
 checkpoint:
-  checkpoints_dir: work_dirs/train_0414_0/checkpoints
+  checkpoints_dir: work_dirs/train_0420_0/checkpoints
   save_last: true
   save_best: true
   best_metric_name: loss_total
