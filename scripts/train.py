@@ -180,6 +180,7 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any, patch_matcher: torch
     feature_nce_cfg = FeatureInfoNCELossCfg(
         temperature=float(lcfg.get("feature_nce_temperature", 0.1)),
         max_pairs=int(lcfg.get("feature_nce_max_pairs", 4096)),
+        match_max_pair=int(lcfg.get("feature_nce_match_max_pair", lcfg.get("match_max_pair", 12))),
     )
     normal_cfg = PointNormalLossCfg(
         w_cos=float(lcfg.get("normal_w_cos", 1.0)),
@@ -196,6 +197,7 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any, patch_matcher: torch
         patch_size=int(cfg.get("model", {}).get("detail_patch_size", 16)),
         subpix_weight=float(lcfg.get("patch_match_subpix_weight", 0.25)),
         max_pairs=int(lcfg.get("patch_match_max_pairs", 4096)),
+        match_max_pair=int(lcfg.get("patch_match_match_max_pair", lcfg.get("match_max_pair", 12))),
     )
     return RPCAnySplatTrainingObjective(
         geometry_ops=geometry_ops,
