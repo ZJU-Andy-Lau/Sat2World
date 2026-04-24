@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any
 
 import torch
@@ -236,6 +237,61 @@ class RPCAnySplatTrainingObjective:
             else:
                 out[k] = v
         return out
+
+    def _build_nan_probe(self, scalar_dict: dict[str, Any]) -> dict[str, Any]:
+        """构建 NaN/Inf 探针摘要。"""
+        nonfinite_losses: list[str] = []
+        nonfinite_metrics: list[str] = []
+        loss_snapshot: dict[str, float | str] = {}
+
+        def _is_finite_value(x: Any) -> bool:
+            if torch.is_tensor(x):
+                if x.numel() == 0:
+                    return True
+                return bool(torch.isfinite(x).all().item())
+            if isinstance(x, (int, float)):
+                return math.isfinite(float(x))
+            return True
+
+        def _to_scalar_repr(x: Any) -> float | str:
+            if torch.is_tensor(x):
+                if x.numel() == 0:
+                    return "empty"
+                if x.ndim == 0:
+                    val = float(x.detach().cpu().item())
+                    if math.isnan(val):
+                        return "nan"
+                    if math.isinf(val):
+                        return "inf" if val > 0 else "-inf"
+                    return val
+                return f"tensor(shape={tuple(x.shape)})"
+            if isinstance(x, (int, float)):
+                val = float(x)
+                if math.isnan(val):
+                    return "nan"
+                if math.isinf(val):
+                    return "inf" if val > 0 else "-inf"
+                return val
+            return str(type(x).__name__)
+
+        for k, v in scalar_dict.items():
+            if not (k.startswith("loss_") or k.startswith("metric_")):
+                continue
+            finite = _is_finite_value(v)
+            if k.startswith("loss_"):
+                loss_snapshot[k] = _to_scalar_repr(v)
+                if not finite:
+                    nonfinite_losses.append(k)
+            elif not finite:
+                nonfinite_metrics.append(k)
+
+        return {
+            "nan_probe_nonfinite_losses": nonfinite_losses,
+            "nan_probe_nonfinite_metrics": nonfinite_metrics,
+            "nan_probe_first_bad_loss": nonfinite_losses[0] if len(nonfinite_losses) > 0 else "",
+            "nan_probe_total_is_finite": len(nonfinite_losses) == 0,
+            "nan_probe_loss_snapshot": loss_snapshot,
+        }
 
     def _replace_ref_affine_with_identity(self, affine_pred: torch.Tensor, ref_view_idx: torch.Tensor | None) -> torch.Tensor:
         """在 loss 计算阶段把参考视图 affine 替换为单位阵。"""
@@ -532,6 +588,7 @@ class RPCAnySplatTrainingObjective:
         aux_dict.update(aux_hreproj)
         aux_dict.update(aux_nce)
         aux_dict.update(aux_patch_match)
+        aux_dict.update(self._build_nan_probe(scalar_dict))
 
         return total, self._to_float_scalar_dict(scalar_dict), aux_dict
 
