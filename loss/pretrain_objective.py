@@ -37,6 +37,7 @@ class GeometryPretrainWeightCfg:
     lambda_affine_reg: float = 0.1
     lambda_affine_ref: float = 0.1
     lambda_height: float = 1.0
+    lambda_height_anchor: float = 0.5
     lambda_point: float = 1.0
     lambda_point_reproj: float = 0.2
     lambda_height_reproj: float = 0.2
@@ -81,6 +82,7 @@ class GeometryPretrainObjective:
         self.affine_reg = AffineLinearRegularization()
         self.affine_ref = RefAffineIdentityLoss()
         self.height_loss = HeightHuberLoss(beta=height_beta)
+        self.height_anchor_loss = torch.nn.SmoothL1Loss(reduction="mean")
         self.point_loss = PointMapLoss(geometry_ops=geometry_ops, beta=point_beta)
         self.point_reproj_loss = PointReprojectionLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.point_pair_loss = PointPairwiseConsistencyLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
@@ -195,8 +197,11 @@ class GeometryPretrainObjective:
             [
                 "affine_pred",
                 "height_abs",
+                "height_anchor",
+                "height_local_z",
                 "point_abs",
                 "point_anchor",
+                "point_z_local_z",
                 "rpc_corrected",
                 "patch_tokens_nce_proj",
                 "patch_valid_mask",
@@ -207,7 +212,7 @@ class GeometryPretrainObjective:
             ],
             "outputs",
         )
-        self._require_keys(batch, ["height_gt", "height_valid_mask", "affine_gt_forward", "rpc_gt", "images"], "batch")
+        self._require_keys(batch, ["height_gt", "height_valid_mask", "height_anchor_gt", "affine_gt_forward", "rpc_gt", "images"], "batch")
 
         affine_pred = outputs["affine_pred"]
         ref_idx = batch.get("ref_view_idx", None)
@@ -236,6 +241,25 @@ class GeometryPretrainObjective:
             outputs["height_abs"],
             batch["height_gt"].to(device=outputs["height_abs"].device, dtype=outputs["height_abs"].dtype),
             batch["height_valid_mask"].to(device=outputs["height_abs"].device, dtype=outputs["height_abs"].dtype),
+        )
+        l_h_anchor = self.height_anchor_loss(
+            outputs["height_anchor"],
+            batch["height_anchor_gt"].to(device=outputs["height_anchor"].device, dtype=outputs["height_anchor"].dtype),
+        )
+        p_h_anchor_mae = (outputs["height_anchor"] - batch["height_anchor_gt"].to(device=outputs["height_anchor"].device, dtype=outputs["height_anchor"].dtype)).abs().mean().detach()
+        z_max_val = float(outputs.get("height_z_max", torch.tensor(0.0, device=outputs["height_abs"].device)).detach().item())
+        z_thr = z_max_val * 0.98 if z_max_val > 0 else 0.0
+        h_local_z = outputs.get("height_local_z", None)
+        pz_local_z = outputs.get("point_z_local_z", None)
+        h_local_boundary = (
+            (h_local_z.abs() >= z_thr).to(h_local_z.dtype).mean().detach()
+            if h_local_z is not None and z_thr > 0
+            else torch.zeros((), device=outputs["height_abs"].device, dtype=outputs["height_abs"].dtype)
+        )
+        pz_local_boundary = (
+            (pz_local_z.abs() >= z_thr).to(pz_local_z.dtype).mean().detach()
+            if pz_local_z is not None and z_thr > 0
+            else torch.zeros((), device=outputs["height_abs"].device, dtype=outputs["height_abs"].dtype)
         )
 
         l_p, p_p, aux_point = self.point_loss(outputs["point_abs"], outputs["point_anchor"], batch, return_aux=False)
@@ -273,6 +297,7 @@ class GeometryPretrainObjective:
             + w.lambda_affine_reg * l_aff_reg
             + w.lambda_affine_ref * l_aff_ref
             + w_h_abs * l_h
+            + float(w.lambda_height_anchor) * l_h_anchor
             + w_p_abs * l_p
             + w.lambda_point_reproj * l_preproj
             + w.lambda_height_reproj * l_hreproj
@@ -291,6 +316,7 @@ class GeometryPretrainObjective:
             "loss_affine_reg": l_aff_reg,
             "loss_affine_ref": l_aff_ref,
             "loss_height": l_h,
+            "loss_height_anchor": l_h_anchor,
             "loss_height_rel": zero,
             "loss_point": l_p,
             "loss_point_reproj": l_preproj,
@@ -305,6 +331,8 @@ class GeometryPretrainObjective:
             "metric_ref_affine_identity_l2": p_aff_ref.get("ref_affine_identity_l2", zero),
             "metric_height_rmse": p_h.get("height_rmse", zero),
             "metric_height_mae": p_h.get("height_mae", zero),
+            "metric_height_bias": p_h.get("height_bias", zero),
+            "metric_height_anchor_mae": p_h_anchor_mae,
             "metric_height_rel_consistency": zero,
             "metric_height_rel_cycle_px": zero,
             "metric_height_rel_cycle_px_rmse": zero,
@@ -327,11 +355,14 @@ class GeometryPretrainObjective:
             "metric_patch_match_valid_pairs": p_patch_match.get("patch_match_valid_pairs", zero),
             "metric_patch_match_acc_top1_1px": p_patch_match.get("patch_match_acc_top1_1px", zero),
             "metric_patch_match_l1_px": p_patch_match.get("patch_match_l1_px", zero),
+            "probe_height_local_z_boundary_ratio": h_local_boundary,
+            "probe_point_z_local_z_boundary_ratio": pz_local_boundary,
             "weight_affine_grid": float(w.lambda_affine_grid),
             "weight_affine_pair": float(w.lambda_affine_pair),
             "weight_affine_reg": float(w.lambda_affine_reg),
             "weight_affine_ref": float(w.lambda_affine_ref),
             "weight_height": float(w_h_abs),
+            "weight_height_anchor": float(w.lambda_height_anchor),
             "weight_height_rel": 0.0,
             "weight_point": float(w_p_abs),
             "weight_point_reproj": float(w.lambda_point_reproj),

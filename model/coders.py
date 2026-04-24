@@ -78,6 +78,31 @@ class SymmetricBinScalarCoder(nn.Module):
         return residual, coarse_value, fine_value
 
 
+class BoundedSinhOffsetDecoder(nn.Module):
+    """通用有界 z -> sinh 偏移解码器。"""
+
+    def __init__(self, z_max: float = 4.0) -> None:
+        super().__init__()
+        self.z_max = float(z_max)
+        if self.z_max <= 0:
+            raise ValueError("z_max must be > 0")
+
+    def forward(self, raw_z: torch.Tensor, scale: float | torch.Tensor) -> dict[str, torch.Tensor]:
+        z = torch.tanh(raw_z) * self.z_max
+        z_safe = z.clamp(min=-self.z_max, max=self.z_max)
+        offset_fp32 = torch.sinh(z_safe.float())
+        if torch.is_tensor(scale):
+            scale_t = scale.to(device=offset_fp32.device, dtype=offset_fp32.dtype)
+        else:
+            scale_t = torch.tensor(float(scale), device=offset_fp32.device, dtype=offset_fp32.dtype)
+        offset = offset_fp32 * scale_t
+        offset = offset.to(dtype=raw_z.dtype)
+        return {
+            "z": z,
+            "offset": offset,
+        }
+
+
 class HeightCoder(nn.Module):
     """高程解码器：把有界残差解码为绝对高程。"""
 

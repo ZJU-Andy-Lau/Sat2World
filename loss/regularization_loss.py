@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from loss.common import masked_l1_loss, masked_reduce, safe_rmse, softmax_entropy
+from loss.common import masked_l1_loss, masked_reduce, safe_rmse
 
 
 class CenterConsistencyLoss:
@@ -102,18 +102,7 @@ class GaussianRegularizationLoss:
 
 
 class CoderProbe:
-    """Coder 探针指标。
-
-    功能:
-        读取 model outputs 中可选的 raw logits/fine 张量，
-        仅输出指标，不产生训练损失。
-
-    兼容字段:
-        - height_logits 或 height_coarse_logits
-        - height_fine_raw
-        - point_logits(dict) / point_coarse_logits(合并)
-        - point_fine_raw(dict) / point_fine_raw(合并)
-    """
+    """高度表示探针指标（无训练损失）。"""
 
     def __init__(self, default_zero: bool = True) -> None:
         """初始化。
@@ -126,14 +115,9 @@ class CoderProbe:
     def _zeros(self, ref: torch.Tensor) -> dict[str, torch.Tensor]:
         z = torch.zeros((), device=ref.device, dtype=ref.dtype)
         return {
-            "height_coarse_entropy": z,
-            "height_fine_abs_mean": z,
-            "point_x_coarse_entropy": z,
-            "point_y_coarse_entropy": z,
-            "point_z_coarse_entropy": z,
-            "point_x_fine_abs_mean": z,
-            "point_y_fine_abs_mean": z,
-            "point_z_fine_abs_mean": z,
+            "height_anchor_mae": z,
+            "height_local_z_boundary_ratio": z,
+            "point_z_local_z_boundary_ratio": z,
         }
 
     def __call__(self, outputs: dict[str, Any], valid_mask: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
@@ -148,43 +132,27 @@ class CoderProbe:
 
         out = self._zeros(ref_tensor) if self.default_zero else {}
 
-        h_logits = outputs.get("height_logits", outputs.get("height_coarse_logits", None))
-        if h_logits is not None:
-            h_ent = softmax_entropy(h_logits, dim=2)
-            mask = None
-            if valid_mask is not None:
-                mask = valid_mask.squeeze(2)
-            out["height_coarse_entropy"] = masked_reduce(h_ent, mask=mask, reduce="mean").detach()
+        height_anchor = outputs.get("height_anchor", None)
+        height_anchor_gt = outputs.get("height_anchor_gt", None)
+        if height_anchor is not None and height_anchor_gt is not None:
+            out["height_anchor_mae"] = (height_anchor - height_anchor_gt).abs().mean().detach()
 
-        h_fine = outputs.get("height_fine_raw", None)
-        if h_fine is not None:
-            out["height_fine_abs_mean"] = masked_reduce(h_fine.abs(), mask=valid_mask, reduce="mean").detach()
+        z_max_cfg = outputs.get("height_z_max", None)
+        z_max_val = float(z_max_cfg.detach().item()) if torch.is_tensor(z_max_cfg) and z_max_cfg.numel() == 1 else None
 
-        p_logits_dict = outputs.get("point_logits", None)
-        if p_logits_dict is not None and isinstance(p_logits_dict, dict):
-            for axis in ("x", "y", "z"):
-                if axis in p_logits_dict:
-                    ent = softmax_entropy(p_logits_dict[axis], dim=2)
-                    mask = None if valid_mask is None else valid_mask.squeeze(2)
-                    out[f"point_{axis}_coarse_entropy"] = masked_reduce(ent, mask=mask, reduce="mean").detach()
-        else:
-            p_logits = outputs.get("point_coarse_logits", None)
-            if p_logits is not None and p_logits.ndim >= 3 and p_logits.shape[2] % 3 == 0:
-                k = p_logits.shape[2] // 3
-                for idx, axis in enumerate(("x", "y", "z")):
-                    sub = p_logits[:, :, idx * k : (idx + 1) * k]
-                    ent = softmax_entropy(sub, dim=2)
-                    mask = None if valid_mask is None else valid_mask.squeeze(2)
-                    out[f"point_{axis}_coarse_entropy"] = masked_reduce(ent, mask=mask, reduce="mean").detach()
+        def _boundary_ratio(z_map: torch.Tensor) -> torch.Tensor:
+            z_abs = z_map.abs()
+            z_max = z_max_val if z_max_val is not None else (float(z_abs.detach().max().item()) if z_abs.numel() > 0 else 0.0)
+            if z_max <= 0:
+                return torch.zeros((), device=z_map.device, dtype=z_map.dtype)
+            thr = z_max * 0.98
+            return (z_abs >= thr).to(z_map.dtype).mean().detach()
 
-        p_fine = outputs.get("point_fine_raw", None)
-        if isinstance(p_fine, dict):
-            for axis in ("x", "y", "z"):
-                if axis in p_fine:
-                    out[f"point_{axis}_fine_abs_mean"] = masked_reduce(p_fine[axis].abs(), mask=valid_mask, reduce="mean").detach()
-        elif p_fine is not None and p_fine.shape[2] == 3:
-            out["point_x_fine_abs_mean"] = masked_reduce(p_fine[:, :, 0:1].abs(), mask=valid_mask, reduce="mean").detach()
-            out["point_y_fine_abs_mean"] = masked_reduce(p_fine[:, :, 1:2].abs(), mask=valid_mask, reduce="mean").detach()
-            out["point_z_fine_abs_mean"] = masked_reduce(p_fine[:, :, 2:3].abs(), mask=valid_mask, reduce="mean").detach()
+        h_local_z = outputs.get("height_local_z", None)
+        if h_local_z is not None:
+            out["height_local_z_boundary_ratio"] = _boundary_ratio(h_local_z)
+        pz_local_z = outputs.get("point_z_local_z", None)
+        if pz_local_z is not None:
+            out["point_z_local_z_boundary_ratio"] = _boundary_ratio(pz_local_z)
 
         return out

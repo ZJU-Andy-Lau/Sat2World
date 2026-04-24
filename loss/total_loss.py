@@ -59,6 +59,7 @@ class LossWeightScheduler:
             "lambda_affine_reg": 0.1,
             "lambda_affine_ref": 0.1,
             "lambda_height": 1.0,
+            "lambda_height_anchor": 0.5,
             "lambda_point": 1.0,
             "lambda_point_reproj": 0.2,
             "lambda_height_reproj": 0.2,
@@ -155,11 +156,8 @@ class RPCAnySplatTrainingObjective:
             gaussian_opacity, gaussian_scale, gaussian_rotation,
             gaussian_confidence_rpc, gaussian_confidence_point,
             rpc_corrected
-        可选（用于 coder probe）:
-            height_logits / height_coarse_logits,
-            height_fine_raw,
-            point_logits / point_coarse_logits,
-            point_fine_raw。
+        可选（用于 probe）:
+            height_anchor, height_local_z, point_z_local_z, height_z_max。
     """
 
     def __init__(
@@ -188,6 +186,7 @@ class RPCAnySplatTrainingObjective:
         self.affine_ref = RefAffineIdentityLoss(affine_grid_cfg)
 
         self.height_loss = HeightHuberLoss(beta=height_beta)
+        self.height_anchor_loss = torch.nn.SmoothL1Loss(reduction="mean")
         self.point_loss = PointMapLoss(geometry_ops=geometry_ops, beta=point_beta)
         self.point_pair_loss = PointPairwiseConsistencyLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.point_reproj_loss = PointReprojectionLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
@@ -338,8 +337,11 @@ class RPCAnySplatTrainingObjective:
             [
                 "affine_pred",
                 "height_abs",
+                "height_anchor",
+                "height_local_z",
                 "point_abs",
                 "point_anchor",
+                "point_z_local_z",
                 "gaussian_centers_rpc",
                 "gaussian_centers_point",
                 "gaussian_opacity",
@@ -360,6 +362,7 @@ class RPCAnySplatTrainingObjective:
             [
                 "height_gt",
                 "height_valid_mask",
+                "height_anchor_gt",
                 "affine_gt_forward",
                 "rpc_gt",
                 "images",
@@ -396,6 +399,10 @@ class RPCAnySplatTrainingObjective:
             outputs["height_abs"],
             batch["height_gt"].to(device=outputs["height_abs"].device, dtype=outputs["height_abs"].dtype),
             batch["height_valid_mask"].to(device=outputs["height_abs"].device, dtype=outputs["height_abs"].dtype),
+        )
+        l_h_anchor = self.height_anchor_loss(
+            outputs["height_anchor"],
+            batch["height_anchor_gt"].to(device=outputs["height_anchor"].device, dtype=outputs["height_anchor"].dtype),
         )
 
         l_p, p_p, aux_point = self.point_loss(outputs["point_abs"], outputs["point_anchor"], batch, return_aux=False)
@@ -439,7 +446,12 @@ class RPCAnySplatTrainingObjective:
         l_opacity = reg_dict["opacity_reg_loss"]
         l_scale = reg_dict["scale_reg_loss"]
 
-        p_coder = self.coder_probe(outputs, valid_mask=batch.get("height_valid_mask", None))
+        probe_outputs = dict(outputs)
+        probe_outputs["height_anchor_gt"] = batch["height_anchor_gt"].to(
+            device=outputs["height_anchor"].device,
+            dtype=outputs["height_anchor"].dtype,
+        )
+        p_coder = self.coder_probe(probe_outputs, valid_mask=batch.get("height_valid_mask", None))
 
         zero = torch.zeros((), device=l_h.device, dtype=l_h.dtype)
         l_render_rpc = zero
@@ -468,6 +480,7 @@ class RPCAnySplatTrainingObjective:
             + weights["lambda_affine_reg"] * l_aff_reg
             + weights.get("lambda_affine_ref", 1.0) * l_aff_ref
             + weights["lambda_height"] * l_h
+            + weights.get("lambda_height_anchor", 0.5) * l_h_anchor
             + weights["lambda_point"] * l_p
             + weights.get("lambda_point_reproj", 0.0) * l_preproj
             + weights.get("lambda_height_reproj", 0.0) * l_hreproj
@@ -490,6 +503,7 @@ class RPCAnySplatTrainingObjective:
             "loss_affine_reg": l_aff_reg,
             "loss_affine_ref": l_aff_ref,
             "loss_height": l_h,
+            "loss_height_anchor": l_h_anchor,
             "loss_height_rel": zero,
             "loss_point": l_p,
             "loss_point_reproj": l_preproj,
@@ -514,6 +528,8 @@ class RPCAnySplatTrainingObjective:
             "metric_ref_affine_identity_l2": p_aff_ref.get("ref_affine_identity_l2", zero),
             "metric_height_rmse": p_h.get("height_rmse", zero),
             "metric_height_mae": p_h.get("height_mae", zero),
+            "metric_height_bias": p_h.get("height_bias", zero),
+            "metric_height_anchor_mae": p_coder.get("height_anchor_mae", zero),
             "metric_height_rel_consistency": zero,
             "metric_height_rel_cycle_px": zero,
             "metric_height_rel_cycle_px_rmse": zero,
@@ -545,14 +561,8 @@ class RPCAnySplatTrainingObjective:
             "probe_gaussian_confidence_rpc_mean": p_gauss.get("gaussian_confidence_rpc_mean", zero),
             "probe_gaussian_confidence_point_mean": p_gauss.get("gaussian_confidence_point_mean", zero),
             "probe_gaussian_quat_norm_error": p_gauss.get("gaussian_quat_norm_error", zero),
-            "probe_height_coarse_entropy": p_coder.get("height_coarse_entropy", zero),
-            "probe_height_fine_abs_mean": p_coder.get("height_fine_abs_mean", zero),
-            "probe_point_x_coarse_entropy": p_coder.get("point_x_coarse_entropy", zero),
-            "probe_point_y_coarse_entropy": p_coder.get("point_y_coarse_entropy", zero),
-            "probe_point_z_coarse_entropy": p_coder.get("point_z_coarse_entropy", zero),
-            "probe_point_x_fine_abs_mean": p_coder.get("point_x_fine_abs_mean", zero),
-            "probe_point_y_fine_abs_mean": p_coder.get("point_y_fine_abs_mean", zero),
-            "probe_point_z_fine_abs_mean": p_coder.get("point_z_fine_abs_mean", zero),
+            "probe_height_local_z_boundary_ratio": p_coder.get("height_local_z_boundary_ratio", zero),
+            "probe_point_z_local_z_boundary_ratio": p_coder.get("point_z_local_z_boundary_ratio", zero),
             "schedule_render_multiplier": schedule_probe["schedule_render_multiplier"],
             "schedule_detail_stage_multiplier": schedule_probe.get("schedule_detail_stage_multiplier", 1.0),
             "weight_affine_grid": weights["lambda_affine_grid"],
@@ -560,6 +570,7 @@ class RPCAnySplatTrainingObjective:
             "weight_affine_reg": weights["lambda_affine_reg"],
             "weight_affine_ref": weights.get("lambda_affine_ref", 1.0),
             "weight_height": weights["lambda_height"],
+            "weight_height_anchor": weights.get("lambda_height_anchor", 0.5),
             "weight_height_rel": 0.0,
             "weight_point": weights["lambda_point"],
             "weight_point_reproj": weights.get("lambda_point_reproj", 0.0),

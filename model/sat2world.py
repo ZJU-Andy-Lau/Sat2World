@@ -23,7 +23,6 @@ import torch.nn as nn
 
 from geometry import (
     RPCGeometryOps,
-    expand_height_ref_map,
     infer_height_ref_batch,
     make_image_grid,
     make_patch_centers,
@@ -38,7 +37,7 @@ from model.backbone import (
     LocalPatchDetailEncoderCfg,
     VisualGeometryDetailFuser,
 )
-from model.coders import HeightCoder, PointCoder, SymmetricBinCoderCfg
+from model.coders import BoundedSinhOffsetDecoder, SymmetricBinCoderCfg, SymmetricBinScalarCoder
 from model.encoder import AlternatingEncoder, AlternatingEncoderCfg
 from model.heads import (
     AffineHead,
@@ -46,8 +45,10 @@ from model.heads import (
     DPTDenseDecoder,
     DPTDenseDecoderCfg,
     GaussianHead,
-    HeightHead,
-    PointHead,
+    DenseHeightLocalHead,
+    PointXYHead,
+    PointZLocalHead,
+    SceneHeightAnchorHead,
     TaskAdapter,
 )
 from model.patch_matcher import PatchHeatmapMatcher, PatchMatcherCfg
@@ -61,18 +62,14 @@ class Sat2WorldCfg:
     encoder: AlternatingEncoderCfg = field(default_factory=AlternatingEncoderCfg)
     affine_head: AffineHeadCfg = field(default_factory=AffineHeadCfg)
 
-    height_bins: int = 33
     point_bins_xy: int = 33
-    point_bins_h: int = 33
     sh_dim: int = 48
 
-    height_bin_size: float = 1.0
+    height_anchor_scale: float = 200.0
+    height_local_scale: float = 30.0
+    height_z_max: float = 4.0
     point_bin_size_xy: float = 2.0
-    point_bin_size_z: float = 1.0
-
-    height_fine_range: float = 0.5
     point_fine_range_xy: float = 1.0
-    point_fine_range_z: float = 0.5
     center_downsample_stage_steps: tuple[int, ...] = (0, 20000, 60000)
     center_downsample_factors: tuple[int, ...] = (4, 2, 1)
 
@@ -160,8 +157,10 @@ class Sat2World(nn.Module):
         self.point_adapter = TaskAdapter(ch=256, depth=int(cfg.task_adapter_depth))
         self.gaussian_adapter = TaskAdapter(ch=256, depth=int(cfg.task_adapter_depth))
         self.affine_head = AffineHead(in_dim=self.backbone.embed_dim, hidden_dim=512, cfg=cfg.affine_head)
-        self.height_head = HeightHead(in_ch=256, num_bins=cfg.height_bins)
-        self.point_head = PointHead(in_ch=256, num_bins_xy=cfg.point_bins_xy, num_bins_h=cfg.point_bins_h)
+        self.height_anchor_head = SceneHeightAnchorHead(in_dim=self.backbone.embed_dim, hidden_dim=512)
+        self.height_local_head = DenseHeightLocalHead(in_ch=256)
+        self.point_xy_head = PointXYHead(in_ch=256, num_bins_xy=cfg.point_bins_xy)
+        self.point_z_local_head = PointZLocalHead(in_ch=256)
         self.gaussian_head = GaussianHead(in_ch=256, sh_dim=cfg.sh_dim)
         self.nce_projector = nn.Sequential(
             nn.LayerNorm(self.backbone.embed_dim),
@@ -170,13 +169,12 @@ class Sat2World(nn.Module):
             nn.Linear(int(cfg.nce_projector_hidden_dim), int(cfg.nce_projector_dim)),
         )
 
-        self.height_coder = HeightCoder(
-            SymmetricBinCoderCfg(num_bins=cfg.height_bins, bin_size=cfg.height_bin_size, fine_range=cfg.height_fine_range)
+        self.height_offset_decoder = BoundedSinhOffsetDecoder(z_max=cfg.height_z_max)
+        self.point_xy_coder_x = SymmetricBinScalarCoder(
+            SymmetricBinCoderCfg(num_bins=cfg.point_bins_xy, bin_size=cfg.point_bin_size_xy, fine_range=cfg.point_fine_range_xy)
         )
-        self.point_coder = PointCoder(
-            cfg_x=SymmetricBinCoderCfg(num_bins=cfg.point_bins_xy, bin_size=cfg.point_bin_size_xy, fine_range=cfg.point_fine_range_xy),
-            cfg_y=SymmetricBinCoderCfg(num_bins=cfg.point_bins_xy, bin_size=cfg.point_bin_size_xy, fine_range=cfg.point_fine_range_xy),
-            cfg_z=SymmetricBinCoderCfg(num_bins=cfg.point_bins_h, bin_size=cfg.point_bin_size_z, fine_range=cfg.point_fine_range_z),
+        self.point_xy_coder_y = SymmetricBinScalarCoder(
+            SymmetricBinCoderCfg(num_bins=cfg.point_bins_xy, bin_size=cfg.point_bin_size_xy, fine_range=cfg.point_fine_range_xy)
         )
 
         self.rpc_ops = RPCGeometryOps(rpc_dtype=torch.double, net_dtype=torch.float32)
@@ -237,6 +235,30 @@ class Sat2World(nn.Module):
     def _reshape_logits_to_bv(self, x: torch.Tensor, b: int, v: int) -> torch.Tensor:
         """把 [B*V,C,H,W] 整理为 [B,V,C,H,W]。"""
         return reshape_bv_to_bvchw(x, b, v)
+
+    def _prepare_height_ref_anchor(
+        self,
+        batch: dict[str, Any],
+        height_ref: torch.Tensor,
+        ref_view_idx: torch.Tensor | int,
+    ) -> torch.Tensor:
+        if "height_ref_anchor" in batch and batch["height_ref_anchor"] is not None:
+            t = batch["height_ref_anchor"]
+            if not torch.is_tensor(t):
+                t = torch.as_tensor(t, device=height_ref.device, dtype=torch.float32)
+            else:
+                t = t.to(device=height_ref.device, dtype=torch.float32)
+            return t.view(height_ref.shape[0], 1)
+
+        b, v = height_ref.shape
+        if torch.is_tensor(ref_view_idx):
+            ref = ref_view_idx.to(device=height_ref.device, dtype=torch.long).view(-1)
+        else:
+            ref = torch.full((b,), int(ref_view_idx), device=height_ref.device, dtype=torch.long)
+        if ref.numel() == 1:
+            ref = ref.expand(b)
+        ref = ref.clamp(0, v - 1)
+        return height_ref.gather(1, ref.view(b, 1))
 
     def _point_map_norm_to_local_meter(
         self,
@@ -359,14 +381,21 @@ class Sat2World(nn.Module):
             patch_grid_hw=(gh, gw),
         )
 
-        # 7) 高程分支
-        height_pred = self.height_head(self.height_adapter(dense_feat))
-        h_logits = self._reshape_logits_to_bv(height_pred["logits"], b, v)
-        h_fine = self._reshape_logits_to_bv(height_pred["fine"], b, v)
+        # 7) 高程分支：scene-level anchor + dense local
+        height_ref_anchor = self._prepare_height_ref_anchor(batch, height_ref, ref_view_idx)
+        height_anchor_raw_z = self.height_anchor_head(scene_token_final)
+        height_anchor_dec = self.height_offset_decoder(height_anchor_raw_z, scale=self.cfg.height_anchor_scale)
+        height_anchor_z = height_anchor_dec["z"]
+        height_anchor_offset = height_anchor_dec["offset"]
+        height_anchor = height_ref_anchor + height_anchor_offset
 
-        h_ref_map = expand_height_ref_map(height_ref, h, w)
-        height_decoded = self.height_coder(h_logits, h_fine, h_ref_map)
-        height_abs = height_decoded["h_abs"]
+        height_local_raw_z_bv = self.height_local_head(self.height_adapter(dense_feat))
+        height_local_raw_z = self._reshape_logits_to_bv(height_local_raw_z_bv, b, v)
+        height_local_dec = self.height_offset_decoder(height_local_raw_z, scale=self.cfg.height_local_scale)
+        height_local_z = height_local_dec["z"]
+        height_local_offset = height_local_dec["offset"]
+        height_anchor_map = height_anchor.view(b, 1, 1, 1, 1).expand(b, v, 1, h, w)
+        height_abs = height_anchor_map + height_local_offset
 
         # 8) 点云分支（独立 anchor）
         image_grid = make_image_grid(h, w, device=device, dtype=torch.float32)
@@ -378,24 +407,24 @@ class Sat2World(nn.Module):
             scene_xy_scale=scene_xy_scale,
         )
 
-        point_pred = self.point_head(self.point_adapter(dense_feat))
-        x_logits = self._reshape_logits_to_bv(point_pred["x_logits"], b, v)
-        y_logits = self._reshape_logits_to_bv(point_pred["y_logits"], b, v)
-        z_logits = self._reshape_logits_to_bv(point_pred["z_logits"], b, v)
-        x_fine = self._reshape_logits_to_bv(point_pred["x_fine"], b, v)
-        y_fine = self._reshape_logits_to_bv(point_pred["y_fine"], b, v)
-        z_fine = self._reshape_logits_to_bv(point_pred["z_fine"], b, v)
+        point_feat = self.point_adapter(dense_feat)
+        point_xy_pred = self.point_xy_head(point_feat)
+        x_logits = self._reshape_logits_to_bv(point_xy_pred["x_logits"], b, v)
+        y_logits = self._reshape_logits_to_bv(point_xy_pred["y_logits"], b, v)
+        x_fine = self._reshape_logits_to_bv(point_xy_pred["x_fine"], b, v)
+        y_fine = self._reshape_logits_to_bv(point_xy_pred["y_fine"], b, v)
+        dx, dx_coarse, dx_fine = self.point_xy_coder_x.decode(x_logits, x_fine, channel_dim=2)
+        dy, dy_coarse, dy_fine = self.point_xy_coder_y.decode(y_logits, y_fine, channel_dim=2)
+        point_x = point_anchor[:, :, 0:1] + dx.unsqueeze(2)
+        point_y = point_anchor[:, :, 1:2] + dy.unsqueeze(2)
 
-        point_decoded = self.point_coder(
-            x_logits=x_logits,
-            y_logits=y_logits,
-            z_logits=z_logits,
-            x_fine=x_fine,
-            y_fine=y_fine,
-            z_fine=z_fine,
-            point_anchor=point_anchor,
-        )
-        point_abs = point_decoded["point_abs"]
+        point_z_local_raw_z_bv = self.point_z_local_head(point_feat)
+        point_z_local_raw_z = self._reshape_logits_to_bv(point_z_local_raw_z_bv, b, v)
+        point_z_local_dec = self.height_offset_decoder(point_z_local_raw_z, scale=self.cfg.height_local_scale)
+        point_z_local_z = point_z_local_dec["z"]
+        point_z_local_offset = point_z_local_dec["offset"]
+        point_z = height_anchor_map + point_z_local_offset
+        point_abs = torch.cat([point_x, point_y, point_z], dim=2)
 
         gaussian_enabled = bool(self.cfg.enable_gaussian_branch) and (not self.runtime_pretrain_geometry_only)
 
@@ -403,17 +432,25 @@ class Sat2World(nn.Module):
             "affine_pred": affine_pred,
             "rpc_corrected": rpc_corrected,
             "height_ref": height_ref,
+            "height_ref_anchor": height_ref_anchor,
             "height_abs": height_abs,
-            "height_coarse": height_decoded["delta_h_coarse"],
-            "height_fine": height_decoded["delta_h_fine"],
-            "height_logits": h_logits,
-            "height_fine_raw": h_fine,
+            "height_anchor": height_anchor,
+            "height_anchor_offset": height_anchor_offset,
+            "height_anchor_z": height_anchor_z,
+            "height_local_z": height_local_z,
+            "height_local_offset": height_local_offset,
+            "height_anchor_raw_z": height_anchor_raw_z,
+            "height_local_raw_z": height_local_raw_z,
             "point_anchor": point_anchor,
             "point_abs": point_abs,
-            "point_delta_coarse": point_decoded["delta_xyz_coarse"],
-            "point_delta_fine": point_decoded["delta_xyz_fine"],
-            "point_logits": {"x": x_logits, "y": y_logits, "z": z_logits},
-            "point_fine_raw": {"x": x_fine, "y": y_fine, "z": z_fine},
+            "point_delta_xy_coarse": torch.cat([dx_coarse.unsqueeze(2), dy_coarse.unsqueeze(2)], dim=2),
+            "point_delta_xy_fine": torch.cat([dx_fine.unsqueeze(2), dy_fine.unsqueeze(2)], dim=2),
+            "point_logits": {"x": x_logits, "y": y_logits},
+            "point_fine_raw": {"x": x_fine, "y": y_fine},
+            "point_z_local_z": point_z_local_z,
+            "point_z_local_offset": point_z_local_offset,
+            "point_z_local_raw_z": point_z_local_raw_z,
+            "height_z_max": torch.tensor(float(self.cfg.height_z_max), device=device, dtype=height_abs.dtype),
             "patch_valid_mask": patch_valid_mask,
             "patch_tokens_final": patch_tokens_final,
             "patch_tokens_match": patch_tokens_layer_sel,
