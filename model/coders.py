@@ -105,6 +105,12 @@ class HeightCoder(nn.Module):
                 delta_h_coarse: [B,V,1,H,W]
                 delta_h_fine: [B,V,1,H,W]
         """
+        if coarse_logits.isnan().any():
+            print("coarse logits has nan")
+        if fine_raw.isnan().any():
+            print("fine raw has nan")
+        if h_ref_map.isnan().any():
+            print("h ref map has nan")
         residual, coarse, fine = self.scalar.decode(coarse_logits, fine_raw, channel_dim=2)
         h_abs = h_ref_map + residual.unsqueeze(2)
         return {

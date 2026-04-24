@@ -49,6 +49,8 @@ class HeightHuberLoss:
             loss: 标量。
             probe: 包含 height_rmse/height_mae/height_bias。
         """
+        if height_abs.isnan().any():
+            print(f"height abs pred has nan")
         loss = masked_huber_loss(height_abs, height_gt, mask=height_valid_mask, beta=self.beta)
 
         diff = height_abs - height_gt
