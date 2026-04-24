@@ -322,6 +322,7 @@ class Trainer:
                     scalar=scalar,
                     aux=aux,
                     batch_dev=batch_dev,
+                    outputs=outputs,
                     step_idx=step_idx,
                     is_update_step=is_update_step,
                 )
@@ -456,6 +457,7 @@ class Trainer:
         scalar: dict[str, Any],
         aux: dict[str, Any],
         batch_dev: dict[str, Any],
+        outputs: dict[str, Any],
         step_idx: int,
         is_update_step: bool,
     ) -> dict[str, Any]:
@@ -484,6 +486,27 @@ class Trainer:
 
         scene_id = batch_dev.get("scene_id", None)
         view_ids = batch_dev.get("view_ids", None)
+        hmask = batch_dev.get("height_valid_mask", None)
+        hpred = outputs.get("height_abs", None) if isinstance(outputs, dict) else None
+        height_stats: dict[str, Any] = {}
+        if torch.is_tensor(hmask):
+            m = (hmask > 0.5)
+            m_f = m.to(dtype=torch.float32)
+            height_stats["height_valid_ratio"] = float(m_f.mean().item())
+            if torch.is_tensor(hpred):
+                fin = torch.isfinite(hpred)
+                height_stats["height_pred_nonfinite_ratio_all"] = float((~fin).to(dtype=torch.float32).mean().item())
+                valid_cnt = int(m.sum().item())
+                invalid_cnt = int((~m).sum().item())
+                if valid_cnt > 0:
+                    height_stats["height_pred_nonfinite_ratio_valid"] = float((~fin[m]).to(dtype=torch.float32).mean().item())
+                else:
+                    height_stats["height_pred_nonfinite_ratio_valid"] = 0.0
+                if invalid_cnt > 0:
+                    height_stats["height_pred_nonfinite_ratio_invalid"] = float((~fin[~m]).to(dtype=torch.float32).mean().item())
+                else:
+                    height_stats["height_pred_nonfinite_ratio_invalid"] = 0.0
+
         info = {
             "local_nonfinite": (len(nonfinite_losses) > 0) or (len(nonfinite_metrics) > 0),
             "global_step": int(self.global_step),
@@ -500,6 +523,7 @@ class Trainer:
             "scene_id": self._to_jsonable(scene_id),
             "view_ids": self._to_jsonable(view_ids),
             "image_paths": self._to_jsonable(batch_dev.get("image_paths", [])),
+            "height_stats": self._to_jsonable(height_stats),
             "loss_scale": float(self.scaler.get_scale()) if self.scaler is not None else 1.0,
             "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         }
