@@ -149,6 +149,7 @@ loss:
   lambda_normal_height: 1.0
   lambda_normal_point: 1.0
   lambda_patch_match: 2.0
+  match_max_pair: 12
   patch_match_subpix_weight: 0.25
   patch_match_max_pairs: 4096
   normal_w_cos: 1.0
