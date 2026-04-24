@@ -11,12 +11,16 @@ Sat2World 训练系统主入口。
 from __future__ import annotations
 
 import copy
+import json
+import math
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
+import torch.distributed as dist
 
 from engine.checkpoint import save_checkpoint
 from engine.distributed import (
@@ -97,6 +101,19 @@ class Trainer:
         self.device_sanity_check = bool(cfg.get("device_sanity_check", False))
         self.enable_fixed_monitor_cache = bool(cfg.get("enable_fixed_monitor_cache", True))
         self.monitor_use_current_batch = bool(cfg.get("monitor_use_current_batch", True))
+        self.nan_probe_enable = bool(cfg.get("nan_probe_enable", True))
+        self.nan_probe_mode = str(cfg.get("nan_probe_mode", "skip")).strip().lower()
+        if self.nan_probe_mode not in {"skip", "raise"}:
+            self.nan_probe_mode = "skip"
+        self.nan_probe_sync_across_ranks = bool(cfg.get("nan_probe_sync_across_ranks", True))
+        self.nan_probe_dump_rank_mode = str(cfg.get("nan_probe_dump_rank_mode", "all")).strip().lower()
+        if self.nan_probe_dump_rank_mode not in {"all", "rank0"}:
+            self.nan_probe_dump_rank_mode = "all"
+        self.nan_probe_dump_max_events = int(cfg.get("nan_probe_dump_max_events", 200))
+        self.nan_probe_events_written = 0
+        self.nan_probe_dump_dir = self.work_dir / "nan_probe"
+        if self.nan_probe_enable:
+            self.nan_probe_dump_dir.mkdir(parents=True, exist_ok=True)
 
         self.epoch = 0
         self.global_step = 0
@@ -299,6 +316,25 @@ class Trainer:
                 scalar.update(sanity)
                 loss_to_backward = loss / float(self.accumulate_steps)
 
+            if self.nan_probe_enable:
+                nonfinite_info = self._build_nonfinite_info(
+                    loss=loss,
+                    scalar=scalar,
+                    aux=aux,
+                    batch_dev=batch_dev,
+                    step_idx=step_idx,
+                    is_update_step=is_update_step,
+                )
+                local_nonfinite = bool(nonfinite_info.get("local_nonfinite", False))
+                global_nonfinite = self._sync_nonfinite_flag(local_nonfinite)
+                if global_nonfinite:
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self._maybe_dump_nan_report(nonfinite_info, local_nonfinite=local_nonfinite)
+                    if self.nan_probe_mode == "raise":
+                        bad = nonfinite_info.get("nonfinite_losses", [])
+                        raise FloatingPointError(f"NaN probe triggered at global_step={self.global_step}, bad_losses={bad}")
+                    return {"skip_non_finite": 1.0, "nan_probe_triggered": 1.0}
+
             if not torch.isfinite(loss):
                 if self.skip_nan_batch:
                     self.optimizer.zero_grad(set_to_none=True)
@@ -364,6 +400,136 @@ class Trainer:
                 self._run_monitor_visual(split="val")
 
         return {k: float(v) if isinstance(v, (int, float)) else v for k, v in scalar.items()}
+
+    def _sync_nonfinite_flag(self, local_nonfinite: bool) -> bool:
+        """跨 rank 同步 non-finite 触发标记。"""
+        if not self.nan_probe_sync_across_ranks:
+            return bool(local_nonfinite)
+        if (not dist.is_available()) or (not dist.is_initialized()):
+            return bool(local_nonfinite)
+        t = torch.tensor(1 if local_nonfinite else 0, device=self.device, dtype=torch.int32)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        return bool(int(t.item()) > 0)
+
+    @staticmethod
+    def _is_finite_value(x: Any) -> bool:
+        if torch.is_tensor(x):
+            if x.numel() == 0:
+                return True
+            return bool(torch.isfinite(x).all().item())
+        if isinstance(x, (int, float)):
+            return math.isfinite(float(x))
+        return True
+
+    @staticmethod
+    def _to_jsonable(x: Any) -> Any:
+        if torch.is_tensor(x):
+            if x.numel() == 0:
+                return "empty_tensor"
+            if x.ndim == 0:
+                v = float(x.detach().cpu().item())
+                if math.isnan(v):
+                    return "nan"
+                if math.isinf(v):
+                    return "inf" if v > 0 else "-inf"
+                return v
+            return {"type": "tensor", "shape": list(x.shape), "dtype": str(x.dtype)}
+        if isinstance(x, (int, float)):
+            v = float(x)
+            if math.isnan(v):
+                return "nan"
+            if math.isinf(v):
+                return "inf" if v > 0 else "-inf"
+            return v
+        if isinstance(x, torch.device):
+            return str(x)
+        if isinstance(x, (list, tuple)):
+            return [Trainer._to_jsonable(v) for v in x]
+        if isinstance(x, dict):
+            return {str(k): Trainer._to_jsonable(v) for k, v in x.items()}
+        return x
+
+    def _build_nonfinite_info(
+        self,
+        *,
+        loss: torch.Tensor,
+        scalar: dict[str, Any],
+        aux: dict[str, Any],
+        batch_dev: dict[str, Any],
+        step_idx: int,
+        is_update_step: bool,
+    ) -> dict[str, Any]:
+        nonfinite_losses: list[str] = []
+        nonfinite_metrics: list[str] = []
+
+        for k, v in scalar.items():
+            if k.startswith("loss_") and (not self._is_finite_value(v)):
+                nonfinite_losses.append(k)
+            if k.startswith("metric_") and (not self._is_finite_value(v)):
+                nonfinite_metrics.append(k)
+
+        aux_losses = aux.get("nan_probe_nonfinite_losses", [])
+        aux_metrics = aux.get("nan_probe_nonfinite_metrics", [])
+        if isinstance(aux_losses, list):
+            nonfinite_losses.extend([str(x) for x in aux_losses])
+        if isinstance(aux_metrics, list):
+            nonfinite_metrics.extend([str(x) for x in aux_metrics])
+
+        if not self._is_finite_value(loss):
+            nonfinite_losses.append("loss_total")
+
+        # 去重保序
+        nonfinite_losses = list(dict.fromkeys(nonfinite_losses))
+        nonfinite_metrics = list(dict.fromkeys(nonfinite_metrics))
+
+        scene_id = batch_dev.get("scene_id", None)
+        view_ids = batch_dev.get("view_ids", None)
+        info = {
+            "local_nonfinite": (len(nonfinite_losses) > 0) or (len(nonfinite_metrics) > 0),
+            "global_step": int(self.global_step),
+            "epoch": int(self.epoch),
+            "step_idx": int(step_idx),
+            "is_update_step": bool(is_update_step),
+            "rank": int(self.distributed_state.get("rank", 0)),
+            "world_size": int(self.distributed_state.get("world_size", 1)),
+            "loss_total": self._to_jsonable(loss),
+            "nonfinite_losses": nonfinite_losses,
+            "nonfinite_metrics": nonfinite_metrics,
+            "first_bad_loss": nonfinite_losses[0] if len(nonfinite_losses) > 0 else str(aux.get("nan_probe_first_bad_loss", "")),
+            "nan_probe_loss_snapshot": self._to_jsonable(aux.get("nan_probe_loss_snapshot", {})),
+            "scene_id": self._to_jsonable(scene_id),
+            "view_ids": self._to_jsonable(view_ids),
+            "image_paths": self._to_jsonable(batch_dev.get("image_paths", [])),
+            "loss_scale": float(self.scaler.get_scale()) if self.scaler is not None else 1.0,
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
+        return info
+
+    def _maybe_dump_nan_report(self, info: dict[str, Any], *, local_nonfinite: bool) -> None:
+        """落盘 NaN 诊断报告。"""
+        if self.nan_probe_events_written >= self.nan_probe_dump_max_events:
+            return
+        if self.nan_probe_dump_rank_mode == "rank0" and (not is_main_process()):
+            return
+        if (not local_nonfinite) and self.nan_probe_dump_rank_mode == "all":
+            return
+
+        self.nan_probe_events_written += 1
+        rank = int(self.distributed_state.get("rank", 0))
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        p = self.nan_probe_dump_dir / f"nan_report_rank{rank}_g{int(self.global_step)}_{ts}.json"
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(self._to_jsonable(info), f, ensure_ascii=False, indent=2)
+
+        if is_main_process():
+            print(
+                "[nan-probe] trigger "
+                f"global_step={info.get('global_step')} "
+                f"rank={info.get('rank')} "
+                f"first_bad_loss={info.get('first_bad_loss')} "
+                f"report={p}",
+                flush=True,
+            )
 
     def _run_monitor_visual(self, split: str, batch_override: dict[str, Any] | None = None) -> None:
         """在固定监控样本上执行可视化推理。"""
