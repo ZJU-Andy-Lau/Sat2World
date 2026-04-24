@@ -45,10 +45,6 @@ def masked_reduce(value: torch.Tensor, mask: torch.Tensor | None = None, reduce:
 
     m = mask.to(dtype=value.dtype)
     m_bool = m != 0
-    # 关键修复：
-    # - 不能使用 value * m 直接屏蔽无效区；当 value=NaN 且 m=0 时，0*NaN 仍为 NaN，
-    #   会污染聚合结果。
-    # - 使用 where 在无效区显式置零，仅保留有效区的原值（含有效区 NaN，以便被探针发现）。
     weighted = torch.where(m_bool, value * m, torch.zeros_like(value))
     if reduce == "sum":
         return weighted.sum()
