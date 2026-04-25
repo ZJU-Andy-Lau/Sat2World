@@ -209,10 +209,8 @@ class PointNormalLoss:
         )
         check_nan(l_h_cos,"norm_loss_l_h_cos")
         check_nan(l_h_l1,"norm_loss_l_h_l1")
-        check_nan(p_h,"norm_loss_pred_p_h")
         check_nan(l_p_cos,"norm_loss_l_p_cos")
-        check_nan(l_p_l1,"norm_loss_pred_l_p_l1")
-        check_nan(p_p,"norm_loss_p_p")
+        check_nan(l_p_l1,"norm_loss_l_p_l1")
 
         w_cos = float(self.cfg.w_cos)
         w_l1 = float(self.cfg.w_l1)
