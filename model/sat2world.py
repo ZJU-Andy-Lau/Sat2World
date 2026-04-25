@@ -451,6 +451,8 @@ class Sat2World(nn.Module):
             "point_z_local_offset": point_z_local_offset,
             "point_z_local_raw_z": point_z_local_raw_z,
             "height_z_max": torch.tensor(float(self.cfg.height_z_max), device=device, dtype=height_abs.dtype),
+            "height_anchor_scale": torch.tensor(float(self.cfg.height_anchor_scale), device=device, dtype=height_abs.dtype),
+            "height_local_scale": torch.tensor(float(self.cfg.height_local_scale), device=device, dtype=height_abs.dtype),
             "patch_valid_mask": patch_valid_mask,
             "patch_tokens_final": patch_tokens_final,
             "patch_tokens_match": patch_tokens_layer_sel,

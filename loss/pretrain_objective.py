@@ -26,6 +26,7 @@ from loss.normal_loss import PointNormalLoss, PointNormalLossCfg
 from loss.patch_match_loss import PatchInternalMatchLoss, PatchInternalMatchLossCfg
 from loss.point_pair_loss import HeightReprojectionLoss, PointPairwiseConsistencyLoss, PointPairwiseLossCfg, PointReprojectionLoss
 from loss.point_loss import PointMapLoss
+from loss.z_space_loss import masked_z_huber_loss
 
 
 @dataclass
@@ -39,6 +40,11 @@ class GeometryPretrainWeightCfg:
     lambda_height: float = 1.0
     lambda_height_anchor: float = 0.5
     lambda_point: float = 1.0
+    lambda_point_xy: float | None = None
+    lambda_point_z: float | None = None
+    lambda_height_meter_aux: float = 1.0e-3
+    lambda_height_anchor_meter_aux: float = 1.0e-3
+    lambda_point_z_meter_aux: float = 1.0e-3
     lambda_point_reproj: float = 0.2
     lambda_height_reproj: float = 0.2
     lambda_point_pair: float = 0.1
@@ -74,6 +80,9 @@ class GeometryPretrainObjective:
         normal_cfg: PointNormalLossCfg | None = None,
         height_beta: float = 1.0,
         point_beta: float = 1.0,
+        height_z_beta_meter: float | None = None,
+        height_anchor_z_beta_meter: float = 5.0,
+        point_z_beta_meter: float | None = None,
         weights: GeometryPretrainWeightCfg | None = None,
     ) -> None:
         self.geometry_ops = geometry_ops
@@ -97,6 +106,11 @@ class GeometryPretrainObjective:
         )
         self.normal_loss = PointNormalLoss(geometry_ops=geometry_ops, cfg=normal_cfg or PointNormalLossCfg())
         self.weights = weights or GeometryPretrainWeightCfg()
+        self.height_beta_meter = float(height_beta)
+        self.point_beta_meter = float(point_beta)
+        self.height_z_beta_meter = float(height_beta if height_z_beta_meter is None else height_z_beta_meter)
+        self.height_anchor_z_beta_meter = float(height_anchor_z_beta_meter)
+        self.point_z_beta_meter = float(point_beta if point_z_beta_meter is None else point_z_beta_meter)
 
     def _require_keys(self, data: dict[str, Any], keys: list[str], name: str) -> None:
         miss = [k for k in keys if k not in data]
@@ -199,9 +213,14 @@ class GeometryPretrainObjective:
                 "height_abs",
                 "height_anchor",
                 "height_local_z",
+                "height_anchor_z",
+                "height_ref_anchor",
                 "point_abs",
                 "point_anchor",
                 "point_z_local_z",
+                "height_local_scale",
+                "height_anchor_scale",
+                "height_z_max",
                 "rpc_corrected",
                 "patch_tokens_nce_proj",
                 "patch_valid_mask",
@@ -262,7 +281,45 @@ class GeometryPretrainObjective:
             else torch.zeros((), device=outputs["height_abs"].device, dtype=outputs["height_abs"].dtype)
         )
 
-        l_p, p_p, aux_point = self.point_loss(outputs["point_abs"], outputs["point_anchor"], batch, return_aux=False)
+        l_p, p_p, aux_point = self.point_loss(outputs["point_abs"], outputs["point_anchor"], batch, return_aux=True)
+        l_p_xy = aux_point.get("loss_point_xy_meter", l_p)
+        l_p_z_meter = aux_point.get("loss_point_z_meter", torch.zeros_like(l_p))
+        gt_point_map_metric = aux_point.get("gt_point_map_metric", aux_point.get("gt_point_map", None))
+        if gt_point_map_metric is None:
+            raise KeyError("PointMapLoss(return_aux=True) must provide gt_point_map_metric for z-space point supervision.")
+
+        height_valid_mask = batch["height_valid_mask"].to(device=outputs["height_abs"].device, dtype=outputs["height_abs"].dtype)
+        height_anchor_detached = outputs["height_anchor"].detach()
+        height_z_max = outputs["height_z_max"]
+        height_local_scale = outputs["height_local_scale"]
+        height_anchor_scale = outputs["height_anchor_scale"]
+
+        l_h_z = masked_z_huber_loss(
+            outputs["height_local_z"],
+            batch["height_gt"].to(device=outputs["height_abs"].device, dtype=outputs["height_abs"].dtype) - height_anchor_detached.view(-1, 1, 1, 1, 1),
+            mask=height_valid_mask,
+            beta_meter=self.height_z_beta_meter,
+            scale=height_local_scale,
+            z_max=height_z_max,
+        )
+        l_h_anchor_z = masked_z_huber_loss(
+            outputs["height_anchor_z"].view(-1, 1, 1, 1, 1),
+            batch["height_anchor_gt"].to(device=outputs["height_anchor"].device, dtype=outputs["height_anchor"].dtype).view(-1, 1, 1, 1, 1)
+            - outputs["height_ref_anchor"].to(device=outputs["height_anchor"].device, dtype=outputs["height_anchor"].dtype).view(-1, 1, 1, 1, 1),
+            mask=None,
+            beta_meter=self.height_anchor_z_beta_meter,
+            scale=height_anchor_scale,
+            z_max=height_z_max,
+        )
+        gt_point_z = gt_point_map_metric[:, :, 2:3]
+        l_p_z_z = masked_z_huber_loss(
+            outputs["point_z_local_z"],
+            gt_point_z - height_anchor_detached.view(-1, 1, 1, 1, 1),
+            mask=height_valid_mask,
+            beta_meter=self.point_z_beta_meter,
+            scale=height_local_scale,
+            z_max=height_z_max,
+        )
         l_preproj, p_preproj, aux_preproj = self.point_reproj_loss(outputs["point_abs"], batch)
         l_ppair, p_ppair, aux_ppair = self.point_pair_loss(outputs["point_abs"], batch)
         l_nh, l_np, p_norm, aux_norm = self.normal_loss(
@@ -290,15 +347,27 @@ class GeometryPretrainObjective:
         w = self.weights
         abs_mul = 1.0 if int(global_step) < int(w.abs_keep_steps) else 0.1
         w_h_abs = float(w.lambda_height) * abs_mul
-        w_p_abs = float(w.lambda_point) * abs_mul
+        w_p_xy_base = float(w.lambda_point if w.lambda_point_xy is None else w.lambda_point_xy)
+        w_p_z_base = float(w.lambda_point if w.lambda_point_z is None else w.lambda_point_z)
+        w_p_xy = w_p_xy_base * abs_mul
+        w_p_z = w_p_z_base * abs_mul
+        w_h_meter_aux = float(w.lambda_height_meter_aux)
+        w_h_anchor_meter_aux = float(w.lambda_height_anchor_meter_aux)
+        w_p_z_meter_aux = float(w.lambda_point_z_meter_aux)
+
+        l_h_optim = l_h_z + w_h_meter_aux * l_h
+        l_h_anchor_optim = l_h_anchor_z + w_h_anchor_meter_aux * l_h_anchor
+        l_p_xy_optim = l_p_xy
+        l_p_z_optim = l_p_z_z + w_p_z_meter_aux * l_p_z_meter
         total = (
             w.lambda_affine_grid * l_aff_grid
             + w.lambda_affine_pair * l_aff_pair
             + w.lambda_affine_reg * l_aff_reg
             + w.lambda_affine_ref * l_aff_ref
-            + w_h_abs * l_h
-            + float(w.lambda_height_anchor) * l_h_anchor
-            + w_p_abs * l_p
+            + w_h_abs * l_h_optim
+            + float(w.lambda_height_anchor) * l_h_anchor_optim
+            + w_p_xy * l_p_xy_optim
+            + w_p_z * l_p_z_optim
             + w.lambda_point_reproj * l_preproj
             + w.lambda_height_reproj * l_hreproj
             + w.lambda_point_pair * l_ppair
@@ -317,8 +386,16 @@ class GeometryPretrainObjective:
             "loss_affine_ref": l_aff_ref,
             "loss_height": l_h,
             "loss_height_anchor": l_h_anchor,
+            "loss_height_z": l_h_z,
+            "loss_height_anchor_z": l_h_anchor_z,
+            "loss_height_optim": l_h_optim,
+            "loss_height_anchor_optim": l_h_anchor_optim,
             "loss_height_rel": zero,
             "loss_point": l_p,
+            "loss_point_xy": l_p_xy,
+            "loss_point_z": l_p_z_meter,
+            "loss_point_z_z": l_p_z_z,
+            "loss_point_z_optim": l_p_z_optim,
             "loss_point_reproj": l_preproj,
             "loss_height_reproj": l_hreproj,
             "loss_point_pair": l_ppair,
@@ -363,8 +440,13 @@ class GeometryPretrainObjective:
             "weight_affine_ref": float(w.lambda_affine_ref),
             "weight_height": float(w_h_abs),
             "weight_height_anchor": float(w.lambda_height_anchor),
+            "weight_height_meter_aux": float(w_h_meter_aux),
+            "weight_height_anchor_meter_aux": float(w_h_anchor_meter_aux),
             "weight_height_rel": 0.0,
-            "weight_point": float(w_p_abs),
+            "weight_point": float(float(w.lambda_point) * abs_mul),
+            "weight_point_xy": float(w_p_xy),
+            "weight_point_z": float(w_p_z),
+            "weight_point_z_meter_aux": float(w_p_z_meter_aux),
             "weight_point_reproj": float(w.lambda_point_reproj),
             "weight_height_reproj": float(w.lambda_height_reproj),
             "weight_point_pair": float(w.lambda_point_pair),
