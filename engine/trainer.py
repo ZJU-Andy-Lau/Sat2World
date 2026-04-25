@@ -92,6 +92,10 @@ class Trainer:
         self.best_metric_name = str(cfg.get("best_metric", "loss_total"))
         self.best_mode = str(cfg.get("best_mode", "min"))
         self.grad_clip_norm = float(cfg.get("grad_clip_norm", 0.0))
+        self.grad_clip_mode = str(cfg.get("grad_clip_mode", "global")).strip().lower()
+        if self.grad_clip_mode not in {"global", "grouped"}:
+            self.grad_clip_mode = "global"
+        self.grad_clip_group_norm = float(cfg.get("grad_clip_group_norm", self.grad_clip_norm))
         self.amp_dtype = str(cfg.get("amp_dtype", "fp16"))
         self.enable_render_train = bool(cfg.get("enable_render_train", True))
         self.enable_render_val = bool(cfg.get("enable_render_val", True))
@@ -148,6 +152,70 @@ class Trainer:
 
         self.fixed_train_monitor_batch = None
         self.fixed_val_monitor_batch = None
+
+    @staticmethod
+    def _grad_group_name(param_name: str) -> str:
+        n = param_name.lower()
+        if ("backbone" in n) or ("encoder" in n) or ("geom_mlp" in n) or ("fuser" in n):
+            return "backbone_encoder"
+        if "dense_decoder" in n:
+            return "dense_decoder"
+        if ("height_adapter" in n) or ("height_anchor_head" in n) or ("height_local_head" in n):
+            return "height"
+        if ("point_adapter" in n) or ("point_xy_head" in n) or ("point_z_local_head" in n):
+            return "point"
+        if "affine_head" in n:
+            return "affine"
+        if "nce_projector" in n:
+            return "nce_projector"
+        if "patch_matcher" in n:
+            return "patch_matcher"
+        if ("gaussian_adapter" in n) or ("gaussian_head" in n):
+            return "gaussian"
+        return "other"
+
+    def _clip_grad_norm(self) -> tuple[float, dict[str, float]]:
+        groups = [
+            "backbone_encoder",
+            "dense_decoder",
+            "height",
+            "point",
+            "affine",
+            "nce_projector",
+            "patch_matcher",
+            "gaussian",
+            "other",
+        ]
+        norms = {f"optim/grad_norm_{g}": 0.0 for g in groups}
+        norms["optim/grad_norm_total_grouped_preclip"] = 0.0
+
+        if self.grad_clip_mode != "grouped":
+            if self.grad_clip_norm <= 0:
+                return 0.0, norms
+            g = float(torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm).item())
+            return g, norms
+
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        grouped_params: dict[str, list[torch.nn.Parameter]] = {k: [] for k in groups}
+        for name, p in model_ref.named_parameters():
+            if (not p.requires_grad) or (p.grad is None):
+                continue
+            grouped_params[self._grad_group_name(name)].append(p)
+
+        sq_sum = 0.0
+        clip_norm = self.grad_clip_group_norm
+        if clip_norm <= 0:
+            return 0.0, norms
+        for g in groups:
+            ps = grouped_params[g]
+            if len(ps) == 0:
+                continue
+            gn = float(torch.nn.utils.clip_grad_norm_(ps, clip_norm).item())
+            norms[f"optim/grad_norm_{g}"] = gn
+            sq_sum += gn * gn
+        total_preclip = math.sqrt(max(sq_sum, 0.0))
+        norms["optim/grad_norm_total_grouped_preclip"] = total_preclip
+        return total_preclip, norms
 
     def _clone_batch_cpu(self, batch: dict[str, Any], keep_samples: int | None = 1) -> dict[str, Any]:
         """把 batch 截取并拷贝到 CPU，作为固定监控样本。"""
@@ -350,11 +418,22 @@ class Trainer:
                 loss_to_backward.backward()
 
         grad_norm = 0.0
+        grad_group_scalars = {
+            "optim/grad_norm_backbone_encoder": 0.0,
+            "optim/grad_norm_dense_decoder": 0.0,
+            "optim/grad_norm_height": 0.0,
+            "optim/grad_norm_point": 0.0,
+            "optim/grad_norm_affine": 0.0,
+            "optim/grad_norm_nce_projector": 0.0,
+            "optim/grad_norm_patch_matcher": 0.0,
+            "optim/grad_norm_gaussian": 0.0,
+            "optim/grad_norm_other": 0.0,
+            "optim/grad_norm_total_grouped_preclip": 0.0,
+        }
         if is_update_step:
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
-            if self.grad_clip_norm > 0:
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm).item())
+            grad_norm, grad_group_scalars = self._clip_grad_norm()
 
             if self.scaler is not None:
                 self.scaler.step(self.optimizer)
@@ -390,6 +469,7 @@ class Trainer:
                 "system/gpu_mem_allocated_mb": mem["allocated_mb"],
             }
         )
+        scalar.update(grad_group_scalars)
         scalar = all_reduce_mean(scalar)
 
         # 日志/可视化

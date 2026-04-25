@@ -143,6 +143,11 @@ loss:
   lambda_height_anchor: 0.5
   abs_keep_steps: 100000
   lambda_point: 1.0
+  lambda_point_xy: 1.0
+  lambda_point_z: 1.0
+  lambda_height_meter_aux: 1.0e-3
+  lambda_height_anchor_meter_aux: 1.0e-3
+  lambda_point_z_meter_aux: 1.0e-3
   lambda_point_pair: 0.1
   lambda_height_reproj: 0.5
   lambda_point_reproj: 0.5
@@ -163,7 +168,10 @@ loss:
   point_pair_grid_h: 64
   point_pair_grid_w: 64
   height_beta: 1.0
+  height_z_beta_meter: 1.0
+  height_anchor_z_beta_meter: 5.0
   point_beta: 1.0
+  point_z_beta_meter: 1.0
   affine_grid_h: 16
   affine_grid_w: 16
   anchors_per_pair: 256
@@ -186,6 +194,8 @@ train:
   max_epochs: 200
   accumulate_steps: 5
   grad_clip_norm: 1.0
+  grad_clip_mode: grouped
+  grad_clip_group_norm: 1.0
   amp_dtype: fp16
   enable_grad_scaler: true
   enable_render_train: false

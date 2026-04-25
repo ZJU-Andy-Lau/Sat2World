@@ -48,6 +48,7 @@ class PointMapLoss:
         point_anchor: torch.Tensor,
         batch: dict[str, Any],
         return_aux: bool = False,
+        aux_include_full_gt_map: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
         """计算点云损失。
 
@@ -55,7 +56,8 @@ class PointMapLoss:
             point_abs: [B,V,3,H,W]。
             point_anchor: [B,V,3,H,W]。
             batch: 至少包含 rpc_gt/height_gt/height_valid_mask/scene_xy_center/scene_xy_scale。
-            return_aux: 是否返回 gt_point_map（默认 False）。
+            return_aux: 是否返回辅助监督张量（默认 False）。
+            aux_include_full_gt_map: 当 return_aux=True 时，是否额外返回完整 gt_point_map_metric。
 
         输出:
             loss: 标量。
@@ -85,7 +87,9 @@ class PointMapLoss:
         gt_point_map_metric = point_map_to_metric(gt_point_map, scene_xy_scale if torch.is_tensor(scene_xy_scale) else None)
         point_anchor_metric = point_map_to_metric(point_anchor, scene_xy_scale if torch.is_tensor(scene_xy_scale) else None)
 
-        loss = masked_huber_loss(point_abs_metric, gt_point_map_metric, mask=height_valid_mask, beta=self.beta)
+        loss_xy = masked_huber_loss(point_abs_metric[:, :, 0:2], gt_point_map_metric[:, :, 0:2], mask=height_valid_mask, beta=self.beta)
+        loss_z = masked_huber_loss(point_abs_metric[:, :, 2:3], gt_point_map_metric[:, :, 2:3], mask=height_valid_mask, beta=self.beta)
+        loss = loss_xy + loss_z
 
         d = point_abs_metric - gt_point_map_metric
         dx2 = d[:, :, 0:1].square()
@@ -97,6 +101,8 @@ class PointMapLoss:
         anchor_norm = torch.sqrt((anchor_delta.square().sum(dim=2, keepdim=True)).clamp_min(1e-8))
 
         probe = {
+            "point_xy_meter_loss": loss_xy.detach(),
+            "point_z_meter_loss": loss_z.detach(),
             "point_xyz_rmse": safe_rmse(dx2 + dy2 + dz2, mask=height_valid_mask).detach(),
             "point_xy_rmse": safe_rmse(dx2 + dy2, mask=height_valid_mask).detach(),
             "point_z_rmse": safe_rmse(dz2, mask=height_valid_mask).detach(),
@@ -106,6 +112,12 @@ class PointMapLoss:
         }
 
         aux: dict[str, Any] = {}
+        aux["loss_point_xy_meter"] = loss_xy
+        aux["loss_point_z_meter"] = loss_z
+        aux["loss_point_meter"] = loss
         if return_aux:
-            aux["gt_point_map"] = gt_point_map_metric
+            aux["gt_point_z_meter"] = gt_point_map_metric[:, :, 2:3].contiguous()
+            if aux_include_full_gt_map:
+                aux["gt_point_map_metric"] = gt_point_map_metric
+                aux["gt_point_map"] = gt_point_map_metric
         return loss, probe, aux
