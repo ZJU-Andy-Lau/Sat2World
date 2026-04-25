@@ -86,6 +86,11 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any, patch_matcher: torch
         lambda_height=float(lcfg.get("lambda_height", 1.0)),
         lambda_height_anchor=float(lcfg.get("lambda_height_anchor", 0.5)),
         lambda_point=float(lcfg.get("lambda_point", 1.0)),
+        lambda_point_xy=(None if "lambda_point_xy" not in lcfg else float(lcfg.get("lambda_point_xy"))),
+        lambda_point_z=(None if "lambda_point_z" not in lcfg else float(lcfg.get("lambda_point_z"))),
+        lambda_height_meter_aux=float(lcfg.get("lambda_height_meter_aux", 1.0e-3)),
+        lambda_height_anchor_meter_aux=float(lcfg.get("lambda_height_anchor_meter_aux", 1.0e-3)),
+        lambda_point_z_meter_aux=float(lcfg.get("lambda_point_z_meter_aux", 1.0e-3)),
         lambda_point_reproj=float(lcfg.get("lambda_point_reproj", 0.2)),
         lambda_height_reproj=float(lcfg.get("lambda_height_reproj", 0.2)),
         lambda_point_pair=float(lcfg.get("lambda_point_pair", 0.1)),
@@ -128,6 +133,9 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any, patch_matcher: torch
         normal_cfg=normal_cfg,
         height_beta=float(lcfg.get("height_beta", 1.0)),
         point_beta=float(lcfg.get("point_beta", 1.0)),
+        height_z_beta_meter=(None if "height_z_beta_meter" not in lcfg else float(lcfg.get("height_z_beta_meter"))),
+        height_anchor_z_beta_meter=float(lcfg.get("height_anchor_z_beta_meter", 5.0)),
+        point_z_beta_meter=(None if "point_z_beta_meter" not in lcfg else float(lcfg.get("point_z_beta_meter"))),
         weights=weights,
     )
 
