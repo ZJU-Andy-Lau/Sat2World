@@ -390,9 +390,13 @@ class RPCModelParameterTorch:
         hei_norm = (hei - self.HEIGHT_OFF) / self.HEIGHT_SCALE
 
         coef = self.RPC_PLH_COEF(samp_norm, line_norm, hei_norm)
+        LATDEM = torch.sum(coef * self.LATDEM, dim=-1)
+        LONDEM = torch.sum(coef * self.LONDEM, dim=-1)
+        safe_LATDEM = torch.where(LATDEM.abs() < 1e-6,torch.full_like(LATDEM,1e-6,dtype=LATDEM.dtype,device=LATDEM.device),LATDEM)
+        safe_LONDEM = torch.where(LONDEM.abs() < 1e-6,torch.full_like(LONDEM,1e-6,dtype=LONDEM.dtype,device=LONDEM.device),LONDEM)
 
-        lat_norm = torch.sum(coef * self.LATNUM, dim=-1) / torch.sum(coef * self.LATDEM, dim=-1)
-        lon_norm = torch.sum(coef * self.LONNUM, dim=-1) / torch.sum(coef * self.LONDEM, dim=-1)
+        lat_norm = torch.sum(coef * self.LATNUM, dim=-1) / safe_LATDEM
+        lon_norm = torch.sum(coef * self.LONNUM, dim=-1) / safe_LONDEM
 
         lat = lat_norm * self.LAT_SCALE + self.LAT_OFF
         lon = lon_norm * self.LONG_SCALE + self.LONG_OFF
@@ -595,9 +599,13 @@ class RPCModelParameterTorch:
         hei_norm = (hei - self.HEIGHT_OFF) / self.HEIGHT_SCALE
 
         coef = self.RPC_PLH_COEF(lat_norm, lon_norm, hei_norm)
+        SDEM = torch.sum(coef * self.SDEM, dim=-1)
+        LDEM = torch.sum(coef * self.LDEM, dim=-1)
+        safe_SDEM = torch.where(SDEM.abs() < 1e-6,torch.full_like(SDEM,1e-6,dtype=SDEM.dtype,device=SDEM.device),SDEM)
+        safe_LDEM = torch.where(LDEM.abs() < 1e-6,torch.full_like(LDEM,1e-6,dtype=LDEM.dtype,device=LDEM.device),LDEM)
 
-        samp_norm = torch.sum(coef * self.SNUM, dim=-1) / torch.sum(coef * self.SDEM, dim=-1)
-        line_norm = torch.sum(coef * self.LNUM, dim=-1) / torch.sum(coef * self.LDEM, dim=-1)
+        samp_norm = torch.sum(coef * self.SNUM, dim=-1) / safe_SDEM
+        line_norm = torch.sum(coef * self.LNUM, dim=-1) / safe_LDEM
 
         samp = samp_norm * self.SAMP_SCALE + self.SAMP_OFF
         line = line_norm * self.LINE_SCALE + self.LINE_OFF
