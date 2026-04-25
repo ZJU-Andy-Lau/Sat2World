@@ -48,6 +48,7 @@ class PointMapLoss:
         point_anchor: torch.Tensor,
         batch: dict[str, Any],
         return_aux: bool = False,
+        aux_include_full_gt_map: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
         """计算点云损失。
 
@@ -55,7 +56,8 @@ class PointMapLoss:
             point_abs: [B,V,3,H,W]。
             point_anchor: [B,V,3,H,W]。
             batch: 至少包含 rpc_gt/height_gt/height_valid_mask/scene_xy_center/scene_xy_scale。
-            return_aux: 是否返回 gt_point_map（默认 False）。
+            return_aux: 是否返回辅助监督张量（默认 False）。
+            aux_include_full_gt_map: 当 return_aux=True 时，是否额外返回完整 gt_point_map_metric。
 
         输出:
             loss: 标量。
@@ -114,6 +116,8 @@ class PointMapLoss:
         aux["loss_point_z_meter"] = loss_z
         aux["loss_point_meter"] = loss
         if return_aux:
-            aux["gt_point_map_metric"] = gt_point_map_metric
-            aux["gt_point_map"] = gt_point_map_metric
+            aux["gt_point_z_meter"] = gt_point_map_metric[:, :, 2:3].contiguous()
+            if aux_include_full_gt_map:
+                aux["gt_point_map_metric"] = gt_point_map_metric
+                aux["gt_point_map"] = gt_point_map_metric
         return loss, probe, aux

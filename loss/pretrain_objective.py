@@ -284,9 +284,11 @@ class GeometryPretrainObjective:
         l_p, p_p, aux_point = self.point_loss(outputs["point_abs"], outputs["point_anchor"], batch, return_aux=True)
         l_p_xy = aux_point.get("loss_point_xy_meter", l_p)
         l_p_z_meter = aux_point.get("loss_point_z_meter", torch.zeros_like(l_p))
-        gt_point_map_metric = aux_point.get("gt_point_map_metric", aux_point.get("gt_point_map", None))
-        if gt_point_map_metric is None:
-            raise KeyError("PointMapLoss(return_aux=True) must provide gt_point_map_metric for z-space point supervision.")
+        gt_point_z_meter = aux_point.pop("gt_point_z_meter", None)
+        aux_point.pop("gt_point_map_metric", None)
+        aux_point.pop("gt_point_map", None)
+        if gt_point_z_meter is None:
+            raise KeyError("PointMapLoss(return_aux=True) must provide gt_point_z_meter for z-space point supervision.")
 
         height_valid_mask = batch["height_valid_mask"].to(device=outputs["height_abs"].device, dtype=outputs["height_abs"].dtype)
         height_anchor_detached = outputs["height_anchor"].detach()
@@ -311,15 +313,15 @@ class GeometryPretrainObjective:
             scale=height_anchor_scale,
             z_max=height_z_max,
         )
-        gt_point_z = gt_point_map_metric[:, :, 2:3]
         l_p_z_z = masked_z_huber_loss(
             outputs["point_z_local_z"],
-            gt_point_z - height_anchor_detached.view(-1, 1, 1, 1, 1),
+            gt_point_z_meter - height_anchor_detached.view(-1, 1, 1, 1, 1),
             mask=height_valid_mask,
             beta_meter=self.point_z_beta_meter,
             scale=height_local_scale,
             z_max=height_z_max,
         )
+        del gt_point_z_meter
         l_preproj, p_preproj, aux_preproj = self.point_reproj_loss(outputs["point_abs"], batch)
         l_ppair, p_ppair, aux_ppair = self.point_pair_loss(outputs["point_abs"], batch)
         l_nh, l_np, p_norm, aux_norm = self.normal_loss(
