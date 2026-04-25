@@ -369,11 +369,12 @@ class Sat2World(nn.Module):
         patch_tokens_layer_sel = patch_tokens_layers[:, layer_idx]
         patch_tokens_nce_proj = self.nce_projector(patch_tokens_layer_sel)
 
-        # 4) 单阶段仿射预测（参考视图约束在 loss 阶段处理）
-        affine_pred = self.affine_head(view_tokens_final)
+        with torch.autocast(device_type=device.type, enabled=False):
+            # 4) 单阶段仿射预测（参考视图约束在 loss 阶段处理）
+            affine_pred = self.affine_head(view_tokens_final.float())
 
-        # 5) affine_pred 修正 rpc_init
-        rpc_corrected = self.rpc_ops.apply_affine_correction_batch(rpc_init, affine_pred)
+            # 5) affine_pred 修正 rpc_init
+            rpc_corrected = self.rpc_ops.apply_affine_correction_batch(rpc_init, affine_pred)
 
         # 6) patch layers -> DPT dense
         dense_feat = self.dense_decoder(
@@ -381,64 +382,64 @@ class Sat2World(nn.Module):
             images=images_bv,
             patch_grid_hw=(gh, gw),
         )
+        with torch.autocast(device_type=device.type, enabled=False):
+            # 7) 高程分支：scene-level anchor + dense local
+            height_ref_anchor = self._prepare_height_ref_anchor(batch, height_ref, ref_view_idx).float()
+            check_nan(height_ref_anchor,"height_ref_anchor")
+            height_anchor_raw_z = self.height_anchor_head(scene_token_final.float())
+            check_nan(height_anchor_raw_z,"height_anchor_raw_z")
+            height_anchor_dec = self.height_offset_decoder(height_anchor_raw_z, scale=self.cfg.height_anchor_scale)
+            height_anchor_z = height_anchor_dec["z"]
+            check_nan(height_anchor_z,"height_anchor_z")
+            height_anchor_offset = height_anchor_dec["offset"]
+            check_nan(height_anchor_offset,"height_anchor_offset")
+            height_anchor = height_ref_anchor + height_anchor_offset
+            check_nan(height_anchor,"height_anchor")
 
-        # 7) 高程分支：scene-level anchor + dense local
-        height_ref_anchor = self._prepare_height_ref_anchor(batch, height_ref, ref_view_idx)
-        check_nan(height_ref_anchor,"height_ref_anchor")
-        height_anchor_raw_z = self.height_anchor_head(scene_token_final)
-        check_nan(height_anchor_raw_z,"height_anchor_raw_z")
-        height_anchor_dec = self.height_offset_decoder(height_anchor_raw_z, scale=self.cfg.height_anchor_scale)
-        height_anchor_z = height_anchor_dec["z"]
-        check_nan(height_anchor_z,"height_anchor_z")
-        height_anchor_offset = height_anchor_dec["offset"]
-        check_nan(height_anchor_offset,"height_anchor_offset")
-        height_anchor = height_ref_anchor + height_anchor_offset
-        check_nan(height_anchor,"height_anchor")
+            check_nan(dense_feat,"dense_feat")
+            height_feat = self.height_adapter(dense_feat.float())
+            check_nan(height_feat,"height_adapter_feat")
+            height_local_raw_z_bv = self.height_local_head(height_feat)
+            check_nan(height_local_raw_z_bv,"height_local_raw_z_bv")
+            height_local_raw_z = self._reshape_logits_to_bv(height_local_raw_z_bv, b, v)
+            height_local_dec = self.height_offset_decoder(height_local_raw_z, scale=self.cfg.height_local_scale)
+            height_local_z = height_local_dec["z"]
+            check_nan(height_local_z,"height_local_z")
+            height_local_offset = height_local_dec["offset"]
+            check_nan(height_local_offset,"height_local_offset")
+            height_anchor_map = height_anchor.view(b, 1, 1, 1, 1).expand(b, v, 1, h, w)
+            check_nan(height_anchor_map,"height_anchor_map")
+            height_abs = height_anchor_map + height_local_offset
+            check_nan(height_abs,"height_abs")
 
-        check_nan(dense_feat,"dense_feat")
-        height_feat = self.height_adapter(dense_feat)
-        check_nan(height_feat,"height_adapter_feat")
-        height_local_raw_z_bv = self.height_local_head(height_feat)
-        check_nan(height_local_raw_z_bv,"height_local_raw_z_bv")
-        height_local_raw_z = self._reshape_logits_to_bv(height_local_raw_z_bv, b, v)
-        height_local_dec = self.height_offset_decoder(height_local_raw_z, scale=self.cfg.height_local_scale)
-        height_local_z = height_local_dec["z"]
-        check_nan(height_local_z,"height_local_z")
-        height_local_offset = height_local_dec["offset"]
-        check_nan(height_local_offset,"height_local_offset")
-        height_anchor_map = height_anchor.view(b, 1, 1, 1, 1).expand(b, v, 1, h, w)
-        check_nan(height_anchor_map,"height_anchor_map")
-        height_abs = height_anchor_map + height_local_offset
-        check_nan(height_abs,"height_abs")
+            # 8) 点云分支（独立 anchor）
+            image_grid = make_image_grid(h, w, device=device, dtype=torch.float32)
+            point_anchor = self.rpc_ops.build_point_anchor_map_batch(
+                rpc_init_batch=rpc_init,
+                pixel_grid=image_grid,
+                height_ref=height_ref,
+                scene_xy_center=scene_xy_center,
+                scene_xy_scale=scene_xy_scale,
+            )
 
-        # 8) 点云分支（独立 anchor）
-        image_grid = make_image_grid(h, w, device=device, dtype=torch.float32)
-        point_anchor = self.rpc_ops.build_point_anchor_map_batch(
-            rpc_init_batch=rpc_init,
-            pixel_grid=image_grid,
-            height_ref=height_ref,
-            scene_xy_center=scene_xy_center,
-            scene_xy_scale=scene_xy_scale,
-        )
+            point_feat = self.point_adapter(dense_feat.float())
+            point_xy_pred = self.point_xy_head(point_feat)
+            x_logits = self._reshape_logits_to_bv(point_xy_pred["x_logits"], b, v)
+            y_logits = self._reshape_logits_to_bv(point_xy_pred["y_logits"], b, v)
+            x_fine = self._reshape_logits_to_bv(point_xy_pred["x_fine"], b, v)
+            y_fine = self._reshape_logits_to_bv(point_xy_pred["y_fine"], b, v)
+            dx, dx_coarse, dx_fine = self.point_xy_coder_x.decode(x_logits, x_fine, channel_dim=2)
+            dy, dy_coarse, dy_fine = self.point_xy_coder_y.decode(y_logits, y_fine, channel_dim=2)
+            point_x = point_anchor[:, :, 0:1] + dx.unsqueeze(2)
+            point_y = point_anchor[:, :, 1:2] + dy.unsqueeze(2)
 
-        point_feat = self.point_adapter(dense_feat)
-        point_xy_pred = self.point_xy_head(point_feat)
-        x_logits = self._reshape_logits_to_bv(point_xy_pred["x_logits"], b, v)
-        y_logits = self._reshape_logits_to_bv(point_xy_pred["y_logits"], b, v)
-        x_fine = self._reshape_logits_to_bv(point_xy_pred["x_fine"], b, v)
-        y_fine = self._reshape_logits_to_bv(point_xy_pred["y_fine"], b, v)
-        dx, dx_coarse, dx_fine = self.point_xy_coder_x.decode(x_logits, x_fine, channel_dim=2)
-        dy, dy_coarse, dy_fine = self.point_xy_coder_y.decode(y_logits, y_fine, channel_dim=2)
-        point_x = point_anchor[:, :, 0:1] + dx.unsqueeze(2)
-        point_y = point_anchor[:, :, 1:2] + dy.unsqueeze(2)
-
-        point_z_local_raw_z_bv = self.point_z_local_head(point_feat)
-        point_z_local_raw_z = self._reshape_logits_to_bv(point_z_local_raw_z_bv, b, v)
-        point_z_local_dec = self.height_offset_decoder(point_z_local_raw_z, scale=self.cfg.height_local_scale)
-        point_z_local_z = point_z_local_dec["z"]
-        point_z_local_offset = point_z_local_dec["offset"]
-        point_z = height_anchor_map + point_z_local_offset
-        point_abs = torch.cat([point_x, point_y, point_z], dim=2)
+            point_z_local_raw_z_bv = self.point_z_local_head(point_feat)
+            point_z_local_raw_z = self._reshape_logits_to_bv(point_z_local_raw_z_bv, b, v)
+            point_z_local_dec = self.height_offset_decoder(point_z_local_raw_z, scale=self.cfg.height_local_scale)
+            point_z_local_z = point_z_local_dec["z"]
+            point_z_local_offset = point_z_local_dec["offset"]
+            point_z = height_anchor_map + point_z_local_offset
+            point_abs = torch.cat([point_x, point_y, point_z], dim=2)
 
         gaussian_enabled = bool(self.cfg.enable_gaussian_branch) and (not self.runtime_pretrain_geometry_only)
 
