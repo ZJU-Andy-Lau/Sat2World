@@ -15,7 +15,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from loss.common import masked_reduce
+from loss.common import masked_reduce,check_nan
 from loss.point_pair_loss import point_map_to_metric
 
 
@@ -164,6 +164,7 @@ class PointNormalLoss:
             scene_xy_center=scene_xy_center,
             scene_xy_scale=scene_xy_scale,
         )
+        check_nan(gt_point,"norm_loss_gt_point")
         pred_point_h = self.geometry_ops.centers_from_rpc_and_height_batch(
             corrected_rpc_batch=rpc_gt,
             pixel_grid=image_grid,
@@ -171,18 +172,26 @@ class PointNormalLoss:
             scene_xy_center=scene_xy_center,
             scene_xy_scale=scene_xy_scale,
         )
+        check_nan(pred_point_h,"norm_loss_pred_point_h")
         pred_point_p = point_abs
+        check_nan(pred_point_p,"norm_loss_pred_point_p")
 
         metric_scale = scene_xy_scale if torch.is_tensor(scene_xy_scale) else None
         gt_metric = point_map_to_metric(gt_point, metric_scale)
         pred_h_metric = point_map_to_metric(pred_point_h, metric_scale)
         pred_p_metric = point_map_to_metric(pred_point_p, metric_scale)
+        check_nan(gt_metric,"norm_loss_gt_metric")
+        check_nan(pred_h_metric,"norm_loss_pred_h_metric")
+        check_nan(pred_p_metric,"norm_loss_pred_p_metric")
 
         gt_n, nmask = compute_normals_from_point_map(gt_metric, valid_mask=valid_mask, eps=float(self.cfg.eps))
-        if bool(self.cfg.detach_gt):
-            gt_n = gt_n.detach()
+        gt_n = gt_n.detach()
         pred_h_n, _ = compute_normals_from_point_map(pred_h_metric, valid_mask=valid_mask, eps=float(self.cfg.eps))
         pred_p_n, _ = compute_normals_from_point_map(pred_p_metric, valid_mask=valid_mask, eps=float(self.cfg.eps))
+        check_nan(gt_n,"norm_loss_gt_n")
+        check_nan(pred_h_n,"norm_loss_pred_h_n")
+        check_nan(pred_p_n,"norm_loss_pred_p_n")
+
 
         l_h_cos, l_h_l1, p_h = normal_alignment_terms(
             pred_h_n,
@@ -198,10 +207,19 @@ class PointNormalLoss:
             sign_invariant=bool(self.cfg.sign_invariant),
             eps=float(self.cfg.eps),
         )
+        check_nan(l_h_cos,"norm_loss_l_h_cos")
+        check_nan(l_h_l1,"norm_loss_l_h_l1")
+        check_nan(p_h,"norm_loss_pred_p_h")
+        check_nan(l_p_cos,"norm_loss_l_p_cos")
+        check_nan(l_p_l1,"norm_loss_pred_l_p_l1")
+        check_nan(p_p,"norm_loss_p_p")
+
         w_cos = float(self.cfg.w_cos)
         w_l1 = float(self.cfg.w_l1)
         loss_h = torch.nan_to_num(w_cos * l_h_cos + w_l1 * l_h_l1, nan=0.0, posinf=0.0, neginf=0.0)
         loss_p = torch.nan_to_num(w_cos * l_p_cos + w_l1 * l_p_l1, nan=0.0, posinf=0.0, neginf=0.0)
+        check_nan(loss_h,"norm_loss_loss_h")
+        check_nan(loss_p,"norm_loss_loss_p")
 
         probe = {
             "normal_h_cos_mean": p_h["normal_cos_mean"],

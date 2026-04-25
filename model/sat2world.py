@@ -52,6 +52,7 @@ from model.heads import (
     TaskAdapter,
 )
 from model.patch_matcher import PatchHeatmapMatcher, PatchMatcherCfg
+from model.utils import check_nan
 
 
 @dataclass
@@ -383,19 +384,29 @@ class Sat2World(nn.Module):
 
         # 7) 高程分支：scene-level anchor + dense local
         height_ref_anchor = self._prepare_height_ref_anchor(batch, height_ref, ref_view_idx)
+        check_nan(height_ref_anchor,"height_ref_anchor")
         height_anchor_raw_z = self.height_anchor_head(scene_token_final)
+        check_nan(height_anchor_raw_z,"height_anchor_raw_z")
         height_anchor_dec = self.height_offset_decoder(height_anchor_raw_z, scale=self.cfg.height_anchor_scale)
         height_anchor_z = height_anchor_dec["z"]
+        check_nan(height_anchor_z,"height_anchor_z")
         height_anchor_offset = height_anchor_dec["offset"]
+        check_nan(height_anchor_offset,"height_anchor_offset")
         height_anchor = height_ref_anchor + height_anchor_offset
+        check_nan(height_anchor,"height_anchor")
 
         height_local_raw_z_bv = self.height_local_head(self.height_adapter(dense_feat))
+        check_nan(height_local_raw_z_bv,"height_local_raw_z_bv")
         height_local_raw_z = self._reshape_logits_to_bv(height_local_raw_z_bv, b, v)
         height_local_dec = self.height_offset_decoder(height_local_raw_z, scale=self.cfg.height_local_scale)
         height_local_z = height_local_dec["z"]
+        check_nan(height_local_z,"height_local_z")
         height_local_offset = height_local_dec["offset"]
+        check_nan(height_local_offset,"height_local_offset")
         height_anchor_map = height_anchor.view(b, 1, 1, 1, 1).expand(b, v, 1, h, w)
+        check_nan(height_anchor_map,"height_anchor_map")
         height_abs = height_anchor_map + height_local_offset
+        check_nan(height_abs,"height_abs")
 
         # 8) 点云分支（独立 anchor）
         image_grid = make_image_grid(h, w, device=device, dtype=torch.float32)

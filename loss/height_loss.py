@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 
-from loss.common import masked_huber_loss, masked_l1_loss, safe_rmse
+from loss.common import masked_huber_loss, masked_l1_loss, safe_rmse, check_nan
 
 
 class HeightHuberLoss:
@@ -49,8 +49,8 @@ class HeightHuberLoss:
             loss: 标量。
             probe: 包含 height_rmse/height_mae/height_bias。
         """
-        if height_abs.isnan().any():
-            print(f"height abs pred has nan")
+        check_nan(height_abs,"height_abs")
+        check_nan(height_gt,"height_gt")
         loss = masked_huber_loss(height_abs, height_gt, mask=height_valid_mask, beta=self.beta)
 
         diff = height_abs - height_gt

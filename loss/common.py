@@ -293,3 +293,7 @@ def safe_rmse(squared_error: torch.Tensor, mask: torch.Tensor | None = None, eps
     """计算安全 RMSE: sqrt(masked_mean(se)+eps)。"""
     mse = masked_reduce(squared_error, mask=mask, reduce="mean")
     return torch.sqrt(mse + eps)
+
+def check_nan(input:torch.Tensor,name:str):
+    if input.isnan().any():
+        print(f"{name} has nan")
