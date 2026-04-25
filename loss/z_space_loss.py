@@ -38,7 +38,7 @@ def offset_meter_to_target_z(
     else:
         zm = torch.tensor(float(z_max), device=offset_fp32.device, dtype=offset_fp32.dtype)
     target_z = torch.asinh(offset_fp32 / s.clamp_min(1e-12))
-    return target_z.clamp(min=-zm, max=zm)
+    return target_z.clamp(min=-zm*0.98, max=zm*0.98)
 
 
 def masked_z_huber_loss(

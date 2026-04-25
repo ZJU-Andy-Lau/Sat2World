@@ -395,7 +395,10 @@ class Sat2World(nn.Module):
         height_anchor = height_ref_anchor + height_anchor_offset
         check_nan(height_anchor,"height_anchor")
 
-        height_local_raw_z_bv = self.height_local_head(self.height_adapter(dense_feat))
+        check_nan(dense_feat,"dense_feat")
+        height_feat = self.height_adapter(dense_feat)
+        check_nan(height_feat,"height_adapter_feat")
+        height_local_raw_z_bv = self.height_local_head(height_feat)
         check_nan(height_local_raw_z_bv,"height_local_raw_z_bv")
         height_local_raw_z = self._reshape_logits_to_bv(height_local_raw_z_bv, b, v)
         height_local_dec = self.height_offset_decoder(height_local_raw_z, scale=self.cfg.height_local_scale)
