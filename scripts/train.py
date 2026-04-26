@@ -431,6 +431,11 @@ def main() -> None:
             image_max_views=int(tb_cfg.get("image_max_views", 4)),
             max_pointcloud_points=int(tb_cfg.get("max_pointcloud_points", 8192)),
             flush_secs=int(tb_cfg.get("flush_secs", 30)),
+            min_free_mb=float(tb_cfg.get("min_free_mb", 100.0)),
+            disk_check_interval_sec=float(tb_cfg.get("disk_check_interval_sec", 1.0)),
+            low_disk_warn_interval_sec=float(tb_cfg.get("low_disk_warn_interval_sec", 300.0)),
+            reopen_interval_sec=float(tb_cfg.get("reopen_interval_sec", 30.0)),
+            skip_when_low_disk=bool(tb_cfg.get("skip_when_low_disk", True)),
         )
 
     resume_state = None
