@@ -90,25 +90,31 @@ class AffineGridLoss:
 
         err = torch.linalg.norm(g_rec - g_true, dim=-1)  # [B,V,N]
 
-        view_mask = torch.ones((b, v, 1), device=err.device, dtype=err.dtype)
-        if ref_view_idx is not None:
-            ref = ref_view_idx.long().view(-1)
+        loss = err.mean()
+
+        ref_err = torch.zeros((b, n), device=err.device, dtype=err.dtype)
+        nonref_mask = torch.ones((b, v), device=err.device, dtype=torch.bool)
+        if ref_view_idx is None:
+            ref = torch.zeros((b,), device=err.device, dtype=torch.long)
+        else:
+            ref = ref_view_idx.long().view(-1).to(device=err.device)
             if ref.numel() == 1:
                 ref = ref.expand(b)
-            view_mask[torch.arange(b, device=err.device), ref, 0] = 0.0
+            ref = ref.clamp(0, v - 1)
+        nonref_mask[torch.arange(b, device=err.device), ref] = False
+        ref_err = err[torch.arange(b, device=err.device), ref]
 
-        view_mask_exp = view_mask.expand_as(err)
-        loss = (err * view_mask_exp).sum() / view_mask_exp.sum().clamp_min(1.0)
-
-        ref_err_mean = torch.zeros((), device=err.device, dtype=err.dtype)
-        if ref_view_idx is not None:
-            ref_err = err[torch.arange(b, device=err.device), ref]
-            ref_err_mean = ref_err.mean()
+        nonref_err = err[nonref_mask].view(-1)
+        nonref_err_sq = nonref_err.square()
+        ref_err_sq = ref_err.square()
 
         probe = {
             "affine_grid_error_px_mean": loss.detach(),
-            "affine_grid_error_px_rmse": safe_rmse(err.square(), mask=view_mask).detach(),
-            "reference_affine_grid_error_px_mean": ref_err_mean.detach(),
+            "affine_grid_error_px_rmse": safe_rmse(err.square()).detach(),
+            "affine_grid_ref_error_px_mean": ref_err.mean().detach(),
+            "affine_grid_ref_error_px_rmse": safe_rmse(ref_err_sq).detach(),
+            "affine_grid_nonref_error_px_mean": nonref_err.mean().detach() if nonref_err.numel() > 0 else torch.zeros((), device=err.device, dtype=err.dtype),
+            "affine_grid_nonref_error_px_rmse": safe_rmse(nonref_err_sq).detach() if nonref_err.numel() > 0 else torch.zeros((), device=err.device, dtype=err.dtype),
         }
         return loss, probe
 
@@ -406,103 +412,29 @@ class AffineLinearRegularization:
         eye = torch.tensor([[1.0, 0.0], [0.0, 1.0]], device=affine_pred.device, dtype=affine_pred.dtype).view(1, 1, 2, 2)
         frob_sq = (lin - eye).square().sum(dim=(-2, -1))
 
-        mask = torch.ones((b, v), device=affine_pred.device, dtype=affine_pred.dtype)
-        if ref_view_idx is not None:
-            ref = ref_view_idx.long().view(-1)
-            if ref.numel() == 1:
-                ref = ref.expand(b)
-            mask[torch.arange(b, device=mask.device), ref] = 0.0
-
-        denom = mask.sum().clamp_min(1.0)
-        loss = (frob_sq * mask).sum() / denom
-
-        probe = {
-            "affine_linear_frob_mean": torch.sqrt((frob_sq * mask).sum() / denom).detach(),
-            "affine_translation_abs_mean": (trans.abs().sum(dim=-1) * mask).sum().detach() / denom,
-        }
-        return loss, probe
-
-
-class RefAffineIdentityLoss:
-    """参考视图 identity 仿射约束（网格版）。
-
-    功能:
-        不再直接对参考视图的 2x3 参数做 MSE，
-        而是在参考视图上构造 true 域均匀网格，施加 affine_pred(ref)
-        后与原网格比较距离，推动参考视图 affine 接近单位变换。
-
-    说明:
-        - 该损失的形式与 AffineGridLoss 一致，但只作用在 ref_view_idx 对应视图；
-        - 等价于“GT forward = identity”时的网格恢复误差；
-        - 为了保持最小改动，直接复用 AffineGridLossCfg 中的 grid_h/grid_w。
-    """
-
-    def __init__(self, cfg: AffineGridLossCfg | None = None) -> None:
-        """初始化参考视图网格约束。"""
-        self.cfg = cfg or AffineGridLossCfg()
-        self._grid_cache: dict[tuple[int, int, int, int, str, str], torch.Tensor] = {}
-
-    def _get_grid(self, h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """获取或创建均匀采样网格 [N,2]。"""
-        key = (h, w, self.cfg.grid_h, self.cfg.grid_w, str(device), str(dtype))
-        if key not in self._grid_cache:
-            self._grid_cache[key] = make_uniform_grid_points(h, w, self.cfg.grid_h, self.cfg.grid_w, device, dtype)
-        return self._grid_cache[key]
-
-    def __call__(
-        self,
-        affine_pred: torch.Tensor,
-        image_hw: tuple[int, int],
-        ref_view_idx: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """计算参考视图网格 identity 约束。
-
-        输入:
-            affine_pred: [B,V,2,3]，correction affine（observed->true）。
-            image_hw: (H,W)。
-            ref_view_idx: [B] 或 None；若为 None，默认第 0 个视图为参考视图。
-
-        输出:
-            loss: 标量，参考视图网格经 affine 变换后与原网格点的平均欧氏距离。
-            probe: 参考视图误差统计。
-        """
-        if affine_pred.ndim != 4 or affine_pred.shape[-2:] != (2, 3):
-            raise ValueError(f"affine_pred must be [B,V,2,3], got {tuple(affine_pred.shape)}")
-
-        b, v = affine_pred.shape[:2]
-        h, w = image_hw
+        loss = frob_sq.mean()
 
         if ref_view_idx is None:
-            ref = torch.zeros((b,), dtype=torch.long, device=affine_pred.device)
+            ref = torch.zeros((b,), device=affine_pred.device, dtype=torch.long)
         else:
             ref = ref_view_idx.long().view(-1).to(device=affine_pred.device)
             if ref.numel() == 1:
                 ref = ref.expand(b)
-        ref = ref.clamp(0, v - 1)
+            ref = ref.clamp(0, v - 1)
+        ref_frob_sq = frob_sq[torch.arange(b, device=affine_pred.device), ref]
+        nonref_mask = torch.ones((b, v), device=affine_pred.device, dtype=torch.bool)
+        nonref_mask[torch.arange(b, device=affine_pred.device), ref] = False
+        nonref_frob_sq = frob_sq[nonref_mask].view(-1)
 
-        pred_ref = affine_pred[torch.arange(b, device=affine_pred.device), ref]  # [B,2,3]
-
-        grid = self._get_grid(h, w, affine_pred.device, affine_pred.dtype)  # [N,2]
-        n = grid.shape[0]
-        g_true = grid.view(1, n, 2).expand(b, n, 2)
-        g_rec = apply_affine_to_points(g_true, pred_ref)  # [B,N,2]
-
-        err = torch.linalg.norm(g_rec - g_true, dim=-1)  # [B,N]
-        loss = err.mean()
-
-        eye = torch.tensor(
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            device=pred_ref.device,
-            dtype=pred_ref.dtype,
-        ).view(1, 2, 3).expand_as(pred_ref)
+        ref_trans_abs = trans.abs().sum(dim=-1)[torch.arange(b, device=affine_pred.device), ref]
+        nonref_trans_abs = trans.abs().sum(dim=-1)[nonref_mask].view(-1)
 
         probe = {
-            "ref_affine_grid_error_px_mean": loss.detach(),
-            "ref_affine_grid_error_px_rmse": safe_rmse(err.square()).detach(),
-            # 为了最小化对现有日志代码的影响，保留旧 key 作为兼容别名；
-            # 但语义上它现在已经不再是“参数 L2”，而是“ref 网格误差均值”。
-            "ref_affine_identity_l2": loss.detach(),
-            "ref_affine_translation_abs_mean": pred_ref[..., 2].abs().mean().detach(),
-            "ref_affine_linear_abs_mean": (pred_ref[..., :2] - eye[..., :2]).abs().mean().detach(),
+            "affine_linear_frob_mean": torch.sqrt(loss).detach(),
+            "affine_translation_abs_mean": trans.abs().sum(dim=-1).mean().detach(),
+            "affine_linear_ref_frob_mean": torch.sqrt(ref_frob_sq.mean()).detach(),
+            "affine_linear_nonref_frob_mean": torch.sqrt(nonref_frob_sq.mean()).detach() if nonref_frob_sq.numel() > 0 else torch.zeros((), device=affine_pred.device, dtype=affine_pred.dtype),
+            "affine_translation_ref_abs_mean": ref_trans_abs.mean().detach(),
+            "affine_translation_nonref_abs_mean": nonref_trans_abs.mean().detach() if nonref_trans_abs.numel() > 0 else torch.zeros((), device=affine_pred.device, dtype=affine_pred.dtype),
         }
         return loss, probe

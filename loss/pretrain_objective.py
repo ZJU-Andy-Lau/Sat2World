@@ -18,7 +18,6 @@ from loss.affine_loss import (
     AffineLinearRegularization,
     AffinePairwiseGeometryLoss,
     AffinePairwiseGeometryLossCfg,
-    RefAffineIdentityLoss,
 )
 from loss.feature_nce_loss import FeatureInfoNCELoss, FeatureInfoNCELossCfg
 from loss.height_loss import HeightHuberLoss
@@ -36,7 +35,6 @@ class GeometryPretrainWeightCfg:
     lambda_affine_grid: float = 1.0
     lambda_affine_pair: float = 1.0
     lambda_affine_reg: float = 0.1
-    lambda_affine_ref: float = 0.1
     lambda_height: float = 1.0
     lambda_height_anchor: float = 0.5
     lambda_point: float = 1.0
@@ -62,7 +60,6 @@ class GeometryPretrainObjective:
     - AffineGridLoss
     - AffinePairwiseGeometryLoss
     - AffineLinearRegularization
-    - RefAffineIdentityLoss
     - HeightHuberLoss
     - PointMapLoss
     """
@@ -89,7 +86,6 @@ class GeometryPretrainObjective:
         self.affine_grid = AffineGridLoss(affine_grid_cfg)
         self.affine_pair = AffinePairwiseGeometryLoss(geometry_ops, affine_pair_cfg)
         self.affine_reg = AffineLinearRegularization()
-        self.affine_ref = RefAffineIdentityLoss()
         self.height_loss = HeightHuberLoss(beta=height_beta)
         self.height_anchor_loss = torch.nn.SmoothL1Loss(reduction="mean")
         self.point_loss = PointMapLoss(geometry_ops=geometry_ops, beta=point_beta)
@@ -235,26 +231,22 @@ class GeometryPretrainObjective:
 
         affine_pred = outputs["affine_pred"]
         ref_idx = batch.get("ref_view_idx", None)
-        affine_pred_for_loss = self._replace_ref_affine_with_identity(affine_pred, ref_idx)
+        affine_pred_direct = affine_pred
+        affine_pred_relative = self._replace_ref_affine_with_identity(affine_pred, ref_idx)
         outputs_for_affine_pair = dict(outputs)
-        outputs_for_affine_pair["affine_pred"] = affine_pred_for_loss
+        outputs_for_affine_pair["affine_pred"] = affine_pred_relative
         if "rpc_init" in batch:
-            outputs_for_affine_pair["rpc_corrected"] = self.geometry_ops.apply_affine_correction_batch(batch["rpc_init"], affine_pred_for_loss)
+            outputs_for_affine_pair["rpc_corrected"] = self.geometry_ops.apply_affine_correction_batch(batch["rpc_init"], affine_pred_relative)
         image_hw = (int(outputs["height_abs"].shape[-2]), int(outputs["height_abs"].shape[-1]))
 
         l_aff_grid, p_aff_grid = self.affine_grid(
-            affine_pred=affine_pred_for_loss,
+            affine_pred=affine_pred_direct,
             affine_gt_forward=batch["affine_gt_forward"].to(device=affine_pred.device, dtype=affine_pred.dtype),
             image_hw=image_hw,
             ref_view_idx=ref_idx,
         )
         l_aff_pair, p_aff_pair, aux_pair = self.affine_pair(outputs_for_affine_pair, batch)
-        l_aff_reg, p_aff_reg = self.affine_reg(affine_pred_for_loss, ref_view_idx=ref_idx)
-        l_aff_ref, p_aff_ref = self.affine_ref(
-            affine_pred,
-            image_hw=image_hw,
-            ref_view_idx=ref_idx,
-        )
+        l_aff_reg, p_aff_reg = self.affine_reg(affine_pred_direct, ref_view_idx=ref_idx)
 
         l_h, p_h = self.height_loss(
             outputs["height_abs"],
@@ -365,7 +357,6 @@ class GeometryPretrainObjective:
             w.lambda_affine_grid * l_aff_grid
             + w.lambda_affine_pair * l_aff_pair
             + w.lambda_affine_reg * l_aff_reg
-            + w.lambda_affine_ref * l_aff_ref
             + w_h_abs * l_h_optim
             + float(w.lambda_height_anchor) * l_h_anchor_optim
             + w_p_xy * l_p_xy_optim
@@ -385,7 +376,6 @@ class GeometryPretrainObjective:
             "loss_affine_grid": l_aff_grid,
             "loss_affine_pair": l_aff_pair,
             "loss_affine_reg": l_aff_reg,
-            "loss_affine_ref": l_aff_ref,
             "loss_height": l_h,
             "loss_height_anchor": l_h_anchor,
             "loss_height_z": l_h_z,
@@ -406,8 +396,15 @@ class GeometryPretrainObjective:
             "loss_feature_nce": l_nce,
             "loss_patch_match": l_patch_match,
             "metric_affine_grid_error_px_mean": p_aff_grid.get("affine_grid_error_px_mean", zero),
+            "metric_affine_grid_error_px_rmse": p_aff_grid.get("affine_grid_error_px_rmse", zero),
+            "metric_affine_grid_ref_error_px_mean": p_aff_grid.get("affine_grid_ref_error_px_mean", zero),
+            "metric_affine_grid_ref_error_px_rmse": p_aff_grid.get("affine_grid_ref_error_px_rmse", zero),
+            "metric_affine_grid_nonref_error_px_mean": p_aff_grid.get("affine_grid_nonref_error_px_mean", zero),
+            "metric_affine_grid_nonref_error_px_rmse": p_aff_grid.get("affine_grid_nonref_error_px_rmse", zero),
             "metric_affine_pair_error_px_mean": p_aff_pair.get("affine_pair_error_px_mean", zero),
-            "metric_ref_affine_identity_l2": p_aff_ref.get("ref_affine_identity_l2", zero),
+            "probe_affine_linear_frob_mean": p_aff_reg.get("affine_linear_frob_mean", zero),
+            "probe_affine_linear_ref_frob_mean": p_aff_reg.get("affine_linear_ref_frob_mean", zero),
+            "probe_affine_linear_nonref_frob_mean": p_aff_reg.get("affine_linear_nonref_frob_mean", zero),
             "metric_height_rmse": p_h.get("height_rmse", zero),
             "metric_height_mae": p_h.get("height_mae", zero),
             "metric_height_bias": p_h.get("height_bias", zero),
@@ -439,7 +436,6 @@ class GeometryPretrainObjective:
             "weight_affine_grid": float(w.lambda_affine_grid),
             "weight_affine_pair": float(w.lambda_affine_pair),
             "weight_affine_reg": float(w.lambda_affine_reg),
-            "weight_affine_ref": float(w.lambda_affine_ref),
             "weight_height": float(w_h_abs),
             "weight_height_anchor": float(w.lambda_height_anchor),
             "weight_height_meter_aux": float(w_h_meter_aux),
