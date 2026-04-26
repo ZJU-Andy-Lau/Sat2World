@@ -279,6 +279,7 @@ class Trainer:
             and hasattr(self.objective, "_replace_ref_affine_with_identity")
             and hasattr(model_ref, "rpc_ops")
         ):
+            # 渲染路径沿用相对几何语义：ref 视图固定为 identity，再据此重算 corrected RPC。
             aff_for_render = self.objective._replace_ref_affine_with_identity(outputs["affine_pred"], batch_dev.get("ref_view_idx", None))
             outputs_for_render = dict(outputs)
             outputs_for_render["rpc_corrected"] = model_ref.rpc_ops.apply_affine_correction_batch(batch_dev["rpc_init"], aff_for_render)

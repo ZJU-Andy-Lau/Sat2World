@@ -189,7 +189,6 @@ loss:
   lambda_affine_grid: 1.0
   lambda_affine_pair: 1.0
   lambda_affine_reg: 0.1
-  lambda_affine_ref: 1.0
   lambda_height: 1.0
   lambda_height_anchor: 0.5
   abs_keep_steps: 100000

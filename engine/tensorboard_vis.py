@@ -208,7 +208,6 @@ class TensorBoardMonitor:
             "loss_affine_grid",
             "loss_affine_pair",
             "loss_affine_reg",
-            "loss_affine_ref",
             "loss_height",
             "loss_height_anchor",
             "loss_point",
