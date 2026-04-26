@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import errno
 import math
-from typing import Any
+import os
+from pathlib import Path
+import time
+from typing import Any, Callable
 import warnings
 
 import numpy as np
@@ -48,16 +51,34 @@ class TensorBoardMonitor:
         max_pointcloud_points: int = 8192,
         flush_secs: int = 30,
         writer_kwargs: dict[str, Any] | None = None,
+        min_free_mb: float = 100.0,
+        disk_check_interval_sec: float = 1.0,
+        low_disk_warn_interval_sec: float = 300.0,
+        reopen_interval_sec: float = 30.0,
+        skip_when_low_disk: bool = True,
     ) -> None:
         """初始化 monitor。"""
         self.is_enabled = bool(is_enabled)
         self.enable_mesh = bool(enable_mesh)
         self.image_max_views = int(image_max_views)
         self.max_pointcloud_points = int(max_pointcloud_points)
+        self.log_dir = Path(log_dir)
+        self.flush_secs = int(flush_secs)
+        self.writer_kwargs = dict(writer_kwargs or {})
+        self.min_free_bytes = int(float(min_free_mb) * 1024 * 1024)
+        self.skip_when_low_disk = bool(skip_when_low_disk)
+        self.disk_check_interval_sec = float(disk_check_interval_sec)
+        self.low_disk_warn_interval_sec = float(low_disk_warn_interval_sec)
+        self.reopen_interval_sec = float(reopen_interval_sec)
+        self._last_disk_check_time = 0.0
+        self._last_disk_ok = True
+        self._last_free_bytes: int | None = None
+        self._last_low_disk_warn_time = 0.0
+        self._last_reopen_attempt_time = 0.0
+        self._writer_closed_by_disk_error = False
         self.writer = None
         if self.is_enabled and SummaryWriter is not None:
-            kwargs = writer_kwargs or {}
-            self.writer = SummaryWriter(log_dir=log_dir, flush_secs=flush_secs, **kwargs)
+            self._create_writer(op="init", tag=None)
         elif self.is_enabled:
             self.is_enabled = False
 
@@ -82,16 +103,102 @@ class TensorBoardMonitor:
     def _warn_write_failure(self, op: str, tag: str | None, exc: Exception) -> None:
         tag_msg = f", tag={tag}" if tag is not None else ""
         if self._is_disk_write_error(exc):
-            warnings.warn(f"TensorBoard {op} failed due to disk issue{tag_msg}: {exc}", RuntimeWarning, stacklevel=2)
+            warnings.warn(
+                f"TensorBoard {op} failed due to disk issue{tag_msg}, log_dir={self.log_dir}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         else:
-            warnings.warn(f"TensorBoard {op} failed{tag_msg}: {exc}", RuntimeWarning, stacklevel=2)
+            warnings.warn(f"TensorBoard {op} failed{tag_msg}, log_dir={self.log_dir}: {exc}", RuntimeWarning, stacklevel=2)
 
-    def _safe_call(self, op: str, fn, *, tag: str | None = None) -> bool:
+    def _resolve_statvfs_path(self) -> Path:
+        p = self.log_dir
+        while not p.exists():
+            if p.parent == p:
+                break
+            p = p.parent
+        return p
+
+    def _check_disk_space(self, *, op: str, tag: str | None = None) -> bool:
+        if not self.skip_when_low_disk:
+            return True
+        now = time.monotonic()
+        should_refresh = (now - self._last_disk_check_time) >= self.disk_check_interval_sec
+        if should_refresh:
+            self._last_disk_check_time = now
+            try:
+                stat_path = self._resolve_statvfs_path()
+                st = os.statvfs(stat_path)
+                free_bytes = int(st.f_bavail) * int(st.f_frsize)
+                self._last_free_bytes = free_bytes
+                self._last_disk_ok = free_bytes >= self.min_free_bytes
+            except Exception as exc:
+                self._last_disk_ok = False
+                self._last_free_bytes = None
+                warnings.warn(
+                    f"TensorBoard disk check failed for op={op}, tag={tag}, log_dir={self.log_dir}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        if self._last_disk_ok:
+            return True
+        if (now - self._last_low_disk_warn_time) >= self.low_disk_warn_interval_sec:
+            free_txt = "unknown" if self._last_free_bytes is None else str(self._last_free_bytes)
+            warnings.warn(
+                f"Skip TensorBoard {op} due to low disk space, tag={tag}, "
+                f"log_dir={self.log_dir}, free_bytes={free_txt}, threshold_bytes={self.min_free_bytes}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._last_low_disk_warn_time = now
+        return False
+
+    def _create_writer(self, *, op: str, tag: str | None) -> bool:
+        try:
+            self.writer = SummaryWriter(log_dir=str(self.log_dir), flush_secs=self.flush_secs, **self.writer_kwargs)
+            self._writer_closed_by_disk_error = False
+            return True
+        except Exception as exc:
+            self._warn_write_failure(op, tag, exc)
+            self.writer = None
+            if self._is_disk_write_error(exc):
+                self._writer_closed_by_disk_error = True
+            return False
+
+    def _ensure_writer(self, op: str, tag: str | None = None) -> bool:
+        if not self.is_enabled or SummaryWriter is None:
+            return False
+        if not self._check_disk_space(op=op, tag=tag):
+            return False
+        if self.writer is not None:
+            return True
+        now = time.monotonic()
+        if self._writer_closed_by_disk_error and (now - self._last_reopen_attempt_time) < self.reopen_interval_sec:
+            return False
+        self._last_reopen_attempt_time = now
+        return self._create_writer(op=f"{op}/reopen", tag=tag)
+
+    def _close_writer_noexcept(self, op: str = "close") -> None:
+        if self.writer is None:
+            return
+        writer = self.writer
+        self.writer = None
+        try:
+            writer.close()
+        except Exception as exc:
+            self._warn_write_failure(op, None, exc)
+
+    def _safe_writer_call(self, op: str, fn: Callable[[], None], *, tag: str | None = None) -> bool:
+        if not self._ensure_writer(op=op, tag=tag):
+            return False
         try:
             fn()
             return True
-        except Exception as e:
-            self._warn_write_failure(op, tag, e)
+        except Exception as exc:
+            self._warn_write_failure(op, tag, exc)
+            if self._is_disk_write_error(exc):
+                self._writer_closed_by_disk_error = True
+                self._close_writer_noexcept(op=f"{op}/close_after_error")
             return False
 
     def _route_scalar_tag(self, split: str, key: str) -> str | None:
@@ -136,7 +243,7 @@ class TensorBoardMonitor:
 
     def log_scalars(self, tag_prefix: str, scalar_dict: dict[str, Any], global_step: int) -> None:
         """记录标量。"""
-        if not self.is_enabled or self.writer is None:
+        if not self.is_enabled:
             return
         for k, v in scalar_dict.items():
             fv = self._to_float(v)
@@ -148,15 +255,15 @@ class TensorBoardMonitor:
                     continue
             else:
                 tag = k if "/" in k else f"{tag_prefix}/{k}"
-            self._safe_call("add_scalar", lambda tag=tag, fv=fv: self.writer.add_scalar(tag, fv, global_step), tag=tag)
+            self._safe_writer_call("add_scalar", lambda tag=tag, fv=fv: self.writer.add_scalar(tag, fv, global_step), tag=tag)
 
     def log_histograms(self, hist_dict: dict[str, Any], global_step: int) -> None:
         """记录直方图。"""
-        if not self.is_enabled or self.writer is None:
+        if not self.is_enabled:
             return
         for k, v in hist_dict.items():
             if torch.is_tensor(v) and v.numel() > 0:
-                self._safe_call("add_histogram", lambda k=k, v=v: self.writer.add_histogram(k, v.detach().float().cpu(), global_step), tag=k)
+                self._safe_writer_call("add_histogram", lambda k=k, v=v: self.writer.add_histogram(k, v.detach().float().cpu(), global_step), tag=k)
 
     def make_rgb_montage(self, images_vchw: torch.Tensor) -> torch.Tensor:
         """将 [V,3,H,W] 多视图图像拼接成横向 montage。"""
@@ -632,7 +739,7 @@ class TensorBoardMonitor:
         split: str,
     ) -> None:
         """记录固定监控样本图像面板。"""
-        if not self.is_enabled or self.writer is None:
+        if not self.is_enabled:
             return
 
         images = batch["images"]  # [B,V,3,H,W]
@@ -642,7 +749,7 @@ class TensorBoardMonitor:
         pred_p = outputs.get("point_abs", None)
 
         # 兼容旧面板（第一个样本） + 新面板（整个 batch 的全部视图）。
-        self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/input_rgb", self.make_rgb_montage(images[0]), global_step), tag=f"vis/{split}/input_rgb")
+        self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/input_rgb", self.make_rgb_montage(images[0]), global_step), tag=f"vis/{split}/input_rgb")
         b, v = int(images.shape[0]), int(images.shape[1])
         labeled_rows = []
         for bi in range(b):
@@ -651,7 +758,7 @@ class TensorBoardMonitor:
                 vid = int(view_ids[bi, vi].item()) if torch.is_tensor(view_ids) else vi
                 row.append(self._draw_label_on_image(images[bi, vi], f"view={vid}"))
             labeled_rows.append(torch.cat(row, dim=-1))
-        self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/I_crop", torch.cat(labeled_rows, dim=-2), global_step), tag=f"vis/{split}/I_crop")
+        self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/I_crop", torch.cat(labeled_rows, dim=-2), global_step), tag=f"vis/{split}/I_crop")
 
         if "affine_gt_forward" in batch:
             aff_fwd = batch["affine_gt_forward"]
@@ -665,7 +772,7 @@ class TensorBoardMonitor:
                     vid = int(view_ids[bi, vi].item()) if torch.is_tensor(view_ids) else vi
                     warped_row.append(self._draw_label_on_image(wi, f"view={vid}"))
                 warped.append(torch.cat(warped_row, dim=-1))
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/I_crop_af", torch.cat(warped, dim=-2), global_step), tag=f"vis/{split}/I_crop_af")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/I_crop_af", torch.cat(warped, dim=-2), global_step), tag=f"vis/{split}/I_crop_af")
 
         if "anchor_line_samp_true" in batch:
             anchors = batch["anchor_line_samp_true"]  # [B,V,K,2]
@@ -675,7 +782,7 @@ class TensorBoardMonitor:
             for bi in range(b):
                 row = [self._overlay_points_on_image(images[bi, vi], anchors[bi, vi]) for vi in range(v)]
                 overlays.append(torch.cat(row, dim=-1))
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/crop_anchor_overlay", torch.cat(overlays, dim=-2), global_step), tag=f"vis/{split}/crop_anchor_overlay")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/crop_anchor_overlay", torch.cat(overlays, dim=-2), global_step), tag=f"vis/{split}/crop_anchor_overlay")
 
         if height_gt is not None and pred_h is not None:
             gt = height_gt[0, 0]
@@ -683,9 +790,9 @@ class TensorBoardMonitor:
             hmask = batch.get("height_valid_mask", None)
             vm = hmask[0, 0] if torch.is_tensor(hmask) else None
             vmin, vmax = self._group_vrange([gt, ph], masks=[vm, vm], q_low=0.05, q_high=0.95)
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/height_gt", self.make_colormap_image(gt, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/height_gt")
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/height_pred", self.make_colormap_image(ph, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/height_pred")
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/height_error", self.make_abs_error_map(ph, gt), global_step), tag=f"vis/{split}/height_error")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/height_gt", self.make_colormap_image(gt, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/height_gt")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/height_pred", self.make_colormap_image(ph, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/height_pred")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/height_error", self.make_abs_error_map(ph, gt), global_step), tag=f"vis/{split}/height_error")
 
         if pred_p is not None and aux.get("gt_point_map", None) is not None:
             pz = pred_p[0, 0, 2]
@@ -693,50 +800,50 @@ class TensorBoardMonitor:
             hmask = batch.get("height_valid_mask", None)
             vm = hmask[0, 0] if torch.is_tensor(hmask) else None
             vmin, vmax = self._group_vrange([pz, gz], masks=[vm, vm], q_low=0.05, q_high=0.95)
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_z_pred", self.make_colormap_image(pz, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/point_z_pred")
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_z_gt", self.make_colormap_image(gz, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/point_z_gt")
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_z_error", self.make_abs_error_map(pz, gz), global_step), tag=f"vis/{split}/point_z_error")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_z_pred", self.make_colormap_image(pz, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/point_z_pred")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_z_gt", self.make_colormap_image(gz, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/point_z_gt")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_z_error", self.make_abs_error_map(pz, gz), global_step), tag=f"vis/{split}/point_z_error")
 
         if render_outputs is not None and render_outputs.get("rpc", None) is not None:
             rr = render_outputs["rpc"]
             rp = render_outputs["point"]
             if rr.get("num_targets", 0) > 0:
-                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_rpc_rgb", rr["rendered_rgb"][0], global_step), tag=f"vis/{split}/render_rpc_rgb")
-                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_target_rgb", rr["target_rgb"][0], global_step), tag=f"vis/{split}/render_target_rgb")
-                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_rpc_alpha", rr["rendered_alpha"][0], global_step), tag=f"vis/{split}/render_rpc_alpha")
+                self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_rpc_rgb", rr["rendered_rgb"][0], global_step), tag=f"vis/{split}/render_rpc_rgb")
+                self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_target_rgb", rr["target_rgb"][0], global_step), tag=f"vis/{split}/render_target_rgb")
+                self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_rpc_alpha", rr["rendered_alpha"][0], global_step), tag=f"vis/{split}/render_rpc_alpha")
                 if not rr["rendered_height"] is None:
                     rh_maps = [rr["rendered_height"][0]]
                     if rp is not None and rp.get("rendered_height", None) is not None:
                         rh_maps.append(rp["rendered_height"][0])
                     rvmin, rvmax = self._group_vrange(rh_maps, q_low=0.05, q_high=0.95)
-                    self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_rpc_height", self.make_colormap_image(rr["rendered_height"][0], vmin=rvmin, vmax=rvmax), global_step), tag=f"vis/{split}/render_rpc_height")
+                    self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_rpc_height", self.make_colormap_image(rr["rendered_height"][0], vmin=rvmin, vmax=rvmax), global_step), tag=f"vis/{split}/render_rpc_height")
             if rp.get("num_targets", 0) > 0:
-                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_point_rgb", rp["rendered_rgb"][0], global_step), tag=f"vis/{split}/render_point_rgb")
-                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_point_alpha", rp["rendered_alpha"][0], global_step), tag=f"vis/{split}/render_point_alpha")
+                self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_point_rgb", rp["rendered_rgb"][0], global_step), tag=f"vis/{split}/render_point_rgb")
+                self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_point_alpha", rp["rendered_alpha"][0], global_step), tag=f"vis/{split}/render_point_alpha")
                 if not rp["rendered_height"] is None:
                     rh_maps = [rp["rendered_height"][0]]
                     if rr is not None and rr.get("rendered_height", None) is not None:
                         rh_maps.append(rr["rendered_height"][0])
                     rvmin, rvmax = self._group_vrange(rh_maps, q_low=0.05, q_high=0.95)
-                    self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_point_height", self.make_colormap_image(rp["rendered_height"][0], vmin=rvmin, vmax=rvmax), global_step), tag=f"vis/{split}/render_point_height")
+                    self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/render_point_height", self.make_colormap_image(rp["rendered_height"][0], vmin=rvmin, vmax=rvmax), global_step), tag=f"vis/{split}/render_point_height")
 
         if "gaussian_confidence_rpc" in outputs:
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/gaussian_conf_rpc", self.make_colormap_image(outputs["gaussian_confidence_rpc"][0, 0]), global_step), tag=f"vis/{split}/gaussian_conf_rpc")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/gaussian_conf_rpc", self.make_colormap_image(outputs["gaussian_confidence_rpc"][0, 0]), global_step), tag=f"vis/{split}/gaussian_conf_rpc")
         if "gaussian_confidence_point" in outputs:
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/gaussian_conf_point", self.make_colormap_image(outputs["gaussian_confidence_point"][0, 0]), global_step), tag=f"vis/{split}/gaussian_conf_point")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/gaussian_conf_point", self.make_colormap_image(outputs["gaussian_confidence_point"][0, 0]), global_step), tag=f"vis/{split}/gaussian_conf_point")
         if "gaussian_opacity" in outputs:
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/gaussian_opacity", self.make_colormap_image(outputs["gaussian_opacity"][0, 0]), global_step), tag=f"vis/{split}/gaussian_opacity")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/gaussian_opacity", self.make_colormap_image(outputs["gaussian_opacity"][0, 0]), global_step), tag=f"vis/{split}/gaussian_opacity")
         if "gaussian_scale" in outputs:
             mag = outputs["gaussian_scale"][0, 0].norm(dim=0, keepdim=True)
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/gaussian_scale_mag", self.make_colormap_image(mag), global_step), tag=f"vis/{split}/gaussian_scale_mag")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/gaussian_scale_mag", self.make_colormap_image(mag), global_step), tag=f"vis/{split}/gaussian_scale_mag")
         if "gaussian_centers_rpc" in outputs and "gaussian_centers_point" in outputs:
             d = (outputs["gaussian_centers_rpc"][0, 0] - outputs["gaussian_centers_point"][0, 0]).norm(dim=0, keepdim=True)
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/center_disagreement", self.make_colormap_image(d), global_step), tag=f"vis/{split}/center_disagreement")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/center_disagreement", self.make_colormap_image(d), global_step), tag=f"vis/{split}/center_disagreement")
 
         if "affine_gt_forward" in batch and "affine_pred" in outputs:
             h, w = images.shape[-2:]
             hm = self.make_affine_residual_heatmap(batch["affine_gt_forward"][0, 0], outputs["affine_pred"][0, 0], h, w)
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/affine_residual", hm, global_step), tag=f"vis/{split}/affine_residual")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/affine_residual", hm, global_step), tag=f"vis/{split}/affine_residual")
 
             checker_pack = self._make_pairwise_affine_rpc_checkerboard(batch, outputs, global_step=global_step)
             if checker_pack is not None:
@@ -747,20 +854,20 @@ class TensorBoardMonitor:
                 else:
                     view_i, view_j = int(i), int(j)
                 checker_labeled = self._draw_label_on_image(checker, f"checker: view_i={view_i} / view_j={view_j}")
-                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/pair_rpc_j_corr", image_j_corr, global_step), tag=f"vis/{split}/pair_rpc_j_corr")
-                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/pair_rpc_i_to_j", image_i_to_j, global_step), tag=f"vis/{split}/pair_rpc_i_to_j")
-                self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/pair_rpc_checker", checker_labeled, global_step), tag=f"vis/{split}/pair_rpc_checker")
-                self._safe_call("add_text", lambda: self.writer.add_text(f"vis/{split}/pair_rpc_meta", f"pair(i,j)=({i},{j}), view=({view_i},{view_j})", global_step), tag=f"vis/{split}/pair_rpc_meta")
+                self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/pair_rpc_j_corr", image_j_corr, global_step), tag=f"vis/{split}/pair_rpc_j_corr")
+                self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/pair_rpc_i_to_j", image_i_to_j, global_step), tag=f"vis/{split}/pair_rpc_i_to_j")
+                self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/pair_rpc_checker", checker_labeled, global_step), tag=f"vis/{split}/pair_rpc_checker")
+                self._safe_writer_call("add_text", lambda: self.writer.add_text(f"vis/{split}/pair_rpc_meta", f"pair(i,j)=({i},{j}), view=({view_i},{view_j})", global_step), tag=f"vis/{split}/pair_rpc_meta")
 
         pairwise = self.make_pairwise_error_matrix(aux, v=int(images.shape[0]))
         if pairwise is not None:
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/pairwise_error_matrix", pairwise, global_step), tag=f"vis/{split}/pairwise_error_matrix")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/pairwise_error_matrix", pairwise, global_step), tag=f"vis/{split}/pairwise_error_matrix")
 
         patch_match_panel = self._make_patch_match_prediction_panel(batch, aux, global_step=global_step)
         if patch_match_panel is not None:
             panel, meta_text = patch_match_panel
-            self._safe_call("add_image", lambda: self.writer.add_image(f"vis/{split}/patch_match_pred_patch_grid", panel, global_step), tag=f"vis/{split}/patch_match_pred_patch_grid")
-            self._safe_call("add_text", lambda: self.writer.add_text(f"vis/{split}/patch_match_meta", meta_text, global_step), tag=f"vis/{split}/patch_match_meta")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/patch_match_pred_patch_grid", panel, global_step), tag=f"vis/{split}/patch_match_pred_patch_grid")
+            self._safe_writer_call("add_text", lambda: self.writer.add_text(f"vis/{split}/patch_match_meta", meta_text, global_step), tag=f"vis/{split}/patch_match_meta")
 
     def _sample_pointcloud(self, xyz_hw3: torch.Tensor, rgb_hw3: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h, w = xyz_hw3.shape[:2]
@@ -776,7 +883,7 @@ class TensorBoardMonitor:
 
     def log_pointclouds(self, batch: dict[str, Any], outputs: dict[str, Any], aux: dict[str, Any], global_step: int, split: str) -> None:
         """记录 GT/pred/rpc-center 点云（优先 add_mesh，失败 fallback）。"""
-        if not self.is_enabled or self.writer is None:
+        if not self.is_enabled:
             return
         if "point_abs" not in outputs or "gaussian_centers_rpc" not in outputs:
             return
@@ -791,7 +898,7 @@ class TensorBoardMonitor:
         def _mesh(tag: str, xyz_hw3: torch.Tensor):
             xyz, rgb = self._sample_pointcloud(xyz_hw3, img)
             if self.enable_mesh:
-                ok = self._safe_call(
+                ok = self._safe_writer_call(
                     "add_mesh",
                     lambda: self.writer.add_mesh(tag, vertices=xyz.unsqueeze(0), colors=(rgb.clamp(0, 1) * 255).to(torch.uint8).unsqueeze(0), global_step=global_step),
                     tag=tag,
@@ -811,7 +918,7 @@ class TensorBoardMonitor:
             bev[0, yi, xi] = zi
             bev[1, yi, xi] = 1.0 - zi
             bev[2, yi, xi] = 0.5
-            self._safe_call("add_image", lambda: self.writer.add_image(tag + "_bev", bev, global_step), tag=tag + "_bev")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(tag + "_bev", bev, global_step), tag=tag + "_bev")
 
         if gt is not None:
             _mesh(f"vis/{split}/pc_gt", gt)
@@ -824,15 +931,15 @@ class TensorBoardMonitor:
 
     def log_text(self, tag: str, text: str, global_step: int) -> None:
         """记录文本事件。"""
-        if self.is_enabled and self.writer is not None:
-            self._safe_call("add_text", lambda: self.writer.add_text(tag, text, global_step), tag=tag)
+        if self.is_enabled:
+            self._safe_writer_call("add_text", lambda: self.writer.add_text(tag, text, global_step), tag=tag)
 
     def flush(self) -> None:
         """强制 flush。"""
-        if self.is_enabled and self.writer is not None:
-            self._safe_call("flush", lambda: self.writer.flush())
+        if self.is_enabled:
+            self._safe_writer_call("flush", lambda: self.writer.flush())
 
     def close(self) -> None:
         """关闭 writer。"""
-        if self.is_enabled and self.writer is not None:
-            self._safe_call("close", lambda: self.writer.close())
+        if self.is_enabled:
+            self._close_writer_noexcept(op="close")
