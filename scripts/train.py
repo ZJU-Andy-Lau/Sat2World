@@ -111,7 +111,6 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
     scfg.detail_patch_size = int(m.get("detail_patch_size", scfg.detail_patch_size))
     scfg.detail_token_dim = int(m.get("detail_token_dim", scfg.detail_token_dim))
     scfg.patch_match_dim = int(m.get("patch_match_dim", scfg.patch_match_dim))
-    scfg.patch_match_heads = int(m.get("patch_match_heads", scfg.patch_match_heads))
     scfg.patch_match_layers = int(m.get("patch_match_layers", scfg.patch_match_layers))
     return Sat2World(scfg)
 

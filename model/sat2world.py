@@ -87,7 +87,6 @@ class Sat2WorldCfg:
     detail_patch_size: int = 16
     detail_token_dim: int = 1024
     patch_match_dim: int = 256
-    patch_match_heads: int = 4
     patch_match_layers: int = 2
 
 
@@ -128,7 +127,6 @@ class Sat2World(nn.Module):
             PatchMatcherCfg(
                 in_dim=self.backbone.embed_dim,
                 match_dim=int(cfg.patch_match_dim),
-                num_heads=int(cfg.patch_match_heads),
                 num_layers=int(cfg.patch_match_layers),
             )
         )
