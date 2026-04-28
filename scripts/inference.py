@@ -506,8 +506,15 @@ def save_rgb_tensor(path: Path, chw_rgb: torch.Tensor) -> None:
     Image.fromarray(arr_u8).save(path)
 
 
-def write_ply_xyz(path: Path, xyz: np.ndarray) -> None:
+def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
     xyz = np.asarray(xyz, dtype=np.float32)
+    rgb = np.asarray(rgb, dtype=np.uint8)
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError(f"xyz must be [N,3], got {tuple(xyz.shape)}")
+    if rgb.ndim != 2 or rgb.shape[1] != 3:
+        raise ValueError(f"rgb must be [N,3], got {tuple(rgb.shape)}")
+    if xyz.shape[0] != rgb.shape[0]:
+        raise ValueError(f"xyz/rgb count mismatch: {xyz.shape[0]} vs {rgb.shape[0]}")
     with open(path, "w", encoding="utf-8") as f:
         f.write("ply\n")
         f.write("format ascii 1.0\n")
@@ -515,19 +522,87 @@ def write_ply_xyz(path: Path, xyz: np.ndarray) -> None:
         f.write("property float x\n")
         f.write("property float y\n")
         f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
         f.write("end_header\n")
-        for p in xyz:
-            f.write(f"{float(p[0]):.6f} {float(p[1]):.6f} {float(p[2]):.6f}\n")
+        for p, c in zip(xyz, rgb):
+            f.write(f"{float(p[0]):.6f} {float(p[1]):.6f} {float(p[2]):.6f} {int(c[0])} {int(c[1])} {int(c[2])}\n")
 
 
-def flatten_centers_map(centers_bv3hw: torch.Tensor, mask_bv1hw: torch.Tensor | None = None, stride: int = 1) -> np.ndarray:
-    c = centers_bv3hw[0].permute(0, 2, 3, 1).reshape(-1, 3)
+def point_map_norm_to_local_meter(point_map_bv3hw: torch.Tensor, scene_xy_scale_b2: torch.Tensor | None) -> torch.Tensor:
+    """将 point path 从归一化 (x,y,z) 转换为局部米制 (x,y,z)，仅反 scale，不加 center。"""
+    if scene_xy_scale_b2 is None:
+        return point_map_bv3hw
+    if not torch.is_tensor(scene_xy_scale_b2):
+        raise TypeError("scene_xy_scale must be tensor when provided")
+    if scene_xy_scale_b2.ndim != 2 or scene_xy_scale_b2.shape[-1] != 2:
+        raise ValueError(f"scene_xy_scale must be [B,2], got {tuple(scene_xy_scale_b2.shape)}")
+    if scene_xy_scale_b2.shape[0] != point_map_bv3hw.shape[0]:
+        raise ValueError("scene_xy_scale batch size mismatch with point map")
+    out = point_map_bv3hw.clone()
+    scale_x = scene_xy_scale_b2[:, 1].to(device=out.device, dtype=out.dtype).view(-1, 1, 1, 1, 1)
+    scale_y = scene_xy_scale_b2[:, 0].to(device=out.device, dtype=out.dtype).view(-1, 1, 1, 1, 1)
+    out[:, :, 0:1] = out[:, :, 0:1] * scale_x
+    out[:, :, 1:2] = out[:, :, 1:2] * scale_y
+    return out
+
+
+def flatten_xyzrgb_from_maps(
+    centers_bv3hw: torch.Tensor,
+    images_bv3hw: torch.Tensor,
+    mask_bv1hw: torch.Tensor | None = None,
+    stride: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    if centers_bv3hw.ndim != 5 or centers_bv3hw.shape[2] != 3:
+        raise ValueError(f"centers must be [B,V,3,H,W], got {tuple(centers_bv3hw.shape)}")
+    if images_bv3hw.ndim != 5 or images_bv3hw.shape[2] != 3:
+        raise ValueError(f"images must be [B,V,3,H,W], got {tuple(images_bv3hw.shape)}")
+    if centers_bv3hw.shape[0] != images_bv3hw.shape[0] or centers_bv3hw.shape[1] != images_bv3hw.shape[1]:
+        raise ValueError("centers/images batch-view shape mismatch")
+
+    b, v, _, hc, wc = centers_bv3hw.shape
+    _, _, _, hi, wi = images_bv3hw.shape
+    images = images_bv3hw
+    if (hi, wi) != (hc, wc):
+        images = torch.nn.functional.interpolate(
+            images_bv3hw.reshape(b * v, 3, hi, wi),
+            size=(hc, wc),
+            mode="bilinear",
+            align_corners=False,
+        ).reshape(b, v, 3, hc, wc)
+
+    mask = None
     if mask_bv1hw is not None:
-        m = mask_bv1hw[0].reshape(-1) > 0.5
-        c = c[m]
+        if mask_bv1hw.ndim != 5 or mask_bv1hw.shape[2] != 1:
+            raise ValueError(f"mask must be [B,V,1,H,W], got {tuple(mask_bv1hw.shape)}")
+        if mask_bv1hw.shape[0] != b or mask_bv1hw.shape[1] != v:
+            raise ValueError("mask batch-view shape mismatch")
+        hm, wm = int(mask_bv1hw.shape[-2]), int(mask_bv1hw.shape[-1])
+        if (hm, wm) != (hc, wc):
+            mask = torch.nn.functional.interpolate(
+                mask_bv1hw.reshape(b * v, 1, hm, wm).to(dtype=centers_bv3hw.dtype),
+                size=(hc, wc),
+                mode="nearest",
+            ).reshape(b, v, 1, hc, wc)
+        else:
+            mask = mask_bv1hw.to(dtype=centers_bv3hw.dtype)
+
+    xyz = centers_bv3hw.permute(0, 1, 3, 4, 2).reshape(-1, 3)
+    rgb = images.permute(0, 1, 3, 4, 2).reshape(-1, 3).clamp(0.0, 1.0)
+    if mask is not None:
+        m = (mask.reshape(-1) > 0.5)
+        xyz = xyz[m]
+        rgb = rgb[m]
+
     st = max(int(stride), 1)
-    c = c[::st]
-    return c.detach().cpu().numpy().astype(np.float32)
+    xyz = xyz[::st]
+    rgb = rgb[::st]
+    if xyz.shape[0] != rgb.shape[0]:
+        raise RuntimeError("xyz/rgb count mismatch after mask/stride")
+    xyz_np = xyz.detach().cpu().to(torch.float32).numpy()
+    rgb_np = (rgb.detach().cpu().to(torch.float32).numpy() * 255.0 + 0.5).astype(np.uint8)
+    return xyz_np, rgb_np
 
 
 def _compute_basic_stats(x: torch.Tensor) -> dict[str, float]:
@@ -1003,16 +1078,26 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
                 scene_xy_scale=scene_scale_for_rpc,
                 downsample_factor=1,
             )
-            centers_point = outputs["point_abs"]
+            centers_point = point_map_norm_to_local_meter(outputs["point_abs"], batch.get("scene_xy_scale", None))
 
             stride = max(int(args.pointcloud_sample_stride), 1)
-            xyz_rpc = flatten_centers_map(centers_rpc, mask_bv1hw=batch["height_valid_mask"], stride=stride)
-            xyz_point = flatten_centers_map(centers_point, mask_bv1hw=batch["height_valid_mask"], stride=stride)
+            xyz_rpc, rgb_rpc = flatten_xyzrgb_from_maps(
+                centers_rpc,
+                batch["images"],
+                mask_bv1hw=batch.get("height_valid_mask", None),
+                stride=stride,
+            )
+            xyz_point, rgb_point = flatten_xyzrgb_from_maps(
+                centers_point,
+                batch["images"],
+                mask_bv1hw=batch.get("height_valid_mask", None),
+                stride=stride,
+            )
 
             ply_rpc = save_dir / "cloud_rpc_height.ply"
             ply_point = save_dir / "cloud_point_path.ply"
-            write_ply_xyz(ply_rpc, xyz_rpc)
-            write_ply_xyz(ply_point, xyz_point)
+            write_ply_xyzrgb(ply_rpc, xyz_rpc, rgb_rpc)
+            write_ply_xyzrgb(ply_point, xyz_point, rgb_point)
             results["pointcloud"] = {
                 "rpc_height_ply": str(ply_rpc),
                 "point_path_ply": str(ply_point),
