@@ -116,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkerboard-cell-size", type=int, default=32)
     p.add_argument("--checkerboard-point-stride", type=int, default=2)
     p.add_argument("--checkerboard-include-ref", action="store_true")
-    p.add_argument("--height-type", str, choices=['gt','pred'], default='gt')
+    p.add_argument("--height-type", type=str, choices=['gt','pred'], default='gt')
 
     p.add_argument("--viz-height", action="store_true")
     p.add_argument("--height-vmin-quantile", type=float, default=0.05)
