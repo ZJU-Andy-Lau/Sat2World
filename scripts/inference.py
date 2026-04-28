@@ -656,7 +656,7 @@ def save_checkerboard_pair_panel(
     if height_type == 'gt':
         h_j_map = batch["height_gt"][bi, j]
     else:
-        h_j_map = batch["height_abs"][bi, j]
+        h_j_map = outputs["height_abs"][bi, j]
     if h_j_map.ndim == 3 and h_j_map.shape[0] == 1:
         h_j_map = h_j_map[0]
     h_j_flat = h_j_map.detach().to(device=image_j_corr.device, dtype=torch.float32).reshape(-1)
