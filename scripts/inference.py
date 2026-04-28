@@ -116,6 +116,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkerboard-cell-size", type=int, default=32)
     p.add_argument("--checkerboard-point-stride", type=int, default=2)
     p.add_argument("--checkerboard-include-ref", action="store_true")
+    p.add_argument("--height-type", str, choices=['gt','pred'], default='gt')
 
     p.add_argument("--viz-height", action="store_true")
     p.add_argument("--height-vmin-quantile", type=float, default=0.05)
@@ -626,7 +627,7 @@ def save_checkerboard_pair_panel(
     cell_size: int,
     point_stride: int,
     out_path: Path,
-    geometry_ops: Any,
+    height_type: str
 ) -> dict[str, Any]:
     i, j = int(pair[0]), int(pair[1])
     del point_stride
@@ -652,7 +653,10 @@ def save_checkerboard_pair_panel(
     yy, xx = torch.meshgrid(line, samp, indexing="ij")
     line_flat = yy.reshape(-1)
     samp_flat = xx.reshape(-1)
-    h_j_map = batch["height_gt"][bi, j]
+    if height_type == 'gt':
+        h_j_map = batch["height_gt"][bi, j]
+    else:
+        h_j_map = batch["height_abs"][bi, j]
     if h_j_map.ndim == 3 and h_j_map.shape[0] == 1:
         h_j_map = h_j_map[0]
     h_j_flat = h_j_map.detach().to(device=image_j_corr.device, dtype=torch.float32).reshape(-1)
@@ -750,6 +754,8 @@ def save_height_panel(
     if vmax_f <= vmin + 1e-6:
         vmax_f = vmin + 1e-6
 
+    dif = torch.abs(h_pred[valid] - h_gt[valid]).to(torch.float32)
+
     pred_rgb = _apply_colormap(h_pred, vmin=vmin, vmax=vmax_f, cmap_name=cmap_name)
     gt_rgb = _apply_colormap(h_gt, vmin=vmin, vmax=vmax_f, cmap_name=cmap_name)
     h, w = pred_rgb.shape[:2]
@@ -757,7 +763,8 @@ def save_height_panel(
     panel.paste(Image.fromarray(pred_rgb), (0, 0))
     panel.paste(Image.fromarray(gt_rgb), (w, 0))
     panel.save(out_path)
-    return {"panel_path": str(out_path), "vmin": float(vmin), "vmax": float(vmax_f), "cmap": str(cmap_name)}
+    return {"panel_path": str(out_path), "vmin": float(vmin), "vmax": float(vmax_f), "cmap": str(cmap_name),
+            'dif_max':float(dif.max()), 'dif_min':float(dif.min()), 'dif_mean':float(dif.mean()), 'dif_median:':float(dif.median())}
 
 
 def _look_at_w2c_np(eye: np.ndarray, target: np.ndarray, up_hint: np.ndarray) -> np.ndarray:
@@ -1111,7 +1118,7 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
                 cell_size=int(args.checkerboard_cell_size),
                 point_stride=int(args.checkerboard_point_stride),
                 out_path=checker_path,
-                geometry_ops=model.rpc_ops,
+                height_type=args.height_type,
             )
 
     if bool(args.viz_height):
