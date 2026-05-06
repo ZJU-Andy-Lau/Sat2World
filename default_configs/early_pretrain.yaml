@@ -1,0 +1,243 @@
+system:
+  project_name: Sat2World
+  experiment_name: default_exp
+  work_dir: work_dirs/early_pretrain_0428_1
+  output_dir: work_dirs/early_pretrain_0428_1
+  seed: 2604281
+  deterministic: false
+  cudnn_benchmark: true
+  allow_tf32: true
+  device: cuda
+  compile_model: false
+  ddp_backend: nccl
+  auto_resume: false
+  checkpoint_match_by_shape: true
+  checkpoint_load_model_only: true
+  checkpoint_model_strict: false
+  resume_path: ""
+  checkpoint_path: ""
+  eval_only: false
+
+data:
+  train:
+    root: ./data/JAX_train
+    max_view_num: 4
+    min_view_num: 2
+    samples_per_scene: 20
+    min_views: 2
+    apply_perturbation: true
+    synthetic_perturbation_in_eval: true
+    cache_rpc: true
+    cache_image: false
+    cache_height: false
+    base_seed: 2604281
+    reference_policy: first
+    strict_same_hw: true
+    crop_size: 256
+    anchors_per_view_per_sample: 128
+    fit_pinhole_in_dataset: false
+    fit_pinhole_keep_diagnostics: false
+    perturb_cfg:
+      tx_range: [ -5.0, 5.0 ]
+      ty_range: [ -5.0, 5.0 ]
+      scale_range: [ -0.0001, 0.0001 ]
+      shear_range: [ -0.0001, 0.0001 ]
+  val:
+    root: ./data/JAX_val
+    max_view_num: 6
+    min_view_num: 3
+    samples_per_scene: 1
+    min_views: 2
+    apply_perturbation: true
+    synthetic_perturbation_in_eval: true
+    cache_rpc: true
+    cache_image: false
+    cache_height: false
+    base_seed: 7618
+    reference_policy: first
+    strict_same_hw: true
+    crop_size: 256
+    anchors_per_view_per_sample: 128
+    fit_pinhole_in_dataset: false
+    fit_pinhole_keep_diagnostics: false
+    perturb_cfg:
+      tx_range: [ -5.0, 5.0 ]
+      ty_range: [ -5.0, 5.0 ]
+      scale_range: [ -0.0001, 0.0001 ]
+      shear_range: [ -0.0001, 0.0001 ]
+  test:
+    root: ./data/JAX_val
+    crop_size: 256
+  loader:
+    batch_size: 1
+    val_batch_size: 1
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+    drop_last: true
+
+geometry:
+  rpc_dtype: float64
+  net_dtype: float32
+
+model:
+  dino_weight_path: "./weights/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
+  pretrained: true
+  freeze_backbone: true
+  patch_size: 16
+  embed_dim: 1024
+  geometry_token_dim: 256
+  fusion_dim: 1024
+  encoder_depth: 8
+  encoder_num_scene_tokens: 4
+  intermediate_layer_idx: [5, 11, 17, 23]
+  dense_pos_embed: true
+  dense_down_ratio: 1
+  dense_frames_chunk_size: 8
+  task_adapter_depth: 2
+  nce_layer_index: 3
+  nce_projector_dim: 256
+  nce_projector_hidden_dim: 512
+  detail_patch_encoder_enable: true
+  detail_patch_size: 16
+  detail_token_dim: 1024
+  patch_match_dim: 256
+  patch_match_heads: 4
+  patch_match_layers: 2
+  encoder_num_heads: 8
+  encoder_ffn_ratio: 4.0
+  encoder_dropout: 0.0
+  encoder_aa_order: [frame, global]
+  encoder_aa_block_size: 1
+  encoder_qkv_bias: true
+  encoder_proj_bias: true
+  encoder_ffn_bias: true
+  encoder_qk_norm: true
+  encoder_fused_attn: true
+  encoder_rope_freq: 100.0
+  encoder_drop_path_rate: 0.0
+  encoder_layerscale_init_values: 0.01
+  affine_diag_scale: 0.01
+  affine_offdiag_scale: 0.01
+  affine_trans_scale: 30.0
+  height_anchor_scale: 200.0
+  height_local_scale: 30.0
+  height_z_max: 4.0
+  point_bins_xy: 33
+  point_bin_size_xy: 0.1
+  point_fine_range_xy: 0.05
+  center_downsample_stage_steps: [0,100,200]
+  center_downsample_factors: [4,2,1]
+  enable_gaussian_branch: false
+  sh_dim: 48
+  gaussian_scale_epsilon: 1.0e-4
+  output_raw_logits: true
+
+loss:
+  lambda_affine_grid: 5.0
+  lambda_affine_pair: 1.0
+  lambda_affine_reg: 0.1
+  lambda_height: 1.0
+  lambda_height_anchor: 0.5
+  abs_keep_steps: 100000
+  lambda_point: 1.0
+  lambda_point_xy: 1.0
+  lambda_point_z: 1.0
+  lambda_height_meter_aux: 1.0e-3
+  lambda_height_anchor_meter_aux: 1.0e-3
+  lambda_point_z_meter_aux: 1.0e-3
+  lambda_point_pair: 0.5
+  lambda_height_reproj: 0.5
+  lambda_point_reproj: 0.5
+  lambda_normal_height: 1.0
+  lambda_normal_point: 1.0
+  lambda_patch_match: 0.5
+  match_max_pair: 12
+  patch_match_subpix_weight: 0.25
+  patch_match_max_pairs: 4096
+  normal_w_cos: 1.0
+  normal_w_l1: 0.5
+  normal_eps: 1.0e-6
+  normal_sign_invariant: true
+  normal_detach_gt: true
+  lambda_feature_nce: 10.0
+  feature_nce_temperature: 0.1
+  feature_nce_max_pairs: 4096
+  point_pair_grid_h: 64
+  point_pair_grid_w: 64
+  height_beta: 1.0
+  height_z_beta_meter: 1.0
+  height_anchor_z_beta_meter: 1.0
+  point_beta: 1.0
+  point_z_beta_meter: 1.0
+  affine_grid_h: 16
+  affine_grid_w: 16
+  anchors_per_pair: 256
+  max_pairs: 12
+  sample_from_valid_only: true
+
+optim:
+  type: adamw
+  base_lr: 2.0e-5
+  backbone_lr_mult: 0.5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  scheduler: warmup_cosine
+  warmup_steps: 600
+  max_steps: 30000
+  min_lr_ratio: 0.01
+
+train:
+  max_epochs: 200
+  accumulate_steps: 2
+  grad_clip_norm: 1.0
+  grad_clip_mode: grouped
+  grad_clip_group_norm: 1.0
+  amp_dtype: bf16
+  enable_grad_scaler: false
+  enable_render_train: false
+  enable_render_val: false
+  skip_nan_batch: true
+  log_interval: 1
+  hist_interval: 100000
+  vis_interval: 100
+  val_interval: 1000000
+  ckpt_interval: 1000000
+  save_every_epoch: true
+  validate_first: false
+  validate_each_epoch: true
+  best_metric: loss_total
+  best_mode: min
+  max_train_steps_per_epoch: -1
+  max_val_steps: -1
+  device_sanity_check: false
+  enable_fixed_monitor_cache: true
+
+logging:
+  tensorboard:
+    enable: true
+    log_dir: work_dirs/early_pretrain_0428_1/tb
+    enable_mesh: true
+    image_max_views: 4
+    max_pointcloud_points: 8192
+    flush_secs: 30
+    min_free_mb: 100
+    disk_check_interval_sec: 1.0
+    low_disk_warn_interval_sec: 300
+    reopen_interval_sec: 30
+    skip_when_low_disk: true
+    fixed_monitor_samples: 1
+    record_histograms: true
+    record_pointcloud: true
+
+checkpoint:
+  checkpoints_dir: work_dirs/early_pretrain_0428_1/checkpoints
+  save_last: true
+  save_best: true
+  best_metric_name: loss_total
+  best_metric_mode: min
+  keep_last_n: 5
+  save_optimizer_state: true
+  save_scheduler_state: true
