@@ -1,7 +1,4 @@
-"""loss.point_loss
-
-实现点云监督损失 PointMapLoss。
-"""
+"""Point supervision losses for normalized raw lat/lon plane coordinates."""
 
 from __future__ import annotations
 
@@ -10,30 +7,24 @@ from typing import Any
 import torch
 
 from loss.common import masked_huber_loss, masked_l1_loss, masked_reduce, safe_rmse
-from loss.point_pair_loss import point_map_to_metric
 
 
-class PointMapLoss:
-    """点云图监督损失。
+class PointLatLonLoss:
+    """Plane-coordinate point loss in normalized raw lat/lon space.
 
-    功能:
-        在线使用 rpc_gt + height_gt 构造 gt_point_map，
-        对 point_abs 进行监督，并输出点云误差与 anchor 偏移指标。
-
-    成员变量:
-        geometry_ops: 几何接口实例，用于 RPC 投影/反投影。
-        beta: Huber 参数。
-        _grid_cache: 图像网格缓存，key=(H,W,device,dtype)。
+    The point head predicts ``point_latlon_norm`` with shape [B,V,2,H,W]
+    (lat_norm/lon_norm).  GT is built from ``rpc_gt + height_gt`` by direct raw
+    lat/lon inverse projection and normalized with batch ``scene_latlon_*``.
+    Metric-plane errors are approximate logging metrics only and are not used as
+    optimization targets.
     """
 
     def __init__(self, geometry_ops: Any, beta: float = 1.0) -> None:
-        """初始化损失类。"""
         self.geometry_ops = geometry_ops
         self.beta = float(beta)
         self._grid_cache: dict[tuple[int, int, str, str], torch.Tensor] = {}
 
     def _get_grid(self, h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """获取或创建 [H,W,2] 像素网格（line,samp）。"""
         key = (h, w, str(device), str(dtype))
         if key not in self._grid_cache:
             yy = torch.arange(h, device=device, dtype=dtype)
@@ -44,80 +35,54 @@ class PointMapLoss:
 
     def __call__(
         self,
-        point_abs: torch.Tensor,
-        point_anchor: torch.Tensor,
+        point_latlon_norm: torch.Tensor,
+        point_latlon_anchor: torch.Tensor,
         batch: dict[str, Any],
         return_aux: bool = False,
         aux_include_full_gt_map: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
-        """计算点云损失。
-
-        输入:
-            point_abs: [B,V,3,H,W]。
-            point_anchor: [B,V,3,H,W]。
-            batch: 至少包含 rpc_gt/height_gt/height_valid_mask/scene_xy_center/scene_xy_scale。
-            return_aux: 是否返回辅助监督张量（默认 False）。
-            aux_include_full_gt_map: 当 return_aux=True 时，是否额外返回完整 gt_point_map_metric。
-
-        输出:
-            loss: 标量。
-            probe: 误差指标字典。
-            aux: 辅助字典，默认为空；return_aux=True 时可含 gt_point_map。
-        """
-        height_gt = batch["height_gt"].to(device=point_abs.device, dtype=point_abs.dtype)
-        height_valid_mask = batch["height_valid_mask"].to(device=point_abs.device, dtype=point_abs.dtype)
-        rpc_gt = batch["rpc_gt"]
-        scene_xy_center = batch.get("scene_xy_center", None)
-        scene_xy_scale = batch.get("scene_xy_scale", None)
-        if scene_xy_scale is not None and torch.is_tensor(scene_xy_scale):
-            scene_xy_scale = scene_xy_scale.to(device=point_abs.device, dtype=point_abs.dtype)
-
-        b, v, _, h, w = point_abs.shape
-        image_grid = self._get_grid(h, w, point_abs.device, point_abs.dtype)
-
-        gt_point_map = self.geometry_ops.centers_from_rpc_and_height_batch(
-            corrected_rpc_batch=rpc_gt,
-            pixel_grid=image_grid,
-            height_abs=height_gt,
-            scene_xy_center=scene_xy_center,
-            scene_xy_scale=scene_xy_scale,
+        del aux_include_full_gt_map
+        if point_latlon_norm.ndim != 5 or point_latlon_norm.shape[2] != 2:
+            raise ValueError(f"point_latlon_norm must be [B,V,2,H,W], got {tuple(point_latlon_norm.shape)}")
+        device = point_latlon_norm.device
+        dtype = point_latlon_norm.dtype
+        b, v, _, h, w = point_latlon_norm.shape
+        height_gt = batch["height_gt"].to(device=device, dtype=dtype)
+        mask = batch["height_valid_mask"].to(device=device, dtype=dtype)
+        center = batch["scene_latlon_center"].to(device=device, dtype=dtype)
+        scale = batch["scene_latlon_scale"].to(device=device, dtype=dtype).clamp_min(1e-12)
+        grid = self._get_grid(h, w, device, dtype)
+        line = grid[..., 0].reshape(-1).view(1, 1, -1).expand(b, v, -1)
+        samp = grid[..., 1].reshape(-1).view(1, 1, -1).expand(b, v, -1)
+        heights = height_gt[:, :, 0].reshape(b, v, -1)
+        lat, lon = self.geometry_ops.linesamp_to_latlon_batch(batch["rpc_gt"], line, samp, heights)
+        lat = lat.to(device=device, dtype=dtype).view(b, v, h, w)
+        lon = lon.to(device=device, dtype=dtype).view(b, v, h, w)
+        gt = torch.stack(
+            [
+                (lat - center[:, 0].view(b, 1, 1, 1)) / scale[:, 0].view(b, 1, 1, 1),
+                (lon - center[:, 1].view(b, 1, 1, 1)) / scale[:, 1].view(b, 1, 1, 1),
+            ],
+            dim=2,
         )
-
-        point_abs_metric = point_map_to_metric(point_abs, scene_xy_scale if torch.is_tensor(scene_xy_scale) else None)
-        gt_point_map_metric = point_map_to_metric(gt_point_map, scene_xy_scale if torch.is_tensor(scene_xy_scale) else None)
-        point_anchor_metric = point_map_to_metric(point_anchor, scene_xy_scale if torch.is_tensor(scene_xy_scale) else None)
-
-        loss_xy = masked_huber_loss(point_abs_metric[:, :, 0:2], gt_point_map_metric[:, :, 0:2], mask=height_valid_mask, beta=self.beta)
-        loss_z = masked_huber_loss(point_abs_metric[:, :, 2:3], gt_point_map_metric[:, :, 2:3], mask=height_valid_mask, beta=self.beta)
-        loss = loss_xy + loss_z
-
-        d = point_abs_metric - gt_point_map_metric
-        dx2 = d[:, :, 0:1].square()
-        dy2 = d[:, :, 1:2].square()
-        dz2 = d[:, :, 2:3].square()
-
-        norm_xyz = torch.sqrt((d.square().sum(dim=2, keepdim=True)).clamp_min(1e-8))
-        anchor_delta = point_abs_metric - point_anchor_metric
-        anchor_norm = torch.sqrt((anchor_delta.square().sum(dim=2, keepdim=True)).clamp_min(1e-8))
-
+        loss = masked_huber_loss(point_latlon_norm, gt, mask=mask, beta=self.beta)
+        diff = point_latlon_norm.detach() - gt.detach()
+        norm_l1 = masked_l1_loss(point_latlon_norm.detach(), gt.detach(), mask=mask)
+        norm_rmse = safe_rmse(diff.square().sum(dim=2, keepdim=True), mask=mask)
+        lat_center_rad = torch.deg2rad(center[:, 0].view(b, 1, 1, 1))
+        dlat_m = diff[:, :, 0:1] * scale[:, 0].view(b, 1, 1, 1, 1) * 111320.0
+        dlon_m = diff[:, :, 1:2] * scale[:, 1].view(b, 1, 1, 1, 1) * 111320.0 * torch.cos(lat_center_rad).view(b, 1, 1, 1, 1)
+        plane_m = torch.sqrt((dlat_m.square() + dlon_m.square()).clamp_min(1e-8))
+        anchor_delta = point_latlon_norm.detach() - point_latlon_anchor.detach()
         probe = {
-            "point_xy_meter_loss": loss_xy.detach(),
-            "point_z_meter_loss": loss_z.detach(),
-            "point_xyz_rmse": safe_rmse(dx2 + dy2 + dz2, mask=height_valid_mask).detach(),
-            "point_xy_rmse": safe_rmse(dx2 + dy2, mask=height_valid_mask).detach(),
-            "point_z_rmse": safe_rmse(dz2, mask=height_valid_mask).detach(),
-            "point_xyz_mae": masked_reduce(d.abs().mean(dim=2, keepdim=True), mask=height_valid_mask, reduce="mean").detach(),
-            "point_anchor_displacement_mean": masked_reduce(anchor_norm, mask=height_valid_mask, reduce="mean").detach(),
-            "point_anchor_displacement_z_mean": masked_reduce(anchor_delta[:, :, 2:3].abs(), mask=height_valid_mask, reduce="mean").detach(),
+            "point_latlon_norm_loss": loss.detach(),
+            "point_latlon_norm_rmse": norm_rmse.detach(),
+            "point_latlon_norm_mae": norm_l1.detach(),
+            "point_plane_error_m_mean": masked_reduce(plane_m, mask=mask, reduce="mean").detach(),
+            "point_plane_error_m_rmse": safe_rmse(plane_m.square(), mask=mask).detach(),
+            "point_latlon_anchor_displacement_mean": masked_reduce(anchor_delta.abs().mean(dim=2, keepdim=True), mask=mask, reduce="mean").detach(),
         }
-
-        aux: dict[str, Any] = {}
-        aux["loss_point_xy_meter"] = loss_xy
-        aux["loss_point_z_meter"] = loss_z
-        aux["loss_point_meter"] = loss
+        aux: dict[str, Any] = {"loss_point_latlon_norm": loss}
         if return_aux:
-            aux["gt_point_z_meter"] = gt_point_map_metric[:, :, 2:3].contiguous()
-            if aux_include_full_gt_map:
-                aux["gt_point_map_metric"] = gt_point_map_metric
-                aux["gt_point_map"] = gt_point_map_metric
+            aux["gt_point_latlon_norm"] = gt.detach()
         return loss, probe, aux

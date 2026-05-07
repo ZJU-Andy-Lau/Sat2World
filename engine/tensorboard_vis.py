@@ -214,7 +214,6 @@ class TensorBoardMonitor:
             "loss_point_reproj",
             "loss_height_reproj",
             "loss_point_pair",
-            "loss_normal_point",
             "loss_feature_nce",
             "loss_patch_match",
             # "loss_render_rpc",
@@ -227,7 +226,6 @@ class TensorBoardMonitor:
             # "metric_height_rmse",
             # "metric_height_mae",
             # "metric_point_xyz_rmse",
-            # "metric_point_z_rmse",
             "metric_point_reproj_px_mean",
             "metric_height_reproj_px_mean",
             "metric_patch_match_acc_top1_1px",
@@ -747,7 +745,7 @@ class TensorBoardMonitor:
         view_ids = batch.get("view_ids", None)
         height_gt = batch.get("height_gt", None)
         pred_h = outputs.get("height_abs", None)
-        pred_p = outputs.get("point_abs", None)
+        pred_p = outputs.get("point_latlon_norm", None)
 
         # 兼容旧面板（第一个样本） + 新面板（整个 batch 的全部视图）。
         self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/input_rgb", self.make_rgb_montage(images[0]), global_step), tag=f"vis/{split}/input_rgb")
@@ -795,15 +793,15 @@ class TensorBoardMonitor:
             self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/height_pred", self.make_colormap_image(ph, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/height_pred")
             self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/height_error", self.make_abs_error_map(ph, gt), global_step), tag=f"vis/{split}/height_error")
 
-        if pred_p is not None and aux.get("gt_point_map", None) is not None:
-            pz = pred_p[0, 0, 2]
-            gz = aux["gt_point_map"][0, 0, 2]
+        if pred_p is not None and aux.get("gt_point_latlon_norm", None) is not None:
+            plat = pred_p[0, 0, 0]
+            glat = aux["gt_point_latlon_norm"][0, 0, 0]
             hmask = batch.get("height_valid_mask", None)
             vm = hmask[0, 0] if torch.is_tensor(hmask) else None
-            vmin, vmax = self._group_vrange([pz, gz], masks=[vm, vm], q_low=0.05, q_high=0.95)
-            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_z_pred", self.make_colormap_image(pz, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/point_z_pred")
-            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_z_gt", self.make_colormap_image(gz, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/point_z_gt")
-            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_z_error", self.make_abs_error_map(pz, gz), global_step), tag=f"vis/{split}/point_z_error")
+            vmin, vmax = self._group_vrange([plat, glat], masks=[vm, vm], q_low=0.05, q_high=0.95)
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_lat_norm_pred", self.make_colormap_image(plat, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/point_lat_norm_pred")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_lat_norm_gt", self.make_colormap_image(glat, vmin=vmin, vmax=vmax), global_step), tag=f"vis/{split}/point_lat_norm_gt")
+            self._safe_writer_call("add_image", lambda: self.writer.add_image(f"vis/{split}/point_lat_norm_error", self.make_abs_error_map(plat, glat), global_step), tag=f"vis/{split}/point_lat_norm_error")
 
         if render_outputs is not None and render_outputs.get("rpc", None) is not None:
             rr = render_outputs["rpc"]
@@ -886,11 +884,11 @@ class TensorBoardMonitor:
         """记录 GT/pred/rpc-center 点云（优先 add_mesh，失败 fallback）。"""
         if not self.is_enabled:
             return
-        if "point_abs" not in outputs or "gaussian_centers_rpc" not in outputs:
+        if "gaussian_centers_point" not in outputs or "gaussian_centers_rpc" not in outputs:
             return
 
         img = batch["images"][0, 0].permute(1, 2, 0).detach().float().cpu()
-        pred = outputs["point_abs"][0, 0].permute(1, 2, 0).detach().float().cpu()
+        pred = outputs["gaussian_centers_point"][0, 0].permute(1, 2, 0).detach().float().cpu()
         rpc = outputs["gaussian_centers_rpc"][0, 0].permute(1, 2, 0).detach().float().cpu()
         gt = aux.get("gt_point_map", None)
         if gt is not None:

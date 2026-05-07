@@ -4,7 +4,7 @@
 - 磁盘 RPC 为 GT 已平差 RPC；
 - dataset 中 rpc_init 由 GT RPC 注入 forward 扰动（true->observed）得到；
 - 模型预测 affine_pred 为 correction（observed->true）；
-- 渲染使用 outputs['rpc_corrected']，双路径中心分别来自 rpc+height 与 point_abs。
+- 渲染使用 outputs['rpc_corrected']，双路径中心分别来自 rpc+height 与 point_latlon_norm+height_abs。
 """
 
 from __future__ import annotations
@@ -92,14 +92,14 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
     scfg.affine_head.offdiag_scale = float(m.get("affine_offdiag_scale", scfg.affine_head.offdiag_scale))
     scfg.affine_head.trans_scale = float(m.get("affine_trans_scale", scfg.affine_head.trans_scale))
 
-    point_bins_legacy = int(m.get("point_bins", scfg.point_bins_xy))
-    scfg.point_bins_xy = int(m.get("point_bins_xy", point_bins_legacy))
+    scfg.point_bins_latlon = int(m.get("point_bins_latlon", scfg.point_bins_latlon))
+    scfg.geometry_feature_dim = int(m.get("geometry_feature_dim", scfg.geometry_feature_dim))
     scfg.sh_dim = int(m.get("sh_dim", scfg.sh_dim))
     scfg.height_anchor_scale = float(m.get("height_anchor_scale", scfg.height_anchor_scale))
     scfg.height_local_scale = float(m.get("height_local_scale", scfg.height_local_scale))
     scfg.height_z_max = float(m.get("height_z_max", scfg.height_z_max))
-    scfg.point_bin_size_xy = float(m.get("point_bin_size_xy", scfg.point_bin_size_xy))
-    scfg.point_fine_range_xy = float(m.get("point_fine_range_xy", scfg.point_fine_range_xy))
+    scfg.point_bin_size_latlon = float(m.get("point_bin_size_latlon", scfg.point_bin_size_latlon))
+    scfg.point_fine_range_latlon = float(m.get("point_fine_range_latlon", scfg.point_fine_range_latlon))
     if "center_downsample_stage_steps" in m:
         scfg.center_downsample_stage_steps = tuple(int(x) for x in m.get("center_downsample_stage_steps", scfg.center_downsample_stage_steps))
     if "center_downsample_factors" in m:
@@ -112,6 +112,13 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
     scfg.detail_token_dim = int(m.get("detail_token_dim", scfg.detail_token_dim))
     scfg.patch_match_dim = int(m.get("patch_match_dim", scfg.patch_match_dim))
     scfg.patch_match_layers = int(m.get("patch_match_layers", scfg.patch_match_layers))
+    scfg.early_global_match.match_dim = int(m.get("early_match_dim", scfg.early_global_match.match_dim))
+    scfg.early_global_match.residual_hidden_dim = int(m.get("early_match_residual_hidden_dim", scfg.early_global_match.residual_hidden_dim))
+    scfg.early_global_match.residual_scale = float(m.get("early_match_residual_scale", scfg.early_global_match.residual_scale))
+    scfg.early_global_match.enable_residual = bool(m.get("early_match_enable_residual", scfg.early_global_match.enable_residual))
+    scfg.early_projection.hidden_dim = int(m.get("early_projection_hidden_dim", scfg.early_projection.hidden_dim))
+    scfg.early_height.hidden_dim = int(m.get("early_height_hidden_dim", scfg.early_height.hidden_dim))
+    scfg.early_height.height_scale = float(m.get("early_height_scale", scfg.early_height.height_scale))
     return Sat2World(scfg)
 
 
@@ -156,16 +163,12 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any, patch_matcher: torch
             "lambda_height": float(lcfg.get("lambda_height", 1.0)),
             "lambda_height_anchor": float(lcfg.get("lambda_height_anchor", 0.5)),
             "lambda_point": float(lcfg.get("lambda_point", 1.0)),
-            "lambda_point_xy": float(lcfg.get("lambda_point_xy", lcfg.get("lambda_point", 1.0))),
-            "lambda_point_z": float(lcfg.get("lambda_point_z", lcfg.get("lambda_point", 1.0))),
             "lambda_height_meter_aux": float(lcfg.get("lambda_height_meter_aux", 1.0e-3)),
             "lambda_height_anchor_meter_aux": float(lcfg.get("lambda_height_anchor_meter_aux", 1.0e-3)),
-            "lambda_point_z_meter_aux": float(lcfg.get("lambda_point_z_meter_aux", 1.0e-3)),
             "lambda_point_reproj": float(lcfg.get("lambda_point_reproj", 0.2)),
             "lambda_height_reproj": float(lcfg.get("lambda_height_reproj", 0.2)),
             "lambda_point_pair": float(lcfg.get("lambda_point_pair", 0.2)),
             "lambda_normal_height": float(lcfg.get("lambda_normal_height", 0.2)),
-            "lambda_normal_point": float(lcfg.get("lambda_normal_point", 0.2)),
             "lambda_feature_nce": float(lcfg.get("lambda_feature_nce", 0.1)),
             "lambda_patch_match": float(lcfg.get("lambda_patch_match", 0.5)),
             "lambda_center": float(lcfg.get("lambda_center", 0.2)),
@@ -215,7 +218,6 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any, patch_matcher: torch
         point_beta=float(lcfg.get("point_beta", 1.0)),
         height_z_beta_meter=(None if "height_z_beta_meter" not in lcfg else float(lcfg.get("height_z_beta_meter"))),
         height_anchor_z_beta_meter=float(lcfg.get("height_anchor_z_beta_meter", 5.0)),
-        point_z_beta_meter=(None if "point_z_beta_meter" not in lcfg else float(lcfg.get("point_z_beta_meter"))),
         scale_min=float(lcfg.get("scale_min", 1e-4)),
         scale_max=float(lcfg.get("scale_max", 0.5)),
         scheduler=scheduler,

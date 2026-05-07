@@ -162,7 +162,7 @@ class Trainer:
             return "dense_decoder"
         if ("height_adapter" in n) or ("height_anchor_head" in n) or ("height_local_head" in n):
             return "height"
-        if ("point_adapter" in n) or ("point_xy_head" in n) or ("point_z_local_head" in n):
+        if ("point_adapter" in n) or ("point_latlon_head" in n):
             return "point"
         if "affine_head" in n:
             return "affine"
@@ -170,6 +170,8 @@ class Trainer:
             return "nce_projector"
         if "patch_matcher" in n:
             return "patch_matcher"
+        if n.startswith("early_") or "early_global_match_head" in n or "early_projection_head" in n or "early_height_head" in n:
+            return "early_heads"
         if ("gaussian_adapter" in n) or ("gaussian_head" in n):
             return "gaussian"
         return "other"
@@ -183,6 +185,7 @@ class Trainer:
             "affine",
             "nce_projector",
             "patch_matcher",
+            "early_heads",
             "gaussian",
             "other",
         ]
@@ -325,7 +328,7 @@ class Trainer:
             p["probe_affine_pred_linear_deviation_mean"] = float(linear_dev.detach().item())
         for name, key in [
             ("probe_nan_ratio_height", "height_abs"),
-            ("probe_nan_ratio_point", "point_abs"),
+            ("probe_nan_ratio_point_latlon", "point_latlon_norm"),
             ("probe_nan_ratio_centers", "gaussian_centers_rpc"),
         ]:
             if key in outputs:
@@ -340,10 +343,10 @@ class Trainer:
             d["hist/affine_pred"] = outputs["affine_pred"].detach()
         if "height_abs" in outputs:
             d["hist/height_abs"] = outputs["height_abs"].detach()
-        if "point_delta_xy_fine" in outputs:
-            d["hist/point_delta_xy_fine"] = outputs["point_delta_xy_fine"].detach()
-        if "point_z_local_offset" in outputs:
-            d["hist/point_z_local_offset"] = outputs["point_z_local_offset"].detach()
+        if "point_delta_latlon_fine" in outputs:
+            d["hist/point_delta_latlon_fine"] = outputs["point_delta_latlon_fine"].detach()
+        if "point_latlon_norm" in outputs:
+            d["hist/point_latlon_norm"] = outputs["point_latlon_norm"].detach()
         if "gaussian_opacity" in outputs:
             d["hist/gaussian_opacity"] = outputs["gaussian_opacity"].detach()
         if "gaussian_scale" in outputs:
@@ -759,7 +762,6 @@ class Trainer:
             lp = logs.get("loss_point", None)
             lpp = logs.get("loss_point_pair", None)
             lpr = logs.get("loss_point_reproj", None)
-            lnp = logs.get("loss_normal_point", None)
             lnce = logs.get("loss_feature_nce", None)
             lssim = logs.get("loss_ssim", None)
             if lt is not None and lag is not None and lap is not None and lh is not None and lhrep is not None and lp is not None:
@@ -787,7 +789,6 @@ class Trainer:
                     f"l_pt={float(lp) if lp is not None else float('nan'):.2f} "
                     f"l_pp={float(lpp) if lpp is not None else float('nan'):.2f} "
                     f"l_pr={float(lpr) if lpr is not None else float('nan'):.2f} "
-                    f"l_np={float(lnp) if lnp is not None else float('nan'):.2f} "
                     f"l_nce={float(lnce) if lnce is not None else float('nan'):.2f} "
                     f"l_ssim={float(lssim) if lssim is not None else float('nan'):.2f} "
                     f"lr={lr:.2e} "
@@ -858,7 +859,6 @@ class Trainer:
             lhrep = float(agg.get("loss_height_reproj", float("nan")))
             lp = float(agg.get("loss_point", float("nan")))
             lpp = float(agg.get("loss_point_pair", float("nan")))
-            lnp = float(agg.get("loss_normal_point", float("nan")))
             lnce = float(agg.get("loss_feature_nce", float("nan")))
             lssim = float(agg.get("loss_ssim", float("nan")))
             tag = " [best]" if better else ""
@@ -871,8 +871,7 @@ class Trainer:
                 f"l_h_abs={lh:.2f} "
                 f"l_h_rep={lhrep:.2f} "
                 f"l_pt={lp:.2f} "
-                f"l_pp={lpp:.2f}"
-                f"l_np={lnp:.2f} "
+                f"l_pp={lpp:.2f} "
                 f"l_nce={lnce:.2f} "
                 f"l_ssim={lssim:.2f}"
                 f"{tag}"

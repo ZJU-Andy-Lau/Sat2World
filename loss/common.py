@@ -51,7 +51,9 @@ def masked_reduce(value: torch.Tensor, mask: torch.Tensor | None = None, reduce:
 
     denom = m.sum()
     if denom.detach().item() <= 0:
-        return torch.zeros((), device=value.device, dtype=value.dtype)
+        # Keep the zero loss connected to ``value`` so no-valid masked batches do
+        # not create DDP unused-parameter surprises for the producing branch.
+        return weighted.sum() * 0.0
     return weighted.sum() / denom
 
 

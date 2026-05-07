@@ -703,3 +703,41 @@ def estimate_scene_xy_center_scale(
     offset = (yx_all - center[None, :]).abs().amax(dim=0)
     scale = torch.clamp(offset * float(safety_factor), min=float(min_scale))
     return center.to(torch.float32), scale.to(torch.float32)
+
+
+def estimate_scene_latlon_center_scale(
+    ref_rpc_gt: "RPCModelParameterTorch",
+    image_hw: tuple[int, int],
+    h_offset: float | torch.Tensor | None = None,
+    *,
+    safety_factor: float = 1.05,
+    min_scale: float = 1.0e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Estimate raw lat/lon normalization from reference crop corners.
+
+    Four crop-image corners in ``line/samp`` order are inverse-projected through
+    the crop-coordinate GT RPC at ``h_offset`` (default: RPC HEIGHT_OFF).  The
+    returned tensors are float32 ``[2]`` in ``lat/lon`` order.  This function does
+    not use Web Mercator or legacy ``scene_xy_*`` normalization.
+    """
+    h, w = int(image_hw[0]), int(image_hw[1])
+    if h <= 0 or w <= 0:
+        raise ValueError(f"image_hw must be positive, got {image_hw}")
+    if h_offset is None:
+        h_offset = getattr(ref_rpc_gt, "HEIGHT_OFF", 0.0)
+    if torch.is_tensor(h_offset):
+        h_val = float(h_offset.detach().reshape(-1)[0].item())
+    else:
+        h_val = float(h_offset)
+    pts = torch.tensor(
+        [[0.0, 0.0], [0.0, float(w - 1)], [float(h - 1), 0.0], [float(h - 1), float(w - 1)]],
+        dtype=torch.double,
+        device=ref_rpc_gt.device,
+    )
+    heights = torch.full((4,), h_val, dtype=torch.double, device=ref_rpc_gt.device)
+    lat, lon = ref_rpc_gt.RPC_PHOTO2OBJ(insamp=pts[:, 1], inline=pts[:, 0], inhei=heights, output_type="tensor")
+    latlon = torch.stack([lat, lon], dim=-1).to(torch.float32).cpu()
+    center = latlon.mean(dim=0)
+    scale = (latlon - center[None]).abs().amax(dim=0) * float(safety_factor)
+    scale = torch.clamp(scale, min=float(min_scale))
+    return center.to(torch.float32), scale.to(torch.float32)

@@ -117,7 +117,6 @@ class CoderProbe:
         return {
             "height_anchor_mae": z,
             "height_local_z_boundary_ratio": z,
-            "point_z_local_z_boundary_ratio": z,
         }
 
     def __call__(self, outputs: dict[str, Any], valid_mask: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
@@ -151,8 +150,4 @@ class CoderProbe:
         h_local_z = outputs.get("height_local_z", None)
         if h_local_z is not None:
             out["height_local_z_boundary_ratio"] = _boundary_ratio(h_local_z)
-        pz_local_z = outputs.get("point_z_local_z", None)
-        if pz_local_z is not None:
-            out["point_z_local_z_boundary_ratio"] = _boundary_ratio(pz_local_z)
-
         return out

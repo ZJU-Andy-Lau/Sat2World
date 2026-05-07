@@ -3,7 +3,6 @@
 本文件实现“物理锚点 + 有界残差”解码策略：
 - SymmetricBinScalarCoder: 标量残差解码器；
 - HeightCoder: 绝对高程解码；
-- PointCoder: 绝对点云解码。
 """
 
 from __future__ import annotations
@@ -142,53 +141,4 @@ class HeightCoder(nn.Module):
             "h_abs": h_abs,
             "delta_h_coarse": coarse.unsqueeze(2),
             "delta_h_fine": fine.unsqueeze(2),
-        }
-
-
-class PointCoder(nn.Module):
-    """三轴点云解码器：点云锚点 + 三轴有界残差。"""
-
-    def __init__(self, cfg_x: SymmetricBinCoderCfg, cfg_y: SymmetricBinCoderCfg, cfg_z: SymmetricBinCoderCfg) -> None:
-        """初始化 PointCoder。"""
-        super().__init__()
-        self.coder_x = SymmetricBinScalarCoder(cfg_x)
-        self.coder_y = SymmetricBinScalarCoder(cfg_y)
-        self.coder_z = SymmetricBinScalarCoder(cfg_z)
-
-    def forward(
-        self,
-        x_logits: torch.Tensor,
-        y_logits: torch.Tensor,
-        z_logits: torch.Tensor,
-        x_fine: torch.Tensor,
-        y_fine: torch.Tensor,
-        z_fine: torch.Tensor,
-        point_anchor: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """解码绝对点云。
-
-        参数:
-            x/y/z_logits: [B,V,K,H,W]。
-            x/y/z_fine: [B,V,1,H,W]。
-            point_anchor: [B,V,3,H,W]。
-
-        返回:
-            dict:
-                point_abs: [B,V,3,H,W]
-                delta_xyz_coarse: [B,V,3,H,W]
-                delta_xyz_fine: [B,V,3,H,W]
-        """
-        dx, dx_c, dx_f = self.coder_x.decode(x_logits, x_fine, channel_dim=2)
-        dy, dy_c, dy_f = self.coder_y.decode(y_logits, y_fine, channel_dim=2)
-        dz, dz_c, dz_f = self.coder_z.decode(z_logits, z_fine, channel_dim=2)
-
-        delta = torch.stack([dx, dy, dz], dim=2)
-        delta_coarse = torch.stack([dx_c, dy_c, dz_c], dim=2)
-        delta_fine = torch.stack([dx_f, dy_f, dz_f], dim=2)
-
-        point_abs = point_anchor + delta
-        return {
-            "point_abs": point_abs,
-            "delta_xyz_coarse": delta_coarse,
-            "delta_xyz_fine": delta_fine,
         }
