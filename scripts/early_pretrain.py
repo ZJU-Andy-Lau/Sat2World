@@ -312,6 +312,7 @@ def main() -> None:
         scaler=scaler,
         distributed_state=dist_state,
         work_dir=str(work_dir),
+        log_profile="early_pretrain",
         resume_state=resume_state,
     )
 

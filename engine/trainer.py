@@ -35,6 +35,55 @@ from engine.distributed import (
 )
 
 
+LOSS_LOG_PROFILES: dict[str, tuple[tuple[str, str], ...]] = {
+    "early_pretrain": (
+        ("tot", "loss_total"),
+        ("nce", "loss_feature_nce"),
+        ("pm", "loss_patch_match"),
+        ("match", "loss_match_coord"),
+        ("ce", "loss_match_ce"),
+        ("proj", "loss_projection"),
+        ("h", "loss_early_height"),
+    ),
+    "geometry_pretrain": (
+        ("tot", "loss_total"),
+        ("ag", "loss_affine_grid"),
+        ("ap", "loss_affine_pair"),
+        ("h", "loss_height"),
+        ("hr", "loss_height_reproj"),
+        ("pt", "loss_point"),
+        ("pr", "loss_point_reproj"),
+        ("pp", "loss_point_pair"),
+        ("nce", "loss_feature_nce"),
+        ("pm", "loss_patch_match"),
+    ),
+    "train": (
+        ("tot", "loss_total"),
+        ("ag", "loss_affine_grid"),
+        ("ap", "loss_affine_pair"),
+        ("h", "loss_height"),
+        ("pt", "loss_point"),
+        ("pp", "loss_point_pair"),
+        ("nce", "loss_feature_nce"),
+        ("pm", "loss_patch_match"),
+        ("rrpc", "loss_render_rpc"),
+        ("rpt", "loss_render_point"),
+        ("ssim", "loss_ssim"),
+    ),
+}
+
+LOSS_LOG_PROFILE_ALIASES = {
+    "early": "early_pretrain",
+    "early-pretrain": "early_pretrain",
+    "geometry": "geometry_pretrain",
+    "geometry-train": "geometry_pretrain",
+    "geometry_train": "geometry_pretrain",
+    "geometry-pretrain": "geometry_pretrain",
+    "full": "train",
+    "default": "train",
+}
+
+
 class Trainer:
     """统一 Trainer。
 
@@ -61,6 +110,7 @@ class Trainer:
         distributed_state: dict[str, Any],
         work_dir: str,
         resume_state: dict[str, Any] | None = None,
+        log_profile: str | None = None,
     ) -> None:
         """初始化 Trainer。"""
         self.cfg = cfg
@@ -76,6 +126,8 @@ class Trainer:
         self.scaler = scaler
         self.distributed_state = distributed_state
         self.work_dir = Path(work_dir)
+        self.log_profile = self._normalize_log_profile(log_profile or cfg.get("log_profile", "train"))
+        self.loss_log_items = LOSS_LOG_PROFILES[self.log_profile]
         ckpt_dir_cfg = str(cfg.get("checkpoints_dir", "")).strip()
         self.ckpt_dir = Path(ckpt_dir_cfg) if ckpt_dir_cfg else (self.work_dir / "checkpoints")
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -259,6 +311,39 @@ class Trainer:
         m = (sec_i % 3600) // 60
         s = sec_i % 60
         return f"{h:02d}:{m:02d}:{s:02d}"
+
+    @staticmethod
+    def _normalize_log_profile(log_profile: Any) -> str:
+        profile = str(log_profile or "train").strip().lower().replace(" ", "_")
+        profile = LOSS_LOG_PROFILE_ALIASES.get(profile, profile)
+        if profile not in LOSS_LOG_PROFILES:
+            allowed = ", ".join(sorted(LOSS_LOG_PROFILES))
+            raise ValueError(f"Unknown trainer log_profile={log_profile!r}; expected one of: {allowed}")
+        return profile
+
+    @staticmethod
+    def _scalar_to_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return None
+            value = value.detach().float().mean().cpu().item()
+        try:
+            value_f = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value_f):
+            return None
+        return value_f
+
+    def _format_loss_log_fields(self, logs: dict[str, Any]) -> str:
+        fields: list[str] = []
+        for label, key in self.loss_log_items:
+            value = self._scalar_to_float(logs.get(key))
+            if value is not None:
+                fields.append(f"{label}={value:.2f}")
+        return " ".join(fields)
 
     def _forward_batch(self, batch_dev: dict[str, Any], mode: str):
         """统一前向：model -> renderer(optional) -> objective。"""
@@ -730,15 +815,8 @@ class Trainer:
         if self.max_train_steps_per_epoch > 0:
             steps_target = min(steps_target, self.max_train_steps_per_epoch)
         prev_time = time.time()
-        loss_sums = {
-            "loss_total": 0.0,
-            "loss_affine_grid": 0.0,
-            "loss_affine_pair": 0.0,
-            "loss_height": 0.0,
-            "loss_height_reproj": 0.0,
-            "loss_point": 0.0,
-        }
-        n_loss_steps = 0
+        loss_sums = {key: 0.0 for _, key in self.loss_log_items}
+        loss_counts = {key: 0 for _, key in self.loss_log_items}
         for step_idx, batch in enumerate(self.train_loader):
             if self.max_train_steps_per_epoch > 0 and step_idx >= self.max_train_steps_per_epoch:
                 break
@@ -754,43 +832,24 @@ class Trainer:
             self.step_in_epoch = step_idx + 1
             prev_time = time.time()
 
-            lt = logs.get("loss_total", None)
-            lag = logs.get("loss_affine_grid", None)
-            lap = logs.get("loss_affine_pair", None)
-            lh = logs.get("loss_height", None)
-            lhrep = logs.get("loss_height_reproj", None)
-            lp = logs.get("loss_point", None)
-            lpp = logs.get("loss_point_pair", None)
-            lpr = logs.get("loss_point_reproj", None)
-            lnce = logs.get("loss_feature_nce", None)
-            lssim = logs.get("loss_ssim", None)
-            if lt is not None and lag is not None and lap is not None and lh is not None and lhrep is not None and lp is not None:
-                loss_sums["loss_total"] += float(lt)
-                loss_sums["loss_affine_grid"] += float(lag)
-                loss_sums["loss_affine_pair"] += float(lap)
-                loss_sums["loss_height"] += float(lh)
-                loss_sums["loss_height_reproj"] += float(lhrep)
-                loss_sums["loss_point"] += float(lp)
-                n_loss_steps += 1
+            for _, key in self.loss_log_items:
+                value = self._scalar_to_float(logs.get(key))
+                if value is not None:
+                    loss_sums[key] += value
+                    loss_counts[key] += 1
 
             if is_main_process():
                 lr = float(logs.get("optim/lr", 0.0))
                 elapsed = time.time() - epoch_t0
                 done = max(step_idx + 1, 1)
                 eta = (elapsed / done) * max(steps_target - done, 0)
+                loss_fields = self._format_loss_log_fields(logs)
+                if loss_fields:
+                    loss_fields += " "
                 print(
                     "[train] "
                     f"ep={self.epoch} st={step_idx} gst={self.global_step} "
-                    f"l_tot={float(lt) if lt is not None else float('nan'):.2f} "
-                    f"l_ag={float(lag) if lag is not None else float('nan'):.2f} "
-                    f"l_ap={float(lap) if lap is not None else float('nan'):.2f} "
-                    f"l_h={float(lh) if lh is not None else float('nan'):.2f} "
-                    f"l_hr={float(lhrep) if lhrep is not None else float('nan'):.2f} "
-                    f"l_pt={float(lp) if lp is not None else float('nan'):.2f} "
-                    f"l_pp={float(lpp) if lpp is not None else float('nan'):.2f} "
-                    f"l_pr={float(lpr) if lpr is not None else float('nan'):.2f} "
-                    f"l_nce={float(lnce) if lnce is not None else float('nan'):.2f} "
-                    f"l_ssim={float(lssim) if lssim is not None else float('nan'):.2f} "
+                    f"{loss_fields}"
                     f"lr={lr:.2e} "
                     f"time={self._format_hhmmss(elapsed)} "
                     f"eta={self._format_hhmmss(eta)}"
@@ -804,23 +863,10 @@ class Trainer:
                 self.model.train()
 
         self.step_in_epoch = 0
-        if is_main_process() and n_loss_steps > 0:
-            avg_total = loss_sums["loss_total"] / n_loss_steps
-            avg_ag = loss_sums["loss_affine_grid"] / n_loss_steps
-            avg_ap = loss_sums["loss_affine_pair"] / n_loss_steps
-            avg_h_abs = loss_sums["loss_height"] / n_loss_steps
-            avg_h_rel = loss_sums["loss_height_reproj"] / n_loss_steps
-            avg_pt = loss_sums["loss_point"] / n_loss_steps
-            print(
-                "[train][epoch_summary] "
-                f"epoch={self.epoch} "
-                f"l_tot={avg_total:.2f} "
-                f"l_ag={avg_ag:.2f} "
-                f"l_ap={avg_ap:.2f} "
-                f"l_h_abs={avg_h_abs:.2f} "
-                f"l_h_rep={avg_h_rel:.2f} "
-                f"l_pt={avg_pt:.2f}"
-            )
+        if is_main_process() and any(count > 0 for count in loss_counts.values()):
+            avg_logs = {key: loss_sums[key] / count for key, count in loss_counts.items() if count > 0}
+            loss_fields = self._format_loss_log_fields(avg_logs)
+            print(f"[train][epoch_summary] epoch={self.epoch} {loss_fields}".rstrip())
 
     def validate(self) -> dict[str, float]:
         """执行完整验证流程。"""
@@ -852,30 +898,11 @@ class Trainer:
         cur = float(agg.get(self.best_metric_name, agg.get("loss_total", float("inf"))))
         better = (cur < self.best_metric) if self.best_mode == "min" else (cur > self.best_metric)
         if is_main_process():
-            lt = float(agg.get("loss_total", float("nan")))
-            lag = float(agg.get("loss_affine_grid", float("nan")))
-            lap = float(agg.get("loss_affine_pair", float("nan")))
-            lh = float(agg.get("loss_height", float("nan")))
-            lhrep = float(agg.get("loss_height_reproj", float("nan")))
-            lp = float(agg.get("loss_point", float("nan")))
-            lpp = float(agg.get("loss_point_pair", float("nan")))
-            lnce = float(agg.get("loss_feature_nce", float("nan")))
-            lssim = float(agg.get("loss_ssim", float("nan")))
             tag = " [best]" if better else ""
-            print(
-                "[val] "
-                f"epoch={self.epoch} gstep={self.global_step} "
-                f"l_tot={lt:.2f} "
-                f"l_ag={lag:.2f} "
-                f"l_ap={lap:.2f} "
-                f"l_h_abs={lh:.2f} "
-                f"l_h_rep={lhrep:.2f} "
-                f"l_pt={lp:.2f} "
-                f"l_pp={lpp:.2f} "
-                f"l_nce={lnce:.2f} "
-                f"l_ssim={lssim:.2f}"
-                f"{tag}"
-            )
+            loss_fields = self._format_loss_log_fields(agg)
+            if loss_fields:
+                loss_fields = f" {loss_fields}"
+            print(f"[val] epoch={self.epoch} gstep={self.global_step}{loss_fields}{tag}")
         if better:
             self.best_metric = cur
             self._save_best_checkpoint()
