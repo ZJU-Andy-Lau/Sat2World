@@ -257,10 +257,14 @@ class EarlyPretrainObjective:
             finite = torch.isfinite(src_tok).all(dim=-1) & torch.isfinite(tgt_tok).all(dim=-1) & torch.isfinite(heights) & torch.isfinite(h_offsets)
             if not bool(finite.any()):
                 continue
+            
             x_pred = self.early_height_head(src_tok[finite], tgt_tok[finite])
-            target_x = (heights[finite] - h_offsets[finite]) / scale
-            losses.append(F.smooth_l1_loss(x_pred, target_x))
-            pred_h = x_pred.detach() * scale + h_offsets[finite].detach()
+            pred_h = x_pred * scale + h_offsets[finite]
+            losses.append(F.smooth_l1_loss(pred_h, heights[finite]))
+            # x_pred = self.early_height_head(src_tok[finite], tgt_tok[finite])
+            # target_x = (heights[finite] - h_offsets[finite]) / scale
+            # losses.append(F.smooth_l1_loss(x_pred, target_x))
+            # pred_h = x_pred.detach() * scale + h_offsets[finite].detach()
             err = (pred_h - heights[finite].detach()).abs()
             abs_m.append(err)
             sq_m.append(err.square())
