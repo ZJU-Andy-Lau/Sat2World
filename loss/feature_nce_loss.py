@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from loss.common import sample_map_bilinear
+from loss.correspondence_utils import build_patch_correspondence_gt
 
 
 @dataclass
@@ -79,19 +80,12 @@ class FeatureInfoNCELoss:
         device = patch_tokens_proj.device
         dtype = patch_tokens_proj.dtype
 
-        hgt = batch["height_gt"].to(device=device, dtype=dtype)
-        hmask = batch["height_valid_mask"].to(device=device, dtype=dtype)
-        rpc_gt = batch["rpc_gt"]
-        scene_xy_center = batch.get("scene_xy_center", None)
-        scene_xy_scale = batch.get("scene_xy_scale", None)
-
         anchors_all: list[torch.Tensor] = []
         positives_all: list[torch.Tensor] = []
         valid_pairs_total = 0
         valid_pairs_after_filter = 0
         sampled_pairs_debug: dict[int, list[tuple[int, int]]] = {}
 
-        centers = patch_centers.to(device=device, dtype=dtype).view(1, n, 2)
         feat_map_all = patch_tokens_proj.view(b, v, gh, gw, d).permute(0, 1, 4, 2, 3).contiguous()
         if patch_padded_hw is not None:
             hp, wp = int(patch_padded_hw[0]), int(patch_padded_hw[1])
@@ -102,74 +96,43 @@ class FeatureInfoNCELoss:
         patch_w = float(wp) / float(max(gw, 1))
         loss_stub = patch_tokens_proj.sum() * 0.0
 
+        view_pairs = self._sample_view_pairs(v, int(self.cfg.match_max_pair), device=device)
         for bi in range(b):
-            view_pairs = self._sample_view_pairs(v, int(self.cfg.match_max_pair), device=device)
             sampled_pairs_debug[int(bi)] = view_pairs
-            for vi, vj in view_pairs:
-                tgt_feat_map = feat_map_all[bi : bi + 1, vj]  # [1,D,Gh,Gw]
-                src_valid = patch_valid_mask[bi : bi + 1, vi]  # [1,N]
-                if not bool(src_valid.any()):
+        for vi, vj in view_pairs:
+            corr = build_patch_correspondence_gt(
+                geometry_ops=self.geometry_ops,
+                batch=batch,
+                patch_centers=patch_centers,
+                patch_valid_mask=patch_valid_mask,
+                patch_grid_hw=patch_grid_hw,
+                patch_padded_hw=patch_padded_hw,
+                src_view_idx=vi,
+                tgt_view_idx=vj,
+                rpc_key="rpc_gt",
+                require_target_patch_valid=False,
+            )
+            valid_pairs_total += int(corr.before_filter_count)
+            if corr.num_valid == 0:
+                continue
+            for bi in corr.batch_indices.unique(sorted=True).tolist():
+                sel = corr.batch_indices == int(bi)
+                if not bool(sel.any()):
                     continue
-
-                h_src, in_h = sample_map_bilinear(hgt[bi : bi + 1, vi], centers)
-                m_src, in_m = sample_map_bilinear(hmask[bi : bi + 1, vi], centers)
-                h_src = h_src[:, 0]
-                valid_src = src_valid & in_h & in_m & (m_src[:, 0] > 0.5)
-                finite_src = torch.isfinite(centers[..., 0]) & torch.isfinite(centers[..., 1]) & torch.isfinite(h_src)
-                valid_src = valid_src & finite_src
-                if not bool(valid_src.any()):
-                    continue
-
-                pts_src = centers[:, valid_src[0]]
-                h_valid = h_src[:, valid_src[0]]
-                if not bool(torch.isfinite(pts_src).all()) or not bool(torch.isfinite(h_valid).all()):
-                    continue
-
-                xs, ys = self.geometry_ops.linesamp_to_xy_batch(
-                    rpc_batch=[[rpc_gt[bi][vi]]],
-                    lines=pts_src[..., 0].view(1, 1, -1),
-                    samps=pts_src[..., 1].view(1, 1, -1),
-                    heights=h_valid.view(1, 1, -1),
-                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
-                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
-                )
-                l_tgt, s_tgt = self.geometry_ops.xy_to_linesamp_batch(
-                    rpc_batch=[[rpc_gt[bi][vj]]],
-                    xs=xs,
-                    ys=ys,
-                    heights=h_valid.view(1, 1, -1),
-                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
-                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
-                )
-                pts_tgt_pix = torch.stack([l_tgt.view(1, -1), s_tgt.view(1, -1)], dim=-1).to(device=device, dtype=dtype)
-                finite_tgt = torch.isfinite(pts_tgt_pix[..., 0]) & torch.isfinite(pts_tgt_pix[..., 1])
-                if not bool(finite_tgt.any()):
-                    continue
-                pts_tgt_pix = pts_tgt_pix[:, finite_tgt[0]]
-                src_proj_all = patch_tokens_proj[bi, vi, valid_src[0]][finite_tgt[0]]
-                valid_pairs_total += int(src_proj_all.shape[0])
-                if pts_tgt_pix.shape[1] == 0:
-                    continue
-
-                pts_tgt_patch = pts_tgt_pix.clone()
-                pts_tgt_patch[..., 0] = (pts_tgt_patch[..., 0] + 0.5) / patch_h - 0.5
-                pts_tgt_patch[..., 1] = (pts_tgt_patch[..., 1] + 0.5) / patch_w - 0.5
-                pos_feat, in_tgt = sample_map_bilinear(tgt_feat_map, pts_tgt_patch)
+                pts_i = corr.tgt_pixels[sel].view(1, -1, 2).to(device=device, dtype=dtype).clone()
+                pts_i[..., 0] = (pts_i[..., 0] + 0.5) / patch_h - 0.5
+                pts_i[..., 1] = (pts_i[..., 1] + 0.5) / patch_w - 0.5
+                pos_feat, in_tgt = sample_map_bilinear(feat_map_all[int(bi) : int(bi) + 1, vj], pts_i)
                 if not bool(in_tgt.any()):
                     continue
-
+                src_proj = patch_tokens_proj[int(bi), vi, corr.src_patch_indices[sel]][in_tgt[0]]
                 pos = pos_feat[0].transpose(0, 1)[in_tgt[0]]
-                src_proj = src_proj_all[in_tgt[0]]
                 finite_pair = torch.isfinite(src_proj).all(dim=-1) & torch.isfinite(pos).all(dim=-1)
                 if not bool(finite_pair.any()):
                     continue
-                src_proj = src_proj[finite_pair]
-                pos = pos[finite_pair]
-                if src_proj.numel() == 0 or pos.numel() == 0:
-                    continue
-                anchors_all.append(src_proj)
-                positives_all.append(pos)
-                valid_pairs_after_filter += int(pos.shape[0])
+                anchors_all.append(src_proj[finite_pair])
+                positives_all.append(pos[finite_pair])
+                valid_pairs_after_filter += int(finite_pair.sum().item())
 
         if len(anchors_all) == 0:
             zero = torch.zeros((), device=device, dtype=dtype)

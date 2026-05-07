@@ -7,10 +7,10 @@ Sat2World 主模型入口：Sat2World。
 2) 计算一次几何特征并与视觉 token 融合；
 3) 单次编码后直接输出 affine_pred；
 4) 用 affine_pred 校正 rpc_init，得到 rpc_corrected；
-5) 输出 height_abs / point_abs / gaussian attributes；
+5) 输出 height_abs / point_latlon_norm / gaussian attributes；
 6) 构造两条高斯中心路径：
    - centers_rpc = corrected RPC + height_abs
-   - centers_point = point_abs
+   - centers_point = point_latlon_norm + height_abs converted to local-meter centers
 """
 
 from __future__ import annotations
@@ -46,12 +46,19 @@ from model.heads import (
     DPTDenseDecoderCfg,
     GaussianHead,
     DenseHeightLocalHead,
-    PointXYHead,
-    PointZLocalHead,
+    PointLatLonHead,
     SceneHeightAnchorHead,
     TaskAdapter,
 )
 from model.patch_matcher import PatchHeatmapMatcher, PatchMatcherCfg
+from model.early_heads import (
+    CrossViewHeightHead,
+    CrossViewHeightHeadCfg,
+    GlobalPatchMatchHead,
+    GlobalPatchMatchHeadCfg,
+    ProjectionPredictionHead,
+    ProjectionPredictionHeadCfg,
+)
 from model.utils import check_nan
 
 
@@ -63,14 +70,15 @@ class Sat2WorldCfg:
     encoder: AlternatingEncoderCfg = field(default_factory=AlternatingEncoderCfg)
     affine_head: AffineHeadCfg = field(default_factory=AffineHeadCfg)
 
-    point_bins_xy: int = 33
+    point_bins_latlon: int = 33
+    geometry_feature_dim: int = 30
     sh_dim: int = 48
 
     height_anchor_scale: float = 200.0
     height_local_scale: float = 30.0
     height_z_max: float = 4.0
-    point_bin_size_xy: float = 2.0
-    point_fine_range_xy: float = 1.0
+    point_bin_size_latlon: float = 2.0
+    point_fine_range_latlon: float = 1.0
     center_downsample_stage_steps: tuple[int, ...] = (0, 20000, 60000)
     center_downsample_factors: tuple[int, ...] = (4, 2, 1)
 
@@ -88,6 +96,9 @@ class Sat2WorldCfg:
     detail_token_dim: int = 1024
     patch_match_dim: int = 256
     patch_match_layers: int = 2
+    early_global_match: GlobalPatchMatchHeadCfg = field(default_factory=GlobalPatchMatchHeadCfg)
+    early_projection: ProjectionPredictionHeadCfg = field(default_factory=ProjectionPredictionHeadCfg)
+    early_height: CrossViewHeightHeadCfg = field(default_factory=CrossViewHeightHeadCfg)
 
 
 class Sat2World(nn.Module):
@@ -116,7 +127,7 @@ class Sat2World(nn.Module):
                 out_dim=int(cfg.detail_token_dim),
             )
         )
-        self.geom_mlp = GeometryTokenMLP(in_dim=45, hidden_dim=256, out_dim=256)
+        self.geom_mlp = GeometryTokenMLP(in_dim=int(cfg.geometry_feature_dim), hidden_dim=256, out_dim=256)
         self.fuser = VisualGeometryDetailFuser(
             visual_dim=self.backbone.embed_dim,
             detail_dim=int(cfg.detail_token_dim),
@@ -158,8 +169,7 @@ class Sat2World(nn.Module):
         self.affine_head = AffineHead(in_dim=self.backbone.embed_dim, hidden_dim=512, cfg=cfg.affine_head)
         self.height_anchor_head = SceneHeightAnchorHead(in_dim=self.backbone.embed_dim, hidden_dim=512)
         self.height_local_head = DenseHeightLocalHead(in_ch=256)
-        self.point_xy_head = PointXYHead(in_ch=256, num_bins_xy=cfg.point_bins_xy)
-        self.point_z_local_head = PointZLocalHead(in_ch=256)
+        self.point_latlon_head = PointLatLonHead(in_ch=256, num_bins_latlon=cfg.point_bins_latlon)
         self.gaussian_head = GaussianHead(in_ch=256, sh_dim=cfg.sh_dim)
         self.nce_projector = nn.Sequential(
             nn.LayerNorm(self.backbone.embed_dim),
@@ -167,19 +177,23 @@ class Sat2World(nn.Module):
             nn.GELU(),
             nn.Linear(int(cfg.nce_projector_hidden_dim), int(cfg.nce_projector_dim)),
         )
+        self.early_global_match_head = GlobalPatchMatchHead(self.backbone.embed_dim, cfg.early_global_match)
+        self.early_projection_head = ProjectionPredictionHead(self.backbone.embed_dim, cfg.early_projection)
+        self.early_height_head = CrossViewHeightHead(self.backbone.embed_dim, cfg.early_height)
 
         self.height_offset_decoder = BoundedSinhOffsetDecoder(z_max=cfg.height_z_max)
-        self.point_xy_coder_x = SymmetricBinScalarCoder(
-            SymmetricBinCoderCfg(num_bins=cfg.point_bins_xy, bin_size=cfg.point_bin_size_xy, fine_range=cfg.point_fine_range_xy)
+        self.point_lat_coder = SymmetricBinScalarCoder(
+            SymmetricBinCoderCfg(num_bins=cfg.point_bins_latlon, bin_size=cfg.point_bin_size_latlon, fine_range=cfg.point_fine_range_latlon)
         )
-        self.point_xy_coder_y = SymmetricBinScalarCoder(
-            SymmetricBinCoderCfg(num_bins=cfg.point_bins_xy, bin_size=cfg.point_bin_size_xy, fine_range=cfg.point_fine_range_xy)
+        self.point_lon_coder = SymmetricBinScalarCoder(
+            SymmetricBinCoderCfg(num_bins=cfg.point_bins_latlon, bin_size=cfg.point_bin_size_latlon, fine_range=cfg.point_fine_range_latlon)
         )
 
         self.rpc_ops = RPCGeometryOps(rpc_dtype=torch.double, net_dtype=torch.float32)
         self.runtime_global_step: int = 0
         self.runtime_mode: str = "train"
         self.runtime_pretrain_geometry_only: bool = False
+        self.runtime_early_pretrain_only: bool = False
         self._set_gaussian_trainable(bool(self.cfg.enable_gaussian_branch))
 
     def set_runtime_context(self, *, global_step: int, mode: str) -> None:
@@ -203,6 +217,52 @@ class Sat2World(nn.Module):
             # 仅在配置允许高斯分支时恢复可训练。
             if bool(self.cfg.enable_gaussian_branch):
                 self._set_gaussian_trainable(True)
+
+
+    def set_early_pretrain_only(self, enabled: bool, *, train_detail_encoder: bool = False) -> None:
+        """Enable the lightweight early encoder-pretraining runtime mode.
+
+        Early mode skips dense decoder, affine, dense height, point, Gaussian and
+        render-related branches in ``forward``.  It also freezes unused branches
+        so DDP/optimizer only see encoder-side representation modules and the
+        early heads.  Geometry training does not call this method, so its default
+        parameter behavior is unchanged.
+        """
+        enabled = bool(enabled)
+        self.runtime_early_pretrain_only = enabled
+        if not enabled:
+            self.requires_grad_(True)
+            self._set_gaussian_trainable(bool(self.cfg.enable_gaussian_branch))
+            return
+
+        self.requires_grad_(False)
+        train_modules = [
+            self.geom_mlp,
+            self.fuser,
+            self.encoder,
+            self.nce_projector,
+            self.patch_matcher,
+            self.early_global_match_head,
+            self.early_projection_head,
+            self.early_height_head,
+        ]
+        if bool(train_detail_encoder):
+            train_modules.append(self.detail_encoder)
+        for module in train_modules:
+            module.requires_grad_(True)
+        self.backbone.requires_grad_(False)
+        self._set_gaussian_trainable(False)
+
+    def trainable_parameter_summary(self) -> dict[str, int]:
+        """Return trainable parameter counts grouped by top-level module name."""
+        summary: dict[str, int] = {}
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            group = name.split(".", 1)[0]
+            summary[group] = summary.get(group, 0) + int(p.numel())
+        summary["total"] = sum(v for k, v in summary.items() if k != "total")
+        return summary
 
     def _current_center_downsample(self) -> int:
         steps = tuple(int(x) for x in self.cfg.center_downsample_stage_steps)
@@ -259,31 +319,34 @@ class Sat2World(nn.Module):
         ref = ref.clamp(0, v - 1)
         return height_ref.gather(1, ref.view(b, 1))
 
-    def _point_map_norm_to_local_meter(
+    def _point_latlon_height_to_local_meter(
         self,
-        point_map: torch.Tensor,
-        scene_xy_scale: Any,
+        point_latlon_norm: torch.Tensor,
+        height_abs: torch.Tensor,
+        scene_latlon_center: Any,
+        scene_latlon_scale: Any,
     ) -> torch.Tensor:
-        """把点云从 (x_norm,y_norm,h_m) 转为局部米制 (x_l,y_l,h_m)。
+        """Convert normalized lat/lon + height to approximate local-meter centers for Gaussian rendering.
 
-        约定：
-        - 局部米制定义为相对 scene center 的 ENU/墨卡托局部平面坐标，不含平移项；
-        - 仅对 x/y 乘以 scene scale（顺序为 [y, x]），z 保持不变。
+        The point head never predicts height.  This helper combines the plane
+        prediction with ``height_abs`` and converts raw-degree lat/lon deltas
+        around ``scene_latlon_center`` to approximate north/east meters.
         """
-        if scene_xy_scale is None:
-            return point_map
-        if not torch.is_tensor(scene_xy_scale):
-            return point_map
-        if scene_xy_scale.ndim != 2 or scene_xy_scale.shape[-1] != 2:
-            return point_map
-
-        out = point_map.clone()
-        b = int(point_map.shape[0])
-        sx = scene_xy_scale[:, 1].to(device=point_map.device, dtype=point_map.dtype).view(b, 1, 1, 1, 1)
-        sy = scene_xy_scale[:, 0].to(device=point_map.device, dtype=point_map.dtype).view(b, 1, 1, 1, 1)
-        out[:, :, 0:1] = out[:, :, 0:1] * sx
-        out[:, :, 1:2] = out[:, :, 1:2] * sy
-        return out
+        if scene_latlon_center is None or scene_latlon_scale is None:
+            raise ValueError("scene_latlon_center/scale are required to convert point_latlon_norm to Gaussian local-meter centers")
+        if not (torch.is_tensor(scene_latlon_center) and torch.is_tensor(scene_latlon_scale)):
+            raise ValueError("scene_latlon_center/scale must be tensors for point-latlon Gaussian conversion")
+        b = int(point_latlon_norm.shape[0])
+        center = scene_latlon_center.to(device=point_latlon_norm.device, dtype=point_latlon_norm.dtype)
+        scale = scene_latlon_scale.to(device=point_latlon_norm.device, dtype=point_latlon_norm.dtype)
+        if center.ndim != 2 or scale.ndim != 2 or center.shape != (b, 2) or scale.shape != (b, 2):
+            raise ValueError(f"scene_latlon_center/scale must be [B,2], got {tuple(center.shape)} and {tuple(scale.shape)}")
+        dlat_deg = point_latlon_norm[:, :, 0:1] * scale[:, 0].view(b, 1, 1, 1, 1)
+        dlon_deg = point_latlon_norm[:, :, 1:2] * scale[:, 1].view(b, 1, 1, 1, 1)
+        lat0 = torch.deg2rad(center[:, 0]).view(b, 1, 1, 1, 1)
+        north_m = dlat_deg * 111320.0
+        east_m = dlon_deg * 111320.0 * torch.cos(lat0)
+        return torch.cat([east_m, north_m, height_abs], dim=2)
 
     def forward(self, batch: dict[str, Any]) -> dict[str, Any]:
         """执行 Sat2World 前向。
@@ -292,7 +355,9 @@ class Sat2World(nn.Module):
             batch["images"]: [B,V,3,H,W]
             batch["rpc_init"]: 长度 B 的 list，每项是长度 V 的 RPC 列表
             batch["scene_xy_center"]: 可选 [B,2] 或 list，顺序 (y,x)
-            batch["scene_xy_scale"]: 可选 [B,2] 或 list，顺序 (y,x)
+            batch["scene_xy_scale"]: 可选 [B,2] 或 list，顺序 (y,x)，legacy renderer local-meter path
+            batch["scene_latlon_center"]: 可选 [B,2]，顺序 (lat,lon)，point/geometry 主坐标
+            batch["scene_latlon_scale"]: 可选 [B,2]，顺序 (lat,lon)，point/geometry 主坐标
             batch["height_ref"]: 可选 [B,V]
             batch["ref_view_idx"]: 可选，int 或 [B]
 
@@ -310,6 +375,8 @@ class Sat2World(nn.Module):
 
         scene_xy_center = batch.get("scene_xy_center", None)
         scene_xy_scale = batch.get("scene_xy_scale", None)
+        scene_latlon_center = batch.get("scene_latlon_center", None)
+        scene_latlon_scale = batch.get("scene_latlon_scale", None)
         ref_view_idx = batch.get("ref_view_idx", 0)
 
         # 1) Backbone 特征提取
@@ -343,9 +410,14 @@ class Sat2World(nn.Module):
             rpc_batch=rpc_init,
             patch_centers=patch_centers,
             height_ref=height_ref,
-            scene_xy_center=scene_xy_center,
-            scene_xy_scale=scene_xy_scale,
+            scene_latlon_center=scene_latlon_center,
+            scene_latlon_scale=scene_latlon_scale,
         )
+        if int(geom_feat.shape[-1]) != int(self.cfg.geometry_feature_dim):
+            raise ValueError(
+                f"Geometry feature dim mismatch: computed {int(geom_feat.shape[-1])}, "
+                f"configured model.geometry_feature_dim={int(self.cfg.geometry_feature_dim)}"
+            )
         geom_tok = self.geom_mlp(geom_feat)
         fused_tok = self.fuser(patch_tokens_vis, patch_tokens_detail, geom_tok)
 
@@ -366,6 +438,38 @@ class Sat2World(nn.Module):
         layer_idx = max(0, min(layer_idx, patch_tokens_layers.shape[1] - 1))
         patch_tokens_layer_sel = patch_tokens_layers[:, layer_idx]
         patch_tokens_nce_proj = self.nce_projector(patch_tokens_layer_sel)
+
+        if self.runtime_early_pretrain_only:
+            image_hw = (int(backbone_out["orig_hw"][0]), int(backbone_out["orig_hw"][1]))
+            early_match = self.early_global_match_head(
+                patch_tokens_final,
+                patch_centers,
+                patch_valid_mask,
+                image_hw=image_hw,
+            )
+            early_projection = self.early_projection_head(patch_tokens_final, view_tokens_final, image_hw=image_hw)
+            # Graph-connected dummy height output keeps the height head in the
+            # DDP graph even when a batch has no valid rpc_gt correspondence.
+            early_height_dummy_0_to_1 = self.early_height_head(patch_tokens_final[:, 0], patch_tokens_final[:, 1])
+            early_height_dummy_1_to_0 = self.early_height_head(patch_tokens_final[:, 1], patch_tokens_final[:, 0])
+            return {
+                "patch_tokens_final": patch_tokens_final,
+                "patch_tokens_match": patch_tokens_layer_sel,
+                "patch_tokens_layer_for_nce": patch_tokens_layer_sel,
+                "patch_tokens_nce_proj": patch_tokens_nce_proj,
+                "view_tokens_final": view_tokens_final,
+                "scene_token_final": scene_token_final,
+                "patch_valid_mask": patch_valid_mask,
+                "patch_centers": patch_centers,
+                "patch_grid_hw": (gh, gw),
+                "patch_padded_hw": backbone_out["pad_hw"],
+                "early_match": early_match,
+                "early_projection": early_projection,
+                "early_height_dummy_0_to_1": early_height_dummy_0_to_1,
+                "early_height_dummy_1_to_0": early_height_dummy_1_to_0,
+                "early_pretrain_only": True,
+                "gaussian_branch_enabled": False,
+            }
 
         with torch.autocast(device_type=device.type, enabled=False):
             # 4) 单阶段仿射预测（参考视图约束在 loss 阶段处理）
@@ -410,35 +514,28 @@ class Sat2World(nn.Module):
             height_abs = height_anchor_map + height_local_offset
             check_nan(height_abs,"height_abs")
 
-            # 8) 点云分支（独立 anchor）
+            # 8) Point plane branch: predict only normalized raw lat/lon plane coordinates.
+            # Height is exclusively provided by height_abs/height heads.
             image_grid = make_image_grid(h, w, device=device, dtype=torch.float32)
-            point_anchor = self.rpc_ops.build_point_anchor_map_batch(
+            point_latlon_anchor = self.rpc_ops.build_point_latlon_anchor_map_batch(
                 rpc_init_batch=rpc_init,
                 pixel_grid=image_grid,
                 height_ref=height_ref,
-                scene_xy_center=scene_xy_center,
-                scene_xy_scale=scene_xy_scale,
+                scene_latlon_center=scene_latlon_center,
+                scene_latlon_scale=scene_latlon_scale,
             )
 
             point_feat = self.point_adapter(dense_feat.float())
-            point_xy_pred = self.point_xy_head(point_feat)
-            x_logits = self._reshape_logits_to_bv(point_xy_pred["x_logits"], b, v)
-            y_logits = self._reshape_logits_to_bv(point_xy_pred["y_logits"], b, v)
-            x_fine = self._reshape_logits_to_bv(point_xy_pred["x_fine"], b, v)
-            y_fine = self._reshape_logits_to_bv(point_xy_pred["y_fine"], b, v)
-            dx, dx_coarse, dx_fine = self.point_xy_coder_x.decode(x_logits, x_fine, channel_dim=2)
-            dy, dy_coarse, dy_fine = self.point_xy_coder_y.decode(y_logits, y_fine, channel_dim=2)
-            point_x = point_anchor[:, :, 0:1] + dx.unsqueeze(2)
-            point_y = point_anchor[:, :, 1:2] + dy.unsqueeze(2)
-
-            point_z_local_raw_z_bv = self.point_z_local_head(point_feat)
-            point_z_local_raw_z = self._reshape_logits_to_bv(point_z_local_raw_z_bv, b, v)
-            point_z_local_dec = self.height_offset_decoder(point_z_local_raw_z, scale=self.cfg.height_local_scale)
-            point_z_local_z = point_z_local_dec["z"]
-            point_z_local_offset = point_z_local_dec["offset"]
-            point_z = height_anchor_map + point_z_local_offset
-            point_abs = torch.cat([point_x, point_y, point_z], dim=2)
-
+            point_latlon_pred = self.point_latlon_head(point_feat)
+            lat_logits = self._reshape_logits_to_bv(point_latlon_pred["lat_logits"], b, v)
+            lon_logits = self._reshape_logits_to_bv(point_latlon_pred["lon_logits"], b, v)
+            lat_fine = self._reshape_logits_to_bv(point_latlon_pred["lat_fine"], b, v)
+            lon_fine = self._reshape_logits_to_bv(point_latlon_pred["lon_fine"], b, v)
+            dlat, dlat_coarse, dlat_fine = self.point_lat_coder.decode(lat_logits, lat_fine, channel_dim=2)
+            dlon, dlon_coarse, dlon_fine = self.point_lon_coder.decode(lon_logits, lon_fine, channel_dim=2)
+            point_lat = point_latlon_anchor[:, :, 0:1] + dlat.unsqueeze(2)
+            point_lon = point_latlon_anchor[:, :, 1:2] + dlon.unsqueeze(2)
+            point_latlon_norm = torch.cat([point_lat, point_lon], dim=2)
         gaussian_enabled = bool(self.cfg.enable_gaussian_branch) and (not self.runtime_pretrain_geometry_only)
 
         out = {
@@ -454,15 +551,12 @@ class Sat2World(nn.Module):
             "height_local_offset": height_local_offset,
             "height_anchor_raw_z": height_anchor_raw_z,
             "height_local_raw_z": height_local_raw_z,
-            "point_anchor": point_anchor,
-            "point_abs": point_abs,
-            "point_delta_xy_coarse": torch.cat([dx_coarse.unsqueeze(2), dy_coarse.unsqueeze(2)], dim=2),
-            "point_delta_xy_fine": torch.cat([dx_fine.unsqueeze(2), dy_fine.unsqueeze(2)], dim=2),
-            "point_logits": {"x": x_logits, "y": y_logits},
-            "point_fine_raw": {"x": x_fine, "y": y_fine},
-            "point_z_local_z": point_z_local_z,
-            "point_z_local_offset": point_z_local_offset,
-            "point_z_local_raw_z": point_z_local_raw_z,
+            "point_latlon_anchor": point_latlon_anchor,
+            "point_latlon_norm": point_latlon_norm,
+            "point_delta_latlon_coarse": torch.cat([dlat_coarse.unsqueeze(2), dlon_coarse.unsqueeze(2)], dim=2),
+            "point_delta_latlon_fine": torch.cat([dlat_fine.unsqueeze(2), dlon_fine.unsqueeze(2)], dim=2),
+            "point_logits": {"lat": lat_logits, "lon": lon_logits},
+            "point_fine_raw": {"lat": lat_fine, "lon": lon_fine},
             "height_z_max": torch.tensor(float(self.cfg.height_z_max), device=device, dtype=height_abs.dtype),
             "height_anchor_scale": torch.tensor(float(self.cfg.height_anchor_scale), device=device, dtype=height_abs.dtype),
             "height_local_scale": torch.tensor(float(self.cfg.height_local_scale), device=device, dtype=height_abs.dtype),
@@ -504,7 +598,7 @@ class Sat2World(nn.Module):
                 scene_xy_scale=scene_scale_for_rpc,
                 downsample_factor=self._current_center_downsample(),
             )
-            centers_point = self._point_map_norm_to_local_meter(point_abs, scene_xy_scale)
+            centers_point = self._point_latlon_height_to_local_meter(point_latlon_norm, height_abs, scene_latlon_center, scene_latlon_scale)
             out.update(
                 {
                     "gaussian_opacity": gaussian_opacity,

@@ -27,6 +27,7 @@ from .io import (
     ViewRecord,
     compute_valid_crop_anchor_bbox,
     estimate_scene_xy_center_scale,
+    estimate_scene_latlon_center_scale,
     load_or_scan_dataset_root,
     linesamp_to_raw_xy,
     raw_xy_to_linesamp,
@@ -80,6 +81,7 @@ class RPCSceneDataset(Dataset):
         fit_pinhole_cfg: Optional[Mapping[str, Any]] = None,
         fit_pinhole_keep_diagnostics: bool = False,
         fixed_eval_randomness: bool = True,
+        augment: Optional[Mapping[str, Any]] = None,
     ) -> None:
         super().__init__()
         mode = mode.lower()
@@ -130,6 +132,27 @@ class RPCSceneDataset(Dataset):
         # 验证/测试默认使用“随机但固定”的样本生成策略：
         # 仅由 (base_seed, scene_id, index) 决定，跨 epoch 保持不变，避免评估协议抖动。
         self.fixed_eval_randomness = bool(fixed_eval_randomness)
+        self.augment_cfg = dict(augment or {})
+        self.color_jitter_cfg = dict(self.augment_cfg.get("color_jitter", {}) or {})
+        self.color_jitter_enable = bool(self.color_jitter_cfg.get("enable", False))
+        self.color_jitter_p = float(self.color_jitter_cfg.get("p", 1.0))
+        self.color_jitter_same_across_views = bool(self.color_jitter_cfg.get("same_across_views", False))
+        if self.color_jitter_enable:
+            import importlib.util
+
+            if importlib.util.find_spec("torchvision") is None:
+                raise ImportError("ColorJitter augmentation requires torchvision; disable data.*.augment.color_jitter.enable or install torchvision.")
+            from torchvision.transforms import ColorJitter
+
+            self.color_jitter = ColorJitter(
+                brightness=self.color_jitter_cfg.get("brightness", 0.0),
+                contrast=self.color_jitter_cfg.get("contrast", 0.0),
+                saturation=self.color_jitter_cfg.get("saturation", 0.0),
+                hue=self.color_jitter_cfg.get("hue", 0.0),
+            )
+        else:
+            self.color_jitter = None
+
         if fit_pinhole_cfg is None:
             self.fit_pinhole_cfg = RPC2PinholeFitCfg()
         else:
@@ -369,6 +392,72 @@ class RPCSceneDataset(Dataset):
         }
         return windows, debug
 
+
+    def _apply_color_jitter(self, images: torch.Tensor, rng) -> torch.Tensor:
+        """Apply deterministic torchvision ColorJitter to ``images`` only."""
+        if self.color_jitter is None or not self.color_jitter_enable or self.color_jitter_p <= 0.0:
+            return images
+        from torchvision.transforms import ColorJitter
+        from torchvision.transforms import functional as tvf
+
+        out = images.clone()
+
+        def _apply_transform(img: torch.Tensor, transform) -> torch.Tensor:
+            if callable(transform):
+                return transform(img)
+            fn_idx, brightness, contrast, saturation, hue = transform
+            out_img = img
+            for fn_id in fn_idx:
+                fid = int(fn_id)
+                if fid == 0 and brightness is not None:
+                    out_img = tvf.adjust_brightness(out_img, float(brightness))
+                elif fid == 1 and contrast is not None:
+                    out_img = tvf.adjust_contrast(out_img, float(contrast))
+                elif fid == 2 and saturation is not None:
+                    out_img = tvf.adjust_saturation(out_img, float(saturation))
+                elif fid == 3 and hue is not None:
+                    out_img = tvf.adjust_hue(out_img, float(hue))
+            return out_img
+
+        def _jitter_one(img: torch.Tensor, seed: int) -> torch.Tensor:
+            if float(rng.random()) >= self.color_jitter_p:
+                return img
+            state = torch.random.get_rng_state()
+            torch.manual_seed(int(seed) % (2**63 - 1))
+            try:
+                transform = ColorJitter.get_params(
+                    self.color_jitter.brightness,
+                    self.color_jitter.contrast,
+                    self.color_jitter.saturation,
+                    self.color_jitter.hue,
+                )
+            finally:
+                torch.random.set_rng_state(state)
+            return _apply_transform(img, transform).clamp(0.0, 1.0)
+
+        if self.color_jitter_same_across_views:
+            seed = int(rng.integers(0, 2**31 - 1))
+            if float(rng.random()) < self.color_jitter_p:
+                state = torch.random.get_rng_state()
+                torch.manual_seed(seed)
+                try:
+                    transform = ColorJitter.get_params(
+                        self.color_jitter.brightness,
+                        self.color_jitter.contrast,
+                        self.color_jitter.saturation,
+                        self.color_jitter.hue,
+                    )
+                finally:
+                    torch.random.set_rng_state(state)
+                out = torch.stack([_apply_transform(img, transform).clamp(0.0, 1.0) for img in out], dim=0)
+            return out.to(dtype=images.dtype)
+
+        jittered = []
+        for img in out:
+            seed = int(rng.integers(0, 2**31 - 1))
+            jittered.append(_jitter_one(img, seed))
+        return torch.stack(jittered, dim=0).to(dtype=images.dtype)
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         scene_record = self._scene_from_index(index)
         scene_id = scene_record.scene_id
@@ -423,6 +512,7 @@ class RPCSceneDataset(Dataset):
             crop_lefts.append(int(left))
 
         images_t = torch.stack(images, dim=0).to(torch.float32)  # [V,3,512,512]
+        images_t = self._apply_color_jitter(images_t, rng)
         height_gt_t = torch.stack(heights, dim=0).to(torch.float32)  # [V,1,512,512]
         height_mask_t = torch.stack(height_masks, dim=0).to(torch.float32)  # [V,1,512,512]
         valid_mask = height_mask_t > 0.5
@@ -465,6 +555,11 @@ class RPCSceneDataset(Dataset):
             selected_image_shapes=image_shapes_crop,
             selected_height_ref=height_ref,
             ref_view_idx=ref_view_idx,
+        )
+        scene_latlon_center, scene_latlon_scale = estimate_scene_latlon_center_scale(
+            ref_rpc_gt=rpc_gt_views[ref_view_idx_int],
+            image_hw=(self.crop_size, self.crop_size),
+            h_offset=rpc_gt_views[ref_view_idx_int].HEIGHT_OFF,
         )
 
         view_pinhole_K = None
@@ -510,6 +605,8 @@ class RPCSceneDataset(Dataset):
             "height_anchor_offset_gt": height_anchor_offset_gt.to(torch.float32),
             "scene_xy_center": scene_xy_center.to(torch.float32),
             "scene_xy_scale": scene_xy_scale.to(torch.float32),
+            "scene_latlon_center": scene_latlon_center.to(torch.float32),  # [2] lat/lon raw-degree normalization center
+            "scene_latlon_scale": scene_latlon_scale.to(torch.float32),  # [2] lat/lon raw-degree normalization scale
             "ref_view_idx": int(ref_view_idx),
             "scene_id": int(scene_id),
             "view_ids": torch.tensor([v.view_id for v in selected_views], dtype=torch.long),
@@ -563,7 +660,7 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     href_anchor_b, h_anchor_gt_b, h_anchor_off_gt_b = [], [], []
     rpc_gt_b, rpc_init_b = [], []
     view_ids_b, image_paths_b = [], []
-    scene_center_b, scene_scale_b, ref_idx_b, scene_id_b = [], [], [], []
+    scene_center_b, scene_scale_b, scene_latlon_center_b, scene_latlon_scale_b, ref_idx_b, scene_id_b = [], [], [], [], [], []
     crop_tops_b, crop_lefts_b = [], []
     crop_anchor_xy_b, crop_anchor_h_b, max_center_dist_b = [], [], []
     anchor_ls_b, anchor_h_b = [], []
@@ -601,6 +698,10 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
 
         scene_center_b.append(sample["scene_xy_center"])
         scene_scale_b.append(sample["scene_xy_scale"])
+        if "scene_latlon_center" in sample:
+            scene_latlon_center_b.append(sample["scene_latlon_center"])
+        if "scene_latlon_scale" in sample:
+            scene_latlon_scale_b.append(sample["scene_latlon_scale"])
         ref_idx_b.append(0)
         scene_id_b.append(int(sample["scene_id"]))
 
@@ -650,6 +751,10 @@ def rpc_scene_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "view_ids": torch.stack(view_ids_b, dim=0).to(torch.long),
         "image_paths": image_paths_b,
     }
+    if len(scene_latlon_center_b) > 0:
+        out["scene_latlon_center"] = torch.stack(scene_latlon_center_b, dim=0).to(torch.float32)
+    if len(scene_latlon_scale_b) > 0:
+        out["scene_latlon_scale"] = torch.stack(scene_latlon_scale_b, dim=0).to(torch.float32)
     if len(crop_tops_b) > 0:
         out["crop_tops"] = torch.stack(crop_tops_b, dim=0).to(torch.long)
     if len(crop_lefts_b) > 0:

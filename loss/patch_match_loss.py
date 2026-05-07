@@ -11,7 +11,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from loss.common import sample_map_bilinear
+from loss.correspondence_utils import build_patch_correspondence_gt
 
 
 @dataclass
@@ -69,16 +69,6 @@ class PatchInternalMatchLoss:
         dtype = patch_tokens_match.dtype
         p = int(self.cfg.patch_size)
 
-        hgt = batch["height_gt"].to(device=device, dtype=dtype)
-        hmask = batch["height_valid_mask"].to(device=device, dtype=dtype)
-        rpc_gt = batch["rpc_gt"]
-        scene_xy_center = batch.get("scene_xy_center", None)
-        scene_xy_scale = batch.get("scene_xy_scale", None)
-        h_img = int(batch["images"].shape[-2])
-        w_img = int(batch["images"].shape[-1])
-
-        centers = patch_centers.to(device=device, dtype=dtype).view(1, n, 2)
-
         src_tok_all: list[torch.Tensor] = []
         tgt_tok_all: list[torch.Tensor] = []
         tgt_local_all: list[torch.Tensor] = []
@@ -91,124 +81,57 @@ class PatchInternalMatchLoss:
         sampled_pairs_debug: dict[int, list[tuple[int, int]]] = {}
         total_before_filter = 0
 
+        view_pairs = self._sample_view_pairs(v, int(self.cfg.match_max_pair), device=device)
         for bi in range(b):
-            view_pairs = self._sample_view_pairs(v, int(self.cfg.match_max_pair), device=device)
             sampled_pairs_debug[int(bi)] = view_pairs
-            for vi, vj in view_pairs:
-                src_valid = patch_valid_mask[bi : bi + 1, vi]
-                if not bool(src_valid.any()):
-                    continue
+        for vi, vj in view_pairs:
+            corr = build_patch_correspondence_gt(
+                geometry_ops=self.geometry_ops,
+                batch=batch,
+                patch_centers=patch_centers,
+                patch_valid_mask=patch_valid_mask,
+                patch_grid_hw=patch_grid_hw,
+                patch_padded_hw=(gh * p, gw * p),
+                src_view_idx=vi,
+                tgt_view_idx=vj,
+                rpc_key="rpc_gt",
+                require_target_patch_valid=True,
+            )
+            total_before_filter += int(corr.before_filter_count)
+            if corr.num_valid == 0:
+                continue
 
-                h_src, in_h = sample_map_bilinear(hgt[bi : bi + 1, vi], centers)
-                m_src, in_m = sample_map_bilinear(hmask[bi : bi + 1, vi], centers)
-                h_src = h_src[:, 0]
-                valid_src = src_valid & in_h & in_m & (m_src[:, 0] > 0.5)
-                finite_src = torch.isfinite(centers[..., 0]) & torch.isfinite(centers[..., 1]) & torch.isfinite(h_src)
-                valid_src = valid_src & finite_src
-                if not bool(valid_src.any()):
-                    continue
+            src_tok_part = patch_tokens_match[corr.batch_indices, corr.src_view_indices, corr.src_patch_indices]
+            tgt_tok_part = patch_tokens_match[corr.batch_indices, corr.tgt_view_indices, corr.tgt_patch_indices]
+            tgt_local = corr.tgt_local_pixels.to(device=device, dtype=dtype)
+            finite_tok = (
+                torch.isfinite(src_tok_part).all(dim=-1)
+                & torch.isfinite(tgt_tok_part).all(dim=-1)
+                & torch.isfinite(tgt_local).all(dim=-1)
+            )
+            if not bool(finite_tok.any()):
+                continue
+            src_tok_part = src_tok_part[finite_tok]
+            tgt_tok_part = tgt_tok_part[finite_tok]
+            tgt_local = tgt_local[finite_tok]
+            meta_batch = corr.batch_indices[finite_tok]
+            meta_src_view = corr.src_view_indices[finite_tok]
+            meta_tgt_view = corr.tgt_view_indices[finite_tok]
+            src_global = corr.src_pixels[finite_tok]
+            tgt_global = corr.tgt_pixels[finite_tok]
+            tgt_row = (corr.tgt_patch_indices[finite_tok] // gw).to(dtype=dtype)
+            tgt_col = (corr.tgt_patch_indices[finite_tok] % gw).to(dtype=dtype)
+            tgt_patch_topleft = torch.stack([tgt_row * float(p), tgt_col * float(p)], dim=-1)
 
-                src_idx = valid_src[0].nonzero(as_tuple=False).squeeze(1)
-                src_pts = centers[:, src_idx]
-                h_valid = h_src[:, src_idx]
-                if not bool(torch.isfinite(src_pts).all()) or not bool(torch.isfinite(h_valid).all()):
-                    continue
-
-                xs, ys = self.geometry_ops.linesamp_to_xy_batch(
-                    rpc_batch=[[rpc_gt[bi][vi]]],
-                    lines=src_pts[..., 0].view(1, 1, -1),
-                    samps=src_pts[..., 1].view(1, 1, -1),
-                    heights=h_valid.view(1, 1, -1),
-                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
-                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
-                )
-                l_tgt, s_tgt = self.geometry_ops.xy_to_linesamp_batch(
-                    rpc_batch=[[rpc_gt[bi][vj]]],
-                    xs=xs,
-                    ys=ys,
-                    heights=h_valid.view(1, 1, -1),
-                    scene_xy_center=None if scene_xy_center is None else scene_xy_center[bi : bi + 1],
-                    scene_xy_scale=None if scene_xy_scale is None else scene_xy_scale[bi : bi + 1],
-                )
-                l_tgt = l_tgt.view(-1)
-                s_tgt = s_tgt.view(-1)
-                finite_tgt = torch.isfinite(l_tgt) & torch.isfinite(s_tgt)
-                if not bool(finite_tgt.any()):
-                    continue
-                src_idx = src_idx[finite_tgt]
-                l_tgt = l_tgt[finite_tgt]
-                s_tgt = s_tgt[finite_tgt]
-                total_before_filter += int(src_idx.shape[0])
-
-                in_tgt = (l_tgt >= 0) & (l_tgt <= (h_img - 1)) & (s_tgt >= 0) & (s_tgt <= (w_img - 1))
-                if not bool(in_tgt.any()):
-                    continue
-
-                src_idx = src_idx[in_tgt]
-                l_tgt = l_tgt[in_tgt]
-                s_tgt = s_tgt[in_tgt]
-
-                tgt_row = torch.round((l_tgt + 0.5) / float(p) - 0.5).long().clamp(0, gh - 1)
-                tgt_col = torch.round((s_tgt + 0.5) / float(p) - 0.5).long().clamp(0, gw - 1)
-                tgt_flat = tgt_row * gw + tgt_col
-
-                tgt_valid = patch_valid_mask[bi, vj, tgt_flat]
-                if not bool(tgt_valid.any()):
-                    continue
-
-                src_idx = src_idx[tgt_valid]
-                tgt_flat = tgt_flat[tgt_valid]
-                l_tgt = l_tgt[tgt_valid]
-                s_tgt = s_tgt[tgt_valid]
-                tgt_row = tgt_row[tgt_valid]
-                tgt_col = tgt_col[tgt_valid]
-
-                top_line = tgt_row.to(dtype=dtype) * float(p)
-                top_samp = tgt_col.to(dtype=dtype) * float(p)
-                local_line = (l_tgt - top_line).clamp(0.0, float(p) - 1e-4)
-                local_samp = (s_tgt - top_samp).clamp(0.0, float(p) - 1e-4)
-                tgt_local = torch.stack([local_line, local_samp], dim=-1)
-                finite_local = torch.isfinite(tgt_local).all(dim=-1)
-                if not bool(finite_local.any()):
-                    continue
-
-                src_idx = src_idx[finite_local]
-                tgt_flat = tgt_flat[finite_local]
-                l_tgt = l_tgt[finite_local]
-                s_tgt = s_tgt[finite_local]
-                tgt_local = tgt_local[finite_local]
-                top_line = top_line[finite_local]
-                top_samp = top_samp[finite_local]
-
-                src_tok_part = patch_tokens_match[bi, vi, src_idx]
-                tgt_tok_part = patch_tokens_match[bi, vj, tgt_flat]
-                finite_tok = torch.isfinite(src_tok_part).all(dim=-1) & torch.isfinite(tgt_tok_part).all(dim=-1)
-                if not bool(finite_tok.any()):
-                    continue
-
-                src_tok_part = src_tok_part[finite_tok]
-                tgt_tok_part = tgt_tok_part[finite_tok]
-                tgt_local = tgt_local[finite_tok]
-                l_tgt = l_tgt[finite_tok]
-                s_tgt = s_tgt[finite_tok]
-                top_line = top_line[finite_tok]
-                top_samp = top_samp[finite_tok]
-                src_idx = src_idx[finite_tok]
-
-                src_tok_all.append(src_tok_part)
-                tgt_tok_all.append(tgt_tok_part)
-                tgt_local_all.append(tgt_local)
-
-                n_pair = int(src_tok_part.shape[0])
-                src_global = centers[0, src_idx]
-                tgt_global = torch.stack([l_tgt, s_tgt], dim=-1)
-                tgt_patch_topleft = torch.stack([top_line, top_samp], dim=-1)
-                meta_batch_all.append(torch.full((n_pair,), int(bi), dtype=torch.long, device=device))
-                meta_src_view_all.append(torch.full((n_pair,), int(vi), dtype=torch.long, device=device))
-                meta_tgt_view_all.append(torch.full((n_pair,), int(vj), dtype=torch.long, device=device))
-                src_global_pts_all.append(src_global)
-                tgt_global_pts_all.append(tgt_global)
-                tgt_patch_topleft_all.append(tgt_patch_topleft)
+            src_tok_all.append(src_tok_part)
+            tgt_tok_all.append(tgt_tok_part)
+            tgt_local_all.append(tgt_local)
+            meta_batch_all.append(meta_batch)
+            meta_src_view_all.append(meta_src_view)
+            meta_tgt_view_all.append(meta_tgt_view)
+            src_global_pts_all.append(src_global)
+            tgt_global_pts_all.append(tgt_global)
+            tgt_patch_topleft_all.append(tgt_patch_topleft)
 
         param_stub = torch.zeros((), device=device, dtype=dtype)
         for p_match in self.patch_matcher.parameters():

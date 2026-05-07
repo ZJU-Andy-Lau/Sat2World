@@ -28,7 +28,7 @@ from loss.feature_nce_loss import FeatureInfoNCELoss, FeatureInfoNCELossCfg
 from loss.height_loss import HeightHuberLoss
 from loss.normal_loss import PointNormalLoss, PointNormalLossCfg
 from loss.patch_match_loss import PatchInternalMatchLoss, PatchInternalMatchLossCfg
-from loss.point_loss import PointMapLoss
+from loss.point_loss import PointLatLonLoss
 from loss.point_pair_loss import HeightReprojectionLoss, PointPairwiseConsistencyLoss, PointPairwiseLossCfg, PointReprojectionLoss
 from loss.regularization_loss import CenterConsistencyLoss, CoderProbe, GaussianRegularizationLoss
 from loss.render_loss import RenderPathLoss
@@ -60,16 +60,12 @@ class LossWeightScheduler:
             "lambda_height": 1.0,
             "lambda_height_anchor": 0.5,
             "lambda_point": 1.0,
-            "lambda_point_xy": 1.0,
-            "lambda_point_z": 1.0,
             "lambda_height_meter_aux": 1.0e-3,
             "lambda_height_anchor_meter_aux": 1.0e-3,
-            "lambda_point_z_meter_aux": 1.0e-3,
             "lambda_point_reproj": 0.2,
             "lambda_height_reproj": 0.2,
             "lambda_point_pair": 0.2,
             "lambda_normal_height": 0.2,
-            "lambda_normal_point": 0.2,
             "lambda_feature_nce": 0.1,
             "lambda_patch_match": 0.5,
             "lambda_center": 0.2,
@@ -125,11 +121,7 @@ class LossWeightScheduler:
         elif global_step < st2:
             stage_mul = 0.35
             p_base = w.get("lambda_point", 0.0)
-            pxy_base = w.get("lambda_point_xy", p_base)
-            pz_base = w.get("lambda_point_z", p_base)
             w["lambda_point"] = p_base * stage_mul
-            w["lambda_point_xy"] = pxy_base * stage_mul
-            w["lambda_point_z"] = pz_base * stage_mul
             w["lambda_point_pair"] = w.get("lambda_point_pair", 0.0) * 0.6
             w["lambda_center"] = w["lambda_center"] * stage_mul
             w["lambda_opacity_reg"] = w["lambda_opacity_reg"] * stage_mul
@@ -141,12 +133,8 @@ class LossWeightScheduler:
         if global_step >= int(self.abs_keep_steps):
             h_base = w.get("lambda_height", 0.0)
             p_base = w.get("lambda_point", 0.0)
-            pxy_base = w.get("lambda_point_xy", p_base)
-            pz_base = w.get("lambda_point_z", p_base)
             w["lambda_height"] = h_base * 0.1
             w["lambda_point"] = p_base * 0.1
-            w["lambda_point_xy"] = pxy_base * 0.1
-            w["lambda_point_z"] = pz_base * 0.1
         return w, {"schedule_render_multiplier": mul, "schedule_detail_stage_multiplier": stage_mul}
 
 
@@ -166,13 +154,13 @@ class RPCAnySplatTrainingObjective:
 
     重要字段约定（outputs 期望）:
         必需:
-            affine_pred, height_abs, point_abs, point_anchor,
+            affine_pred, height_abs, point_latlon_norm, point_latlon_anchor,
             gaussian_centers_rpc, gaussian_centers_point,
             gaussian_opacity, gaussian_scale, gaussian_rotation,
             gaussian_confidence_rpc, gaussian_confidence_point,
             rpc_corrected
         可选（用于 probe）:
-            height_anchor, height_local_z, point_z_local_z, height_z_max。
+            height_anchor, height_local_z, height_z_max。
     """
 
     def __init__(
@@ -185,7 +173,6 @@ class RPCAnySplatTrainingObjective:
         point_beta: float = 1.0,
         height_z_beta_meter: float | None = None,
         height_anchor_z_beta_meter: float = 5.0,
-        point_z_beta_meter: float | None = None,
         point_pair_cfg: PointPairwiseLossCfg | None = None,
         feature_nce_cfg: FeatureInfoNCELossCfg | None = None,
         patch_match_cfg: PatchInternalMatchLossCfg | None = None,
@@ -203,10 +190,9 @@ class RPCAnySplatTrainingObjective:
 
         self.height_loss = HeightHuberLoss(beta=height_beta)
         self.height_anchor_loss = torch.nn.SmoothL1Loss(reduction="mean")
-        self.point_loss = PointMapLoss(geometry_ops=geometry_ops, beta=point_beta)
+        self.point_loss = PointLatLonLoss(geometry_ops=geometry_ops, beta=point_beta)
         self.height_z_beta_meter = float(height_beta if height_z_beta_meter is None else height_z_beta_meter)
         self.height_anchor_z_beta_meter = float(height_anchor_z_beta_meter)
-        self.point_z_beta_meter = float(point_beta if point_z_beta_meter is None else point_z_beta_meter)
         self.point_pair_loss = PointPairwiseConsistencyLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.point_reproj_loss = PointReprojectionLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
         self.height_reproj_loss = HeightReprojectionLoss(geometry_ops=geometry_ops, cfg=point_pair_cfg or PointPairwiseLossCfg())
@@ -360,9 +346,8 @@ class RPCAnySplatTrainingObjective:
                 "height_anchor_z",
                 "height_ref_anchor",
                 "height_local_z",
-                "point_abs",
-                "point_anchor",
-                "point_z_local_z",
+                "point_latlon_norm",
+                "point_latlon_anchor",
                 "gaussian_centers_rpc",
                 "gaussian_centers_point",
                 "gaussian_opacity",
@@ -421,14 +406,8 @@ class RPCAnySplatTrainingObjective:
             batch["height_anchor_gt"].to(device=outputs["height_anchor"].device, dtype=outputs["height_anchor"].dtype),
         )
 
-        l_p, p_p, aux_point = self.point_loss(outputs["point_abs"], outputs["point_anchor"], batch, return_aux=True)
-        l_p_xy = aux_point.get("loss_point_xy_meter", l_p)
-        l_p_z_meter = aux_point.get("loss_point_z_meter", torch.zeros_like(l_p))
-        gt_point_z_meter = aux_point.pop("gt_point_z_meter", None)
-        aux_point.pop("gt_point_map_metric", None)
-        aux_point.pop("gt_point_map", None)
-        if gt_point_z_meter is None:
-            raise KeyError("PointMapLoss(return_aux=True) must provide gt_point_z_meter for z-space point supervision.")
+        l_p, p_p, aux_point = self.point_loss(outputs["point_latlon_norm"], outputs["point_latlon_anchor"], batch, return_aux=True)
+        l_p_latlon = aux_point.get("loss_point_latlon_norm", l_p)
 
         height_valid_mask = batch["height_valid_mask"].to(device=outputs["height_abs"].device, dtype=outputs["height_abs"].dtype)
         height_anchor_detached = outputs["height_anchor"].detach()
@@ -453,20 +432,10 @@ class RPCAnySplatTrainingObjective:
             scale=height_anchor_scale,
             z_max=height_z_max,
         )
-        l_p_z_z = masked_z_huber_loss(
-            outputs["point_z_local_z"],
-            gt_point_z_meter - height_anchor_detached.view(-1, 1, 1, 1, 1),
-            mask=height_valid_mask,
-            beta_meter=self.point_z_beta_meter,
-            scale=height_local_scale,
-            z_max=height_z_max,
-        )
-        del gt_point_z_meter
-        l_preproj, p_preproj, aux_preproj = self.point_reproj_loss(outputs["point_abs"], batch)
-        l_ppair, p_ppair, aux_ppair = self.point_pair_loss(outputs["point_abs"], batch)
-        l_nh, l_np, p_norm, aux_norm = self.normal_loss(
+        l_preproj, p_preproj, aux_preproj = self.point_reproj_loss(outputs["point_latlon_norm"], outputs["height_abs"], batch)
+        l_ppair, p_ppair, aux_ppair = self.point_pair_loss(outputs["point_latlon_norm"], batch)
+        l_nh, p_norm, aux_norm = self.normal_loss(
             height_abs=outputs["height_abs"],
-            point_abs=outputs["point_abs"],
             batch=batch,
         )
         l_hreproj, p_hreproj, aux_hreproj = self.height_reproj_loss(outputs["height_abs"], batch)
@@ -530,15 +499,12 @@ class RPCAnySplatTrainingObjective:
                 l_render_point, p_render_point = self.render_point(render_outputs["point"])
         l_ssim = 0.5 * (p_render_rpc.get("render_ssim_loss", zero) + p_render_point.get("render_ssim_loss", zero))
 
-        w_point_xy = weights.get("lambda_point_xy", weights["lambda_point"])
-        w_point_z = weights.get("lambda_point_z", weights["lambda_point"])
+        w_point_latlon = weights["lambda_point"]
         w_h_meter_aux = weights.get("lambda_height_meter_aux", 1.0e-3)
         w_h_anchor_meter_aux = weights.get("lambda_height_anchor_meter_aux", 1.0e-3)
-        w_p_z_meter_aux = weights.get("lambda_point_z_meter_aux", 1.0e-3)
 
         l_h_optim = l_h_z + w_h_meter_aux * l_h
         l_h_anchor_optim = l_h_anchor_z + w_h_anchor_meter_aux * l_h_anchor
-        l_p_z_optim = l_p_z_z + w_p_z_meter_aux * l_p_z_meter
 
         total = (
             weights["lambda_affine_grid"] * l_aff_grid
@@ -546,13 +512,11 @@ class RPCAnySplatTrainingObjective:
             + weights["lambda_affine_reg"] * l_aff_reg
             + weights["lambda_height"] * l_h_optim
             + weights.get("lambda_height_anchor", 0.5) * l_h_anchor_optim
-            + w_point_xy * l_p_xy
-            + w_point_z * l_p_z_optim
+            + w_point_latlon * l_p_latlon
             + weights.get("lambda_point_reproj", 0.0) * l_preproj
             + weights.get("lambda_height_reproj", 0.0) * l_hreproj
             + weights.get("lambda_point_pair", 0.0) * l_ppair
             + weights.get("lambda_normal_height", 0.0) * l_nh
-            + weights.get("lambda_normal_point", 0.0) * l_np
             + weights.get("lambda_feature_nce", 0.0) * l_nce
             + weights.get("lambda_patch_match", 0.0) * l_patch_match
             + weights["lambda_center"] * l_center
@@ -575,15 +539,11 @@ class RPCAnySplatTrainingObjective:
             "loss_height_anchor_optim": l_h_anchor_optim,
             "loss_height_rel": zero,
             "loss_point": l_p,
-            "loss_point_xy": l_p_xy,
-            "loss_point_z": l_p_z_meter,
-            "loss_point_z_z": l_p_z_z,
-            "loss_point_z_optim": l_p_z_optim,
+            "loss_point_latlon_norm": l_p_latlon,
             "loss_point_reproj": l_preproj,
             "loss_height_reproj": l_hreproj,
             "loss_point_pair": l_ppair,
             "loss_normal_height": l_nh,
-            "loss_normal_point": l_np,
             "loss_feature_nce": l_nce,
             "loss_patch_match": l_patch_match,
             "loss_center_consistency": l_center,
@@ -612,18 +572,17 @@ class RPCAnySplatTrainingObjective:
             "metric_height_rel_pairs_used": zero,
             "metric_height_reproj_px_mean": p_hreproj.get("height_reproj_px_mean", zero),
             "metric_height_reproj_num_pairs_used": p_hreproj.get("height_reproj_num_pairs_used", zero),
-            "metric_point_xyz_rmse": p_p.get("point_xyz_rmse", zero),
-            "metric_point_xy_rmse": p_p.get("point_xy_rmse", zero),
-            "metric_point_z_rmse": p_p.get("point_z_rmse", zero),
-            "metric_point_anchor_displacement_mean": p_p.get("point_anchor_displacement_mean", zero),
+            "metric_point_latlon_norm_rmse": p_p.get("point_latlon_norm_rmse", zero),
+            "metric_point_latlon_norm_mae": p_p.get("point_latlon_norm_mae", zero),
+            "metric_point_plane_error_m_mean": p_p.get("point_plane_error_m_mean", zero),
+            "metric_point_plane_error_m_rmse": p_p.get("point_plane_error_m_rmse", zero),
+            "metric_point_latlon_anchor_displacement_mean": p_p.get("point_latlon_anchor_displacement_mean", zero),
             "metric_point_reproj_px_mean": p_preproj.get("point_reproj_px_mean", zero),
             "metric_point_reproj_num_pairs_used": p_preproj.get("point_reproj_num_pairs_used", zero),
-            "metric_point_pair_dist_mean": p_ppair.get("point_pair_dist_mean", zero),
+            "metric_point_pair_dist_mean": p_ppair.get("point_pair_latlon_norm_dist_mean", zero),
             "metric_point_pair_num_pairs_used": p_ppair.get("point_pair_num_pairs_used", zero),
             "metric_normal_h_cos_mean": p_norm.get("normal_h_cos_mean", zero),
             "metric_normal_h_ang_deg_mean": p_norm.get("normal_h_ang_deg_mean", zero),
-            "metric_normal_p_cos_mean": p_norm.get("normal_p_cos_mean", zero),
-            "metric_normal_p_ang_deg_mean": p_norm.get("normal_p_ang_deg_mean", zero),
             "metric_normal_valid_ratio": p_norm.get("normal_valid_ratio", zero),
             "metric_feature_nce_valid_pairs": p_nce.get("feature_nce_valid_pairs", zero),
             "metric_feature_nce_acc_top1": p_nce.get("feature_nce_acc_top1", zero),
@@ -638,7 +597,6 @@ class RPCAnySplatTrainingObjective:
             "probe_gaussian_confidence_point_mean": p_gauss.get("gaussian_confidence_point_mean", zero),
             "probe_gaussian_quat_norm_error": p_gauss.get("gaussian_quat_norm_error", zero),
             "probe_height_local_z_boundary_ratio": p_coder.get("height_local_z_boundary_ratio", zero),
-            "probe_point_z_local_z_boundary_ratio": p_coder.get("point_z_local_z_boundary_ratio", zero),
             "schedule_render_multiplier": schedule_probe["schedule_render_multiplier"],
             "schedule_detail_stage_multiplier": schedule_probe.get("schedule_detail_stage_multiplier", 1.0),
             "weight_affine_grid": weights["lambda_affine_grid"],
@@ -650,14 +608,10 @@ class RPCAnySplatTrainingObjective:
             "weight_height_anchor_meter_aux": w_h_anchor_meter_aux,
             "weight_height_rel": 0.0,
             "weight_point": weights["lambda_point"],
-            "weight_point_xy": w_point_xy,
-            "weight_point_z": w_point_z,
-            "weight_point_z_meter_aux": w_p_z_meter_aux,
             "weight_point_reproj": weights.get("lambda_point_reproj", 0.0),
             "weight_height_reproj": weights.get("lambda_height_reproj", 0.0),
             "weight_point_pair": weights.get("lambda_point_pair", 0.0),
             "weight_normal_height": weights.get("lambda_normal_height", 0.0),
-            "weight_normal_point": weights.get("lambda_normal_point", 0.0),
             "weight_feature_nce": weights.get("lambda_feature_nce", 0.0),
             "weight_patch_match": weights.get("lambda_patch_match", 0.0),
             "weight_center": weights["lambda_center"],

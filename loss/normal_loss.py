@@ -1,11 +1,4 @@
-"""loss.normal_loss
-
-点云法向监督损失：
-- GT 法向来自 rpc_gt + height_gt 构造的 GT 点云；
-- 预测法向来自两条路径：
-  1) rpc_gt + height_abs
-  2) point_abs
-"""
+"""Height-derived local-meter normal supervision."""
 
 from __future__ import annotations
 
@@ -15,8 +8,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from loss.common import masked_reduce,check_nan
-from loss.point_pair_loss import point_map_to_metric
+from loss.common import masked_reduce, check_nan
 
 
 @dataclass
@@ -115,7 +107,7 @@ def normal_alignment_terms(
 
 
 class PointNormalLoss:
-    """基于点云图法向的双路径监督。"""
+    """Normal supervision from RPC-projected height maps only."""
 
     def __init__(self, geometry_ops: Any, cfg: PointNormalLossCfg | None = None) -> None:
         self.geometry_ops = geometry_ops
@@ -135,63 +127,45 @@ class PointNormalLoss:
         self,
         *,
         height_abs: torch.Tensor,
-        point_abs: torch.Tensor,
         batch: dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
-        """返回两条路径的法向损失与 probe。"""
-        if height_abs.ndim != 5 or point_abs.ndim != 5:
-            raise ValueError("height_abs and point_abs must be [B,V,C,H,W]")
-        if point_abs.shape[2] != 3:
-            raise ValueError("point_abs channel dim must be 3")
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
+        """Return height-derived normal loss, probes, and a lightweight mask aux."""
+        if height_abs.ndim != 5:
+            raise ValueError("height_abs must be [B,V,1,H,W]")
 
-        device = point_abs.device
-        dtype = point_abs.dtype
-        _, _, _, h, w = point_abs.shape
+        device = height_abs.device
+        dtype = height_abs.dtype
+        _, _, _, h, w = height_abs.shape
 
         height_gt = batch["height_gt"].to(device=device, dtype=dtype)
         valid_mask = batch["height_valid_mask"].to(device=device, dtype=dtype)
         rpc_gt = batch["rpc_gt"]
         scene_xy_center = batch.get("scene_xy_center", None)
-        scene_xy_scale = batch.get("scene_xy_scale", None)
-        if torch.is_tensor(scene_xy_scale):
-            scene_xy_scale = scene_xy_scale.to(device=device, dtype=dtype)
+        scene_xy_scale = torch.ones_like(scene_xy_center, device=device, dtype=dtype) if torch.is_tensor(scene_xy_center) else None
 
         image_grid = self._get_grid(h, w, device, dtype)
-        gt_point = self.geometry_ops.centers_from_rpc_and_height_batch(
+        gt_metric = self.geometry_ops.centers_from_rpc_and_height_batch(
             corrected_rpc_batch=rpc_gt,
             pixel_grid=image_grid,
             height_abs=height_gt,
             scene_xy_center=scene_xy_center,
             scene_xy_scale=scene_xy_scale,
         )
-        check_nan(gt_point,"norm_loss_gt_point")
-        pred_point_h = self.geometry_ops.centers_from_rpc_and_height_batch(
+        check_nan(gt_metric, "norm_loss_gt_metric")
+        pred_h_metric = self.geometry_ops.centers_from_rpc_and_height_batch(
             corrected_rpc_batch=rpc_gt,
             pixel_grid=image_grid,
             height_abs=height_abs,
             scene_xy_center=scene_xy_center,
             scene_xy_scale=scene_xy_scale,
         )
-        check_nan(pred_point_h,"norm_loss_pred_point_h")
-        pred_point_p = point_abs
-        check_nan(pred_point_p,"norm_loss_pred_point_p")
-
-        metric_scale = scene_xy_scale if torch.is_tensor(scene_xy_scale) else None
-        gt_metric = point_map_to_metric(gt_point, metric_scale)
-        pred_h_metric = point_map_to_metric(pred_point_h, metric_scale)
-        pred_p_metric = point_map_to_metric(pred_point_p, metric_scale)
-        check_nan(gt_metric,"norm_loss_gt_metric")
-        check_nan(pred_h_metric,"norm_loss_pred_h_metric")
-        check_nan(pred_p_metric,"norm_loss_pred_p_metric")
+        check_nan(pred_h_metric, "norm_loss_pred_h_metric")
 
         gt_n, nmask = compute_normals_from_point_map(gt_metric, valid_mask=valid_mask, eps=float(self.cfg.eps))
         gt_n = gt_n.detach()
         pred_h_n, _ = compute_normals_from_point_map(pred_h_metric, valid_mask=valid_mask, eps=float(self.cfg.eps))
-        pred_p_n, _ = compute_normals_from_point_map(pred_p_metric, valid_mask=valid_mask, eps=float(self.cfg.eps))
-        check_nan(gt_n,"norm_loss_gt_n")
-        check_nan(pred_h_n,"norm_loss_pred_h_n")
-        check_nan(pred_p_n,"norm_loss_pred_p_n")
-
+        check_nan(gt_n, "norm_loss_gt_n")
+        check_nan(pred_h_n, "norm_loss_pred_h_n")
 
         l_h_cos, l_h_l1, p_h = normal_alignment_terms(
             pred_h_n,
@@ -200,33 +174,15 @@ class PointNormalLoss:
             sign_invariant=bool(self.cfg.sign_invariant),
             eps=float(self.cfg.eps),
         )
-        l_p_cos, l_p_l1, p_p = normal_alignment_terms(
-            pred_p_n,
-            gt_n,
-            nmask,
-            sign_invariant=bool(self.cfg.sign_invariant),
-            eps=float(self.cfg.eps),
-        )
-        check_nan(l_h_cos,"norm_loss_l_h_cos")
-        check_nan(l_h_l1,"norm_loss_l_h_l1")
-        check_nan(l_p_cos,"norm_loss_l_p_cos")
-        check_nan(l_p_l1,"norm_loss_l_p_l1")
+        check_nan(l_h_cos, "norm_loss_l_h_cos")
+        check_nan(l_h_l1, "norm_loss_l_h_l1")
 
-        w_cos = float(self.cfg.w_cos)
-        w_l1 = float(self.cfg.w_l1)
-        loss_h = torch.nan_to_num(w_cos * l_h_cos + w_l1 * l_h_l1, nan=0.0, posinf=0.0, neginf=0.0)
-        loss_p = torch.nan_to_num(w_cos * l_p_cos + w_l1 * l_p_l1, nan=0.0, posinf=0.0, neginf=0.0)
-        check_nan(loss_h,"norm_loss_loss_h")
-        check_nan(loss_p,"norm_loss_loss_p")
+        loss_h = torch.nan_to_num(float(self.cfg.w_cos) * l_h_cos + float(self.cfg.w_l1) * l_h_l1, nan=0.0, posinf=0.0, neginf=0.0)
+        check_nan(loss_h, "norm_loss_loss_h")
 
         probe = {
             "normal_h_cos_mean": p_h["normal_cos_mean"],
             "normal_h_ang_deg_mean": p_h["normal_ang_deg_mean"],
-            "normal_p_cos_mean": p_p["normal_cos_mean"],
-            "normal_p_ang_deg_mean": p_p["normal_ang_deg_mean"],
             "normal_valid_ratio": p_h["normal_valid_ratio"],
         }
-        aux = {
-            "normal_mask": nmask,
-        }
-        return loss_h, loss_p, probe, aux
+        return loss_h, probe, {"normal_mask": nmask}

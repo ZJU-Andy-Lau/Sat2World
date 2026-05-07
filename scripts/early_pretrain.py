@@ -1,7 +1,8 @@
-"""Sat2World 几何预训练入口。
+"""Sat2World early pretrain phase-1 scaffold.
 
-目标：仅训练几何主线（仿射 / 高程 / 点云），
-不引入 3DGS 渲染及其相关损失。
+This entry disables Gaussian/render training and uses a minimal objective over
+existing patch NCE and patch-match outputs only. Dedicated early heads are left
+for later phases.
 """
 
 from __future__ import annotations
@@ -21,8 +22,8 @@ if str(_ROOT) not in sys.path:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser("Sat2World Geometry Pretrain")
-    p.add_argument("--config", type=str, default="config/pretrain.yaml")
+    p = argparse.ArgumentParser("Sat2World Early Pretrain")
+    p.add_argument("--config", type=str, default="default_configs/early_pretrain.yaml")
     p.add_argument("--work-dir", type=str, default="")
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--checkpoint", type=str, default="")
@@ -60,60 +61,27 @@ def build_model(cfg: dict[str, Any]) -> Any:
     return _build_model(cfg)
 
 
-def build_objective(cfg: dict[str, Any], geometry_ops: Any, patch_matcher: torch.nn.Module) -> Any:
-    from loss.affine_loss import AffineGridLossCfg, AffinePairwiseGeometryLossCfg
+def build_objective(cfg: dict[str, Any], model: torch.nn.Module) -> Any:
+    from loss.early_pretrain_objective import EarlyPretrainObjective, EarlyPretrainWeightCfg
     from loss.feature_nce_loss import FeatureInfoNCELossCfg
-    from loss.normal_loss import PointNormalLossCfg
     from loss.patch_match_loss import PatchInternalMatchLossCfg
-    from loss.point_pair_loss import PointPairwiseLossCfg
-    from loss.pretrain_objective import GeometryPretrainObjective, GeometryPretrainWeightCfg
 
     lcfg = cfg.get("loss", {})
-    pair_cfg = AffinePairwiseGeometryLossCfg(
-        anchors_per_pair=int(lcfg.get("anchors_per_pair", 256)),
-        max_pairs=lcfg.get("max_pairs", None),
-        sample_from_valid_only=bool(lcfg.get("sample_from_valid_only", True)),
-    )
-    grid_cfg = AffineGridLossCfg(
-        grid_h=int(lcfg.get("affine_grid_h", 16)),
-        grid_w=int(lcfg.get("affine_grid_w", 16)),
-    )
-    weights = GeometryPretrainWeightCfg(
-        lambda_affine_grid=float(lcfg.get("lambda_affine_grid", 1.0)),
-        lambda_affine_pair=float(lcfg.get("lambda_affine_pair", 1.0)),
-        lambda_affine_reg=float(lcfg.get("lambda_affine_reg", 0.1)),
-        lambda_height=float(lcfg.get("lambda_height", 1.0)),
-        lambda_height_anchor=float(lcfg.get("lambda_height_anchor", 0.5)),
-        lambda_point=float(lcfg.get("lambda_point", 1.0)),
-        lambda_point_xy=(None if "lambda_point_xy" not in lcfg else float(lcfg.get("lambda_point_xy"))),
-        lambda_point_z=(None if "lambda_point_z" not in lcfg else float(lcfg.get("lambda_point_z"))),
-        lambda_height_meter_aux=float(lcfg.get("lambda_height_meter_aux", 1.0e-3)),
-        lambda_height_anchor_meter_aux=float(lcfg.get("lambda_height_anchor_meter_aux", 1.0e-3)),
-        lambda_point_z_meter_aux=float(lcfg.get("lambda_point_z_meter_aux", 1.0e-3)),
-        lambda_point_reproj=float(lcfg.get("lambda_point_reproj", 0.2)),
-        lambda_height_reproj=float(lcfg.get("lambda_height_reproj", 0.2)),
-        lambda_point_pair=float(lcfg.get("lambda_point_pair", 0.1)),
-        lambda_normal_height=float(lcfg.get("lambda_normal_height", 0.2)),
-        lambda_normal_point=float(lcfg.get("lambda_normal_point", 0.2)),
-        lambda_feature_nce=float(lcfg.get("lambda_feature_nce", 0.1)),
-        lambda_patch_match=float(lcfg.get("lambda_patch_match", 0.5)),
-        abs_keep_steps=int(lcfg.get("abs_keep_steps", lcfg.get("height_abs_keep_steps", 5000))),
-    )
-    point_pair_cfg = PointPairwiseLossCfg(
-        grid_h=int(lcfg.get("point_pair_grid_h", 64)),
-        grid_w=int(lcfg.get("point_pair_grid_w", 64)),
+    weights = EarlyPretrainWeightCfg(
+        lambda_feature_nce=float(lcfg.get("lambda_feature_nce", 1.0)),
+        lambda_patch_match=float(lcfg.get("lambda_patch_match", 1.0)),
+        lambda_match_coord=float(lcfg.get("lambda_match_coord", 1.0)),
+        lambda_match_ce=float(lcfg.get("lambda_match_ce", 1.0)),
+        lambda_match_cycle=float(lcfg.get("lambda_match_cycle", 0.0)),
+        lambda_projection=float(lcfg.get("lambda_projection", 1.0)),
+        lambda_early_height=float(lcfg.get("lambda_early_height", 1.0)),
+        pixel_loss_norm=float(lcfg.get("pixel_loss_norm", cfg.get("model", {}).get("detail_patch_size", 16))),
+        early_height_scale=float(lcfg.get("early_height_scale", cfg.get("model", {}).get("early_height_scale", 1000.0))),
     )
     feature_nce_cfg = FeatureInfoNCELossCfg(
         temperature=float(lcfg.get("feature_nce_temperature", 0.1)),
         max_pairs=int(lcfg.get("feature_nce_max_pairs", 4096)),
         match_max_pair=int(lcfg.get("feature_nce_match_max_pair", lcfg.get("match_max_pair", 12))),
-    )
-    normal_cfg = PointNormalLossCfg(
-        w_cos=float(lcfg.get("normal_w_cos", 1.0)),
-        w_l1=float(lcfg.get("normal_w_l1", 0.5)),
-        eps=float(lcfg.get("normal_eps", 1e-6)),
-        sign_invariant=bool(lcfg.get("normal_sign_invariant", True)),
-        detach_gt=bool(lcfg.get("normal_detach_gt", True)),
     )
     patch_match_cfg = PatchInternalMatchLossCfg(
         patch_size=int(cfg.get("model", {}).get("detail_patch_size", 16)),
@@ -121,23 +89,14 @@ def build_objective(cfg: dict[str, Any], geometry_ops: Any, patch_matcher: torch
         max_pairs=int(lcfg.get("patch_match_max_pairs", 4096)),
         match_max_pair=int(lcfg.get("patch_match_match_max_pair", lcfg.get("match_max_pair", 12))),
     )
-    return GeometryPretrainObjective(
-        geometry_ops=geometry_ops,
-        affine_grid_cfg=grid_cfg,
-        affine_pair_cfg=pair_cfg,
-        point_pair_cfg=point_pair_cfg,
+    return EarlyPretrainObjective(
+        geometry_ops=model.rpc_ops,
+        patch_matcher=model.patch_matcher,
+        early_height_head=model.early_height_head,
         feature_nce_cfg=feature_nce_cfg,
         patch_match_cfg=patch_match_cfg,
-        patch_matcher=patch_matcher,
-        normal_cfg=normal_cfg,
-        height_beta=float(lcfg.get("height_beta", 1.0)),
-        point_beta=float(lcfg.get("point_beta", 1.0)),
-        height_z_beta_meter=(None if "height_z_beta_meter" not in lcfg else float(lcfg.get("height_z_beta_meter"))),
-        height_anchor_z_beta_meter=float(lcfg.get("height_anchor_z_beta_meter", 5.0)),
-        point_z_beta_meter=(None if "point_z_beta_meter" not in lcfg else float(lcfg.get("point_z_beta_meter"))),
         weights=weights,
     )
-
 
 def build_optimizer_and_scheduler(cfg: dict[str, Any], model: torch.nn.Module):
     from scripts.train import build_optimizer_and_scheduler as _build_optimizer_and_scheduler
@@ -152,7 +111,7 @@ def build_dataloaders(cfg: dict[str, Any], distributed: bool):
 
 
 def run_sanity_once(model, objective, loader, device) -> None:
-    """几何预训练闭环自检：仅 model + objective 前向一次。"""
+    """early pretrain 闭环自检：仅 model + objective 前向一次。"""
     from engine.distributed import move_batch_to_device
 
     batch = next(iter(loader))
@@ -162,9 +121,9 @@ def run_sanity_once(model, objective, loader, device) -> None:
         outputs = model(batch)
         total_loss, scalar_dict, _ = objective(outputs, batch, global_step=0, epoch=0, render_outputs=None, mode="train")
 
-    print("[pretrain sanity] outputs keys:", sorted(list(outputs.keys()))[:10], "...")
-    print("[pretrain sanity] loss_total:", float(total_loss.detach().cpu().item()))
-    print("[pretrain sanity] scalar sample:", {k: scalar_dict[k] for k in list(scalar_dict.keys())[:8]})
+    print("[early pretrain sanity] outputs keys:", sorted(list(outputs.keys()))[:10], "...")
+    print("[early pretrain sanity] loss_total:", float(total_loss.detach().cpu().item()))
+    print("[early pretrain sanity] scalar sample:", {k: scalar_dict[k] for k in list(scalar_dict.keys())[:8]})
 
 
 def main() -> None:
@@ -199,7 +158,7 @@ def main() -> None:
     _startup_log("config_loaded")
 
     system_cfg = cfg.get("system", {})
-    work_dir = Path(system_cfg.get("work_dir", "work_dirs/pretrain_default"))
+    work_dir = Path(system_cfg.get("work_dir", "work_dirs/early_pretrain_default"))
     work_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_cfg = cfg.get("checkpoint", {})
     checkpoints_dir = Path(checkpoint_cfg.get("checkpoints_dir", str(work_dir / "checkpoints")))
@@ -222,20 +181,23 @@ def main() -> None:
     train_loader, val_loader = build_dataloaders(cfg, distributed=dist_state["distributed"])
     _startup_log("dataloaders_built", rank=int(dist_state["rank"]))
 
-    # 预训练阶段永久跳过高斯分支（同时避免分支参数进入优化与 DDP 归约路径）。
+    # Early pretrain 阶段禁用 Gaussian/render 分支（phase 1 仍复用现有 forward 主流程）。
     model_cfg = cfg.get("model", {})
     if bool(model_cfg.get("enable_gaussian_branch", True)):
-        _startup_log("force_disable_gaussian_branch_for_pretrain", rank=int(dist_state["rank"]))
+        _startup_log("force_disable_gaussian_branch_for_early_pretrain", rank=int(dist_state["rank"]))
     model_cfg["enable_gaussian_branch"] = False
     cfg["model"] = model_cfg
 
     model = build_model(cfg).to(device)
-    if hasattr(model, "set_pretrain_geometry_only"):
-        model.set_pretrain_geometry_only(True)
-    elif hasattr(model, "gaussian_head"):
-        model.gaussian_head.requires_grad_(False)
+    train_detail_encoder = bool(cfg.get("early_pretrain", {}).get("train_detail_encoder", False))
+    if hasattr(model, "set_early_pretrain_only"):
+        model.set_early_pretrain_only(True, train_detail_encoder=train_detail_encoder)
+    else:
+        raise AttributeError("Sat2World model must provide set_early_pretrain_only for early pretrain.")
+    if int(dist_state["rank"]) == 0 and hasattr(model, "trainable_parameter_summary"):
+        print(f"[early_pretrain] trainable_parameter_summary={model.trainable_parameter_summary()}", flush=True)
     _startup_log("model_built_and_to_device", rank=int(dist_state["rank"]))
-    objective = build_objective(cfg, model.rpc_ops, model.patch_matcher)
+    objective = build_objective(cfg, model)
     _startup_log("objective_built", rank=int(dist_state["rank"]))
     optimizer, scheduler = build_optimizer_and_scheduler(cfg, model)
     _startup_log("optimizer_and_scheduler_built", rank=int(dist_state["rank"]))

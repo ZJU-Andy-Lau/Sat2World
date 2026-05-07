@@ -14,14 +14,13 @@ system:
   checkpoint_match_by_shape: true
   checkpoint_load_model_only: true
   checkpoint_model_strict: false
-  resume_path: ""
-  checkpoint_path: ""
+  resume_path: ''
+  checkpoint_path: ''
   eval_only: false
-
 data:
   train:
     root: ./data/JAX_train
-    max_view_num: 4
+    max_view_num: 2
     min_view_num: 2
     samples_per_scene: 20
     min_views: 2
@@ -38,14 +37,31 @@ data:
     fit_pinhole_in_dataset: false
     fit_pinhole_keep_diagnostics: false
     perturb_cfg:
-      tx_range: [ -5.0, 5.0 ]
-      ty_range: [ -5.0, 5.0 ]
-      scale_range: [ -0.0001, 0.0001 ]
-      shear_range: [ -0.0001, 0.0001 ]
+      tx_range:
+      - -5.0
+      - 5.0
+      ty_range:
+      - -5.0
+      - 5.0
+      scale_range:
+      - -0.0001
+      - 0.0001
+      shear_range:
+      - -0.0001
+      - 0.0001
+    augment:
+      color_jitter:
+        enable: true
+        p: 0.8
+        brightness: 0.2
+        contrast: 0.2
+        saturation: 0.2
+        hue: 0.02
+        same_across_views: false
   val:
     root: ./data/JAX_val
-    max_view_num: 6
-    min_view_num: 3
+    max_view_num: 2
+    min_view_num: 2
     samples_per_scene: 1
     min_views: 2
     apply_perturbation: true
@@ -61,10 +77,27 @@ data:
     fit_pinhole_in_dataset: false
     fit_pinhole_keep_diagnostics: false
     perturb_cfg:
-      tx_range: [ -5.0, 5.0 ]
-      ty_range: [ -5.0, 5.0 ]
-      scale_range: [ -0.0001, 0.0001 ]
-      shear_range: [ -0.0001, 0.0001 ]
+      tx_range:
+      - -5.0
+      - 5.0
+      ty_range:
+      - -5.0
+      - 5.0
+      scale_range:
+      - -0.0001
+      - 0.0001
+      shear_range:
+      - -0.0001
+      - 0.0001
+    augment:
+      color_jitter:
+        enable: false
+        p: 0.0
+        brightness: 0.2
+        contrast: 0.2
+        saturation: 0.2
+        hue: 0.02
+        same_across_views: false
   test:
     root: ./data/JAX_val
     crop_size: 256
@@ -76,13 +109,11 @@ data:
     persistent_workers: true
     prefetch_factor: 2
     drop_last: true
-
 geometry:
   rpc_dtype: float64
   net_dtype: float32
-
 model:
-  dino_weight_path: "./weights/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
+  dino_weight_path: ./weights/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth
   pretrained: true
   freeze_backbone: true
   patch_size: 16
@@ -91,7 +122,11 @@ model:
   fusion_dim: 1024
   encoder_depth: 8
   encoder_num_scene_tokens: 4
-  intermediate_layer_idx: [5, 11, 17, 23]
+  intermediate_layer_idx:
+  - 5
+  - 11
+  - 17
+  - 23
   dense_pos_embed: true
   dense_down_ratio: 1
   dense_frames_chunk_size: 8
@@ -108,7 +143,9 @@ model:
   encoder_num_heads: 8
   encoder_ffn_ratio: 4.0
   encoder_dropout: 0.0
-  encoder_aa_order: [frame, global]
+  encoder_aa_order:
+  - frame
+  - global
   encoder_aa_block_size: 1
   encoder_qkv_bias: true
   encoder_proj_bias: true
@@ -124,41 +161,50 @@ model:
   height_anchor_scale: 200.0
   height_local_scale: 30.0
   height_z_max: 4.0
-  point_bins_xy: 33
-  point_bin_size_xy: 0.1
-  point_fine_range_xy: 0.05
-  center_downsample_stage_steps: [0,100,200]
-  center_downsample_factors: [4,2,1]
+  point_bins_latlon: 33
+  geometry_feature_dim: 30
+  point_bin_size_latlon: 0.1
+  point_fine_range_latlon: 0.05
+  center_downsample_stage_steps:
+  - 0
+  - 100
+  - 200
+  center_downsample_factors:
+  - 4
+  - 2
+  - 1
   enable_gaussian_branch: false
   sh_dim: 48
-  gaussian_scale_epsilon: 1.0e-4
+  gaussian_scale_epsilon: 0.0001
   output_raw_logits: true
-
+  early_match_dim: 256
+  early_match_residual_hidden_dim: 512
+  early_match_residual_scale: 16.0
+  early_match_enable_residual: true
+  early_projection_hidden_dim: 512
+  early_height_hidden_dim: 512
+  early_height_scale: 1000.0
 loss:
-  lambda_affine_grid: 5.0
-  lambda_affine_pair: 1.0
-  lambda_affine_reg: 0.1
-  lambda_height: 1.0
-  lambda_height_anchor: 0.5
+  lambda_affine_grid: 0.0
+  lambda_affine_pair: 0.0
+  lambda_affine_reg: 0.0
+  lambda_height: 0.0
+  lambda_height_anchor: 0.0
   abs_keep_steps: 100000
-  lambda_point: 1.0
-  lambda_point_xy: 1.0
-  lambda_point_z: 1.0
-  lambda_height_meter_aux: 1.0e-3
-  lambda_height_anchor_meter_aux: 1.0e-3
-  lambda_point_z_meter_aux: 1.0e-3
-  lambda_point_pair: 0.5
-  lambda_height_reproj: 0.5
-  lambda_point_reproj: 0.5
-  lambda_normal_height: 1.0
-  lambda_normal_point: 1.0
+  lambda_point: 0.0
+  lambda_height_meter_aux: 0.0
+  lambda_height_anchor_meter_aux: 0.0
+  lambda_point_pair: 0.0
+  lambda_height_reproj: 0.0
+  lambda_point_reproj: 0.0
+  lambda_normal_height: 0.0
   lambda_patch_match: 0.5
   match_max_pair: 12
   patch_match_subpix_weight: 0.25
   patch_match_max_pairs: 4096
   normal_w_cos: 1.0
   normal_w_l1: 0.5
-  normal_eps: 1.0e-6
+  normal_eps: 1.0e-06
   normal_sign_invariant: true
   normal_detach_gt: true
   lambda_feature_nce: 10.0
@@ -170,25 +216,31 @@ loss:
   height_z_beta_meter: 1.0
   height_anchor_z_beta_meter: 1.0
   point_beta: 1.0
-  point_z_beta_meter: 1.0
   affine_grid_h: 16
   affine_grid_w: 16
   anchors_per_pair: 256
   max_pairs: 12
   sample_from_valid_only: true
-
+  lambda_match_coord: 1.0
+  lambda_projection: 1.0
+  lambda_early_height: 1.0
+  lambda_match_ce: 1.0
+  lambda_match_cycle: 0.0
+  pixel_loss_norm: 16.0
+  early_height_scale: 1000.0
 optim:
   type: adamw
-  base_lr: 2.0e-5
+  base_lr: 2.0e-05
   backbone_lr_mult: 0.5
   weight_decay: 0.01
-  betas: [0.9, 0.999]
-  eps: 1.0e-8
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1.0e-08
   scheduler: warmup_cosine
   warmup_steps: 600
   max_steps: 30000
   min_lr_ratio: 0.01
-
 train:
   max_epochs: 200
   accumulate_steps: 2
@@ -214,7 +266,6 @@ train:
   max_val_steps: -1
   device_sanity_check: false
   enable_fixed_monitor_cache: true
-
 logging:
   tensorboard:
     enable: true
@@ -231,7 +282,6 @@ logging:
     fixed_monitor_samples: 1
     record_histograms: true
     record_pointcloud: true
-
 checkpoint:
   checkpoints_dir: work_dirs/early_pretrain_0428_1/checkpoints
   save_last: true
@@ -241,3 +291,5 @@ checkpoint:
   keep_last_n: 5
   save_optimizer_state: true
   save_scheduler_state: true
+early_pretrain:
+  train_detail_encoder: false

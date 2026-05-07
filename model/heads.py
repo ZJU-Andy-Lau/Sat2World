@@ -327,38 +327,23 @@ class DenseHeightLocalHead(nn.Module):
         return self.net(feat)
 
 
-class PointXYHead(nn.Module):
-    def __init__(self, in_ch: int = 256, num_bins_xy: int = 33) -> None:
+class PointLatLonHead(nn.Module):
+    def __init__(self, in_ch: int = 256, num_bins_latlon: int = 33) -> None:
         super().__init__()
         self.trunk = ConvBlock(in_ch, in_ch)
-        self.x_logits = nn.Conv2d(in_ch, num_bins_xy, kernel_size=1)
-        self.y_logits = nn.Conv2d(in_ch, num_bins_xy, kernel_size=1)
-        self.x_fine = nn.Conv2d(in_ch, 1, kernel_size=1)
-        self.y_fine = nn.Conv2d(in_ch, 1, kernel_size=1)
+        self.lat_logits = nn.Conv2d(in_ch, num_bins_latlon, kernel_size=1)
+        self.lon_logits = nn.Conv2d(in_ch, num_bins_latlon, kernel_size=1)
+        self.lat_fine = nn.Conv2d(in_ch, 1, kernel_size=1)
+        self.lon_fine = nn.Conv2d(in_ch, 1, kernel_size=1)
 
     def forward(self, feat: torch.Tensor) -> dict[str, torch.Tensor]:
         x = self.trunk(feat)
         return {
-            "x_logits": self.x_logits(x),
-            "y_logits": self.y_logits(x),
-            "x_fine": self.x_fine(x),
-            "y_fine": self.y_fine(x),
+            "lat_logits": self.lat_logits(x),
+            "lon_logits": self.lon_logits(x),
+            "lat_fine": self.lat_fine(x),
+            "lon_fine": self.lon_fine(x),
         }
-
-
-class PointZLocalHead(nn.Module):
-    def __init__(self, in_ch: int = 256, hidden_ch: int = 256) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            ConvBlock(in_ch, hidden_ch),
-            nn.Conv2d(hidden_ch, 1, kernel_size=1),
-        )
-        last = self.net[-1]
-        nn.init.zeros_(last.weight)
-        nn.init.zeros_(last.bias)
-
-    def forward(self, feat: torch.Tensor) -> torch.Tensor:
-        return self.net(feat)
 
 
 class GaussianHead(nn.Module):

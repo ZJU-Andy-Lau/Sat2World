@@ -132,7 +132,6 @@ def main() -> None:
                 "affine_pred",
                 "rpc_corrected",
                 "height_abs",
-                "point_abs",
                 "gaussian_centers_rpc",
                 "gaussian_centers_point",
             ]

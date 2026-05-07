@@ -169,6 +169,96 @@ class RPCGeometryOps:
         )
         return lines, samps
 
+    def linesamp_to_latlon(
+        self,
+        rpc_obj: RPCModelParameterTorch,
+        lines: torch.Tensor,
+        samps: torch.Tensor,
+        heights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single RPC raw inverse projection: (line,samp,height) -> (lat,lon).
+
+        Coordinates are crop-image pixels in ``line/samp`` order.  Returned
+        tensors are raw geodetic degrees in ``lat/lon`` order.  RPC adjustment
+        parameters stored in ``rpc_obj`` are applied by ``RPC_PHOTO2OBJ``.
+        """
+        lat, lon = rpc_obj.RPC_PHOTO2OBJ(
+            insamp=samps.to(dtype=self.rpc_dtype, device=rpc_obj.device),
+            inline=lines.to(dtype=self.rpc_dtype, device=rpc_obj.device),
+            inhei=heights.to(dtype=self.rpc_dtype, device=rpc_obj.device),
+            output_type="tensor",
+        )
+        return lat, lon
+
+    def latlon_to_linesamp(
+        self,
+        rpc_obj: RPCModelParameterTorch,
+        lats: torch.Tensor,
+        lons: torch.Tensor,
+        heights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single RPC raw projection: (lat,lon,height) -> (line,samp).
+
+        Inputs are raw geodetic degrees in ``lat/lon`` order.  Outputs are
+        crop-image pixels in ``line/samp`` order.  RPC adjustment parameters
+        stored in ``rpc_obj`` are applied by ``RPC_OBJ2PHOTO``.
+        """
+        samp, line = rpc_obj.RPC_OBJ2PHOTO(
+            lats.to(dtype=self.rpc_dtype, device=rpc_obj.device),
+            lons.to(dtype=self.rpc_dtype, device=rpc_obj.device),
+            heights.to(dtype=self.rpc_dtype, device=rpc_obj.device),
+            output_type="tensor",
+        )
+        return line, samp
+
+    def normalize_latlon(self, lat: torch.Tensor, lon: torch.Tensor, center: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """Normalize raw ``lat/lon`` degrees with [2] lat/lon center and scale."""
+        c = center.to(device=lat.device, dtype=lat.dtype)
+        s = scale.to(device=lat.device, dtype=lat.dtype).clamp_min(1e-12)
+        return torch.stack([(lat - c[0]) / s[0], (lon - c[1]) / s[1]], dim=-1)
+
+    def unnormalize_latlon(self, latlon_norm: torch.Tensor, center: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """Invert normalized lat/lon coordinates. Last dim order is lat/lon."""
+        c = center.to(device=latlon_norm.device, dtype=latlon_norm.dtype)
+        s = scale.to(device=latlon_norm.device, dtype=latlon_norm.dtype).clamp_min(1e-12)
+        return latlon_norm * s.view(*([1] * (latlon_norm.ndim - 1)), 2) + c.view(*([1] * (latlon_norm.ndim - 1)), 2)
+
+    def linesamp_to_latlon_batch(
+        self,
+        rpc_batch: Sequence[Sequence[RPCModelParameterTorch]],
+        lines: torch.Tensor,
+        samps: torch.Tensor,
+        heights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Batch raw inverse projection for [B,V,N] line/samp/height tensors."""
+        b, v, n = lines.shape
+        lats = torch.empty((b, v, n), device=lines.device, dtype=self.net_dtype)
+        lons = torch.empty((b, v, n), device=lines.device, dtype=self.net_dtype)
+        for bi in range(b):
+            for vi in range(v):
+                lat, lon = self.linesamp_to_latlon(rpc_batch[bi][vi], lines[bi, vi], samps[bi, vi], heights[bi, vi])
+                lats[bi, vi] = lat.to(device=lines.device, dtype=self.net_dtype)
+                lons[bi, vi] = lon.to(device=lines.device, dtype=self.net_dtype)
+        return lats, lons
+
+    def latlon_to_linesamp_batch(
+        self,
+        rpc_batch: Sequence[Sequence[RPCModelParameterTorch]],
+        lats: torch.Tensor,
+        lons: torch.Tensor,
+        heights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Batch raw projection for [B,V,N] lat/lon/height tensors."""
+        b, v, n = lats.shape
+        lines = torch.empty((b, v, n), device=lats.device, dtype=self.net_dtype)
+        samps = torch.empty((b, v, n), device=lats.device, dtype=self.net_dtype)
+        for bi in range(b):
+            for vi in range(v):
+                line, samp = self.latlon_to_linesamp(rpc_batch[bi][vi], lats[bi, vi], lons[bi, vi], heights[bi, vi])
+                lines[bi, vi] = line.to(device=lats.device, dtype=self.net_dtype)
+                samps[bi, vi] = samp.to(device=lats.device, dtype=self.net_dtype)
+        return lines, samps
+
     def linesamp_to_xy_batch(
         self,
         rpc_batch: Sequence[Sequence[RPCModelParameterTorch]],
@@ -246,29 +336,27 @@ class RPCGeometryOps:
         patch_centers: torch.Tensor,
         height_ref: torch.Tensor,
         *,
-        scene_xy_center: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
-        scene_xy_scale: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
+        scene_latlon_center: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
+        scene_latlon_scale: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
     ) -> torch.Tensor:
-        """批量计算 patch 级 45 维几何特征。
+        """Build derivative-free 30D patch geometry features.
 
-        参数:
-            rpc_batch: [B][V] RPC 列表。
-            patch_centers: [N,2] 或 [B,V,N,2]，顺序 (line,samp)。
-            height_ref: [B,V]。
-            scene_xy_center/scene_xy_scale: [B,2] 或等价 list。
+        New feature layout (last dimension):
+        - 9 height layers of normalized raw geodetic lat/lon: 18 dims;
+        - the corresponding 9 RPC-normalized heights: 9 dims;
+        - RPC-normalized line and samp: 2 dims;
+        - this view RPC HEIGHT_OFF / 1000: 1 dim.
 
-        返回:
-            geom_feat: [B,V,N,45]，float32。
-
-        说明:
-            本函数默认不对 affine 保梯度，内部使用 no_grad 调用几何特征接口，
-            以控制显存与图复杂度。
+        The model input still uses ``rpc_batch`` (currently rpc_init).  Lat/lon
+        normalization parameters must be scene-level ``scene_latlon_*`` in
+        lat/lon order, normally estimated from reference-view rpc_gt corners.
         """
         if height_ref.ndim != 2:
             raise ValueError(f"height_ref must be [B,V], got {tuple(height_ref.shape)}")
-
         b, v = height_ref.shape
-        centers, scales = self._normalize_scene_xy(scene_xy_center, scene_xy_scale, b, height_ref.device)
+        if scene_latlon_center is None or scene_latlon_scale is None:
+            raise ValueError("scene_latlon_center/scale are required for 30D normalized-lat/lon geometry features")
+        latlon_centers, latlon_scales = self._normalize_scene_latlon(scene_latlon_center, scene_latlon_scale, b, height_ref.device)
 
         if patch_centers.ndim == 2:
             n = patch_centers.shape[0]
@@ -281,70 +369,29 @@ class RPCGeometryOps:
         else:
             raise ValueError(f"Unsupported patch_centers shape: {tuple(patch_centers.shape)}")
 
-        out = torch.empty((b, v, n, 45), device=height_ref.device, dtype=self.net_dtype)
+        out = torch.empty((b, v, n, 30), device=height_ref.device, dtype=self.net_dtype)
         h_offsets = torch.tensor([-50.0, -10.0, -5.0, -1.0, 0.0, 1.0, 5.0, 10.0, 50.0], dtype=self.rpc_dtype)
-
         for bi in range(b):
+            center = latlon_centers[bi].to(device=height_ref.device, dtype=self.rpc_dtype)
+            scale = latlon_scales[bi].to(device=height_ref.device, dtype=self.rpc_dtype).clamp_min(1e-12)
             for vi in range(v):
                 rpc_obj = rpc_batch[bi][vi]
                 coords = centers_bv[bi, vi].to(dtype=self.rpc_dtype, device=rpc_obj.device)
-                h_ref_scalar = float(height_ref[bi, vi].item())
-                dem = torch.full((n,), h_ref_scalar, dtype=self.rpc_dtype, device=rpc_obj.device)
-                xy_center = self._to_rpc_param(centers[bi], rpc_obj.device)
-                xy_scale = self._to_rpc_param(scales[bi], rpc_obj.device)
-
-                feat = rpc_obj.compute_geometry_features(
-                    Coords=coords,
-                    dem=dem,
-                    xy_center=xy_center,
-                    xy_scale=xy_scale,
-                )
-                h_ref_digits = self._encode_height_ref_digits(h_ref_scalar, device=rpc_obj.device)
-                h_ref_digits_n = h_ref_digits.unsqueeze(0).expand(n, -1)  # [N,5]
-
-                h_anchors = dem.unsqueeze(1) + h_offsets.to(device=rpc_obj.device).unsqueeze(0)  # [N,9]
+                h_off = rpc_obj.HEIGHT_OFF.to(dtype=self.rpc_dtype, device=rpc_obj.device)
+                h_scale = rpc_obj.HEIGHT_SCALE.to(dtype=self.rpc_dtype, device=rpc_obj.device).abs().clamp_min(1e-6)
+                h_layers = h_off + h_offsets.to(device=rpc_obj.device).view(1, 9)
                 line_rep = coords[:, 0].unsqueeze(1).expand(-1, 9).reshape(-1)
                 samp_rep = coords[:, 1].unsqueeze(1).expand(-1, 9).reshape(-1)
-                h_rep = h_anchors.reshape(-1)
-                x_norm_rep, y_norm_rep = rpc_obj.RPC_LINESAMP2XY(
-                    line_in=line_rep,
-                    samp_in=samp_rep,
-                    h_in=h_rep,
-                    output_type="tensor",
-                    xy_center=xy_center,
-                    xy_scale=xy_scale,
-                )
-                xy_anchors = torch.stack([x_norm_rep, y_norm_rep], dim=-1).view(n, 9, 2).reshape(n, 18)  # [N,18]
-
-                line_samp_norm = coords / 1000.0  # [N,2]: (line/1000, samp/1000)
-                feat45 = torch.cat([feat, h_ref_digits_n, xy_anchors, line_samp_norm], dim=-1)
-                out[bi, vi] = feat45.detach().to(dtype=self.net_dtype, device=height_ref.device)
-
+                h_rep = h_layers.expand(n, -1).reshape(-1)
+                lat, lon = self.linesamp_to_latlon(rpc_obj, line_rep, samp_rep, h_rep)
+                latlon_norm = torch.stack([(lat - center[0]) / scale[0], (lon - center[1]) / scale[1]], dim=-1).view(n, 18)
+                h_norm = ((h_layers - h_off) / h_scale).expand(n, -1)
+                line_norm = ((coords[:, 0] - rpc_obj.LINE_OFF) / rpc_obj.LINE_SCALE.abs().clamp_min(1e-6)).view(n, 1)
+                samp_norm = ((coords[:, 1] - rpc_obj.SAMP_OFF) / rpc_obj.SAMP_SCALE.abs().clamp_min(1e-6)).view(n, 1)
+                h_off_norm = (h_off / 1000.0).expand(n, 1)
+                feat30 = torch.cat([latlon_norm, h_norm, line_norm, samp_norm, h_off_norm], dim=-1)
+                out[bi, vi] = feat30.detach().to(dtype=self.net_dtype, device=height_ref.device)
         return out
-
-    def _encode_height_ref_digits(self, h_ref: float, *, device: torch.device) -> torch.Tensor:
-        """将 h_ref 编码为 5 维：[千位, 百位, 十位, 个位, 小数]，并归一化到 [0,1]。"""
-        h_abs = abs(float(h_ref))
-        int_part = int(h_abs)
-        frac_part = h_abs - float(int_part)
-        sym = 0.0 if h_abs < 1e-8 else (h_ref / h_abs)
-
-        thousands = (int_part // 1000) % 10
-        hundreds = (int_part // 100) % 10
-        tens = (int_part // 10) % 10
-        ones = int_part % 10
-
-        return torch.tensor(
-            [
-                sym * float(thousands) / 9.0,
-                sym * float(hundreds) / 9.0,
-                sym * float(tens) / 9.0,
-                sym * float(ones) / 9.0,
-                sym * float(frac_part),
-            ],
-            dtype=self.rpc_dtype,
-            device=device,
-        )
 
     def centers_from_rpc_and_height_batch(
         self,
@@ -431,58 +478,55 @@ class RPCGeometryOps:
 
         return out
 
-    def build_point_anchor_map_batch(
+
+    def build_point_latlon_anchor_map_batch(
         self,
         rpc_init_batch: Sequence[Sequence[RPCModelParameterTorch]],
         pixel_grid: torch.Tensor,
         height_ref: torch.Tensor,
         *,
-        scene_xy_center: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
-        scene_xy_scale: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
+        scene_latlon_center: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
+        scene_latlon_scale: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
     ) -> torch.Tensor:
-        """基于初始 RPC 与 h_ref 构造点云绝对锚点。
+        """Build point-head anchors in normalized raw lat/lon coordinates.
 
-        参数:
-            rpc_init_batch: [B][V] 初始 RPC。
-            pixel_grid: [H,W,2]。
-            height_ref: [B,V]。
+        Args:
+            rpc_init_batch: [B][V] initial RPCs used by model input geometry.
+            pixel_grid: [H,W,2] crop-image pixels in line/samp order.
+            height_ref: [B,V] reference height per view.
+            scene_latlon_center/scale: [B,2] in raw degree lat/lon order,
+                normally estimated from reference-view GT RPC crop corners.
 
-        返回:
-            point_anchor: [B,V,3,H,W]，(x,y,h_ref)。
+        Returns:
+            [B,V,2,H,W] with channels lat_norm/lon_norm.  This function does
+            not use legacy local-meter ``scene_xy_*`` normalization.
         """
         if pixel_grid.ndim != 3 or pixel_grid.shape[-1] != 2:
-            raise ValueError("pixel_grid must be [H,W,2]")
+            raise ValueError("pixel_grid must be [H,W,2] in line/samp order")
         if height_ref.ndim != 2:
             raise ValueError("height_ref must be [B,V]")
 
         b, v = height_ref.shape
         h, w = pixel_grid.shape[:2]
-        centers, scales = self._normalize_scene_xy(scene_xy_center, scene_xy_scale, b, height_ref.device)
+        if scene_latlon_center is None or scene_latlon_scale is None:
+            raise ValueError("scene_latlon_center/scale are required for point_latlon_anchor")
+        centers, scales = self._normalize_scene_latlon(scene_latlon_center, scene_latlon_scale, b, height_ref.device)
 
         line = pixel_grid[..., 0].reshape(-1)
         samp = pixel_grid[..., 1].reshape(-1)
-
-        out = torch.empty((b, v, 3, h, w), device=height_ref.device, dtype=self.net_dtype)
+        out = torch.empty((b, v, 2, h, w), device=height_ref.device, dtype=self.net_dtype)
 
         for bi in range(b):
+            center = centers[bi].to(device=height_ref.device, dtype=self.rpc_dtype)
+            scale = scales[bi].to(device=height_ref.device, dtype=self.rpc_dtype).clamp_min(1e-12)
             for vi in range(v):
                 rpc_obj = rpc_init_batch[bi][vi]
                 h_val = float(height_ref[bi, vi].item())
                 h_flat = torch.full((h * w,), h_val, device=height_ref.device, dtype=self.net_dtype)
-
-                x, y = self.linesamp_to_xy(
-                    rpc_obj,
-                    lines=line,
-                    samps=samp,
-                    heights=h_flat,
-                    xy_center=centers[bi],
-                    xy_scale=scales[bi],
-                )
-                x = x.reshape(h, w).to(dtype=self.net_dtype, device=height_ref.device)
-                y = y.reshape(h, w).to(dtype=self.net_dtype, device=height_ref.device)
-                z = torch.full((h, w), h_val, device=height_ref.device, dtype=self.net_dtype)
-                out[bi, vi] = torch.stack([x, y, z], dim=0)
-
+                lat, lon = self.linesamp_to_latlon(rpc_obj, lines=line, samps=samp, heights=h_flat)
+                lat_norm = ((lat - center[0]) / scale[0]).reshape(h, w).to(dtype=self.net_dtype, device=height_ref.device)
+                lon_norm = ((lon - center[1]) / scale[1]).reshape(h, w).to(dtype=self.net_dtype, device=height_ref.device)
+                out[bi, vi] = torch.stack([lat_norm, lon_norm], dim=0)
         return out
 
     def _to_rpc_param(
@@ -496,6 +540,33 @@ class RPCGeometryOps:
         if torch.is_tensor(value):
             return value.to(device=device, dtype=self.rpc_dtype)
         return torch.as_tensor(value, device=device, dtype=self.rpc_dtype)
+
+    def _normalize_scene_latlon(
+        self,
+        scene_latlon_center: Optional[torch.Tensor | Sequence[Sequence[float]]],
+        scene_latlon_scale: Optional[torch.Tensor | Sequence[Sequence[float]]],
+        batch_size: int,
+        device: torch.device,
+    ) -> tuple[list[Optional[torch.Tensor]], list[Optional[torch.Tensor]]]:
+        """Normalize scene-level lat/lon center/scale into B-length lists."""
+        def _norm(data, name):
+            if data is None:
+                return [None for _ in range(batch_size)]
+            if torch.is_tensor(data):
+                t = data.to(device=device)
+                if t.ndim == 1 and t.numel() == 2:
+                    return [t for _ in range(batch_size)]
+                if t.ndim == 2 and t.shape == (batch_size, 2):
+                    return [t[i] for i in range(batch_size)]
+                raise ValueError(f"{name} tensor shape must be [2] or [B,2], got {tuple(t.shape)}")
+            seq = list(data)
+            if len(seq) == 2 and not isinstance(seq[0], (list, tuple, torch.Tensor)):
+                t = torch.as_tensor(seq, device=device, dtype=self.net_dtype)
+                return [t for _ in range(batch_size)]
+            if len(seq) != batch_size:
+                raise ValueError(f"{name} list length must be B={batch_size}, got {len(seq)}")
+            return [torch.as_tensor(seq[i], device=device, dtype=self.net_dtype) for i in range(batch_size)]
+        return _norm(scene_latlon_center, "scene_latlon_center"), _norm(scene_latlon_scale, "scene_latlon_scale")
 
     def _normalize_scene_xy(
         self,

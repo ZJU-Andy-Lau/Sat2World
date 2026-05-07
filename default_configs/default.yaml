@@ -11,7 +11,7 @@ system:
   compile_model: false
   ddp_backend: nccl
   auto_resume: true
-  checkpoint_match_by_shape: false
+  checkpoint_match_by_shape: true
   checkpoint_load_model_only: true
   checkpoint_model_strict: true
   resume_path: ""
@@ -140,9 +140,10 @@ model:
   height_anchor_scale: 200.0
   height_local_scale: 30.0
   height_z_max: 4.0
-  point_bins_xy: 33
-  point_bin_size_xy: 0.1
-  point_fine_range_xy: 0.05
+  point_bins_latlon: 33
+  geometry_feature_dim: 30
+  point_bin_size_latlon: 0.1
+  point_fine_range_latlon: 0.05
   center_downsample_stage_steps: [0, 10, 20]
   center_downsample_factors: [4, 2, 1]
   enable_gaussian_branch: true
@@ -197,7 +198,6 @@ loss:
   lambda_height_reproj: 0.2
   lambda_point_reproj: 0.2
   lambda_normal_height: 10.0
-  lambda_normal_point: 10.0
   lambda_feature_nce: 10.0
   lambda_patch_match: 0.5
   match_max_pair: 12

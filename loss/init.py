@@ -7,8 +7,8 @@ from loss.affine_loss import AffineGridLoss, AffineLinearRegularization, AffineP
 from loss.common import masked_huber_loss, masked_l1_loss, masked_l2_loss, psnr_from_mse, softmax_entropy, ssim_map
 from loss.height_loss import HeightHuberLoss
 from loss.normal_loss import PointNormalLoss, PointNormalLossCfg
-from loss.point_loss import PointMapLoss
-from loss.point_pair_loss import HeightReprojectionLoss, PointPairwiseConsistencyLoss, PointPairwiseLossCfg, PointReprojectionLoss, point_map_to_metric
+from loss.point_loss import PointLatLonLoss
+from loss.point_pair_loss import HeightReprojectionLoss, PointPairwiseConsistencyLoss, PointPairwiseLossCfg, PointReprojectionLoss
 from loss.regularization_loss import CenterConsistencyLoss, CoderProbe, GaussianRegularizationLoss
 from loss.render_loss import RenderPathLoss
 from loss.total_loss import LossWeightScheduler, RPCAnySplatTrainingObjective
@@ -26,12 +26,11 @@ __all__ = [
     "HeightHuberLoss",
     "PointNormalLoss",
     "PointNormalLossCfg",
-    "PointMapLoss",
+    "PointLatLonLoss",
     "PointPairwiseConsistencyLoss",
     "PointPairwiseLossCfg",
     "PointReprojectionLoss",
     "HeightReprojectionLoss",
-    "point_map_to_metric",
     "RenderPathLoss",
     "GaussianRegularizationLoss",
     "CenterConsistencyLoss",

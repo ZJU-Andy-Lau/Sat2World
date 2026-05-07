@@ -35,6 +35,7 @@ if str(_ROOT) not in sys.path:
 
 from dataset.io import (  # noqa: E402
     compute_valid_crop_anchor_bbox,
+    estimate_scene_latlon_center_scale,
     estimate_scene_xy_center_scale,
     linesamp_to_raw_xy,
     raw_xy_to_linesamp,
@@ -447,6 +448,11 @@ def build_inference_batch(
         selected_height_ref=height_ref,
         ref_view_idx=ref_view_idx,
     )
+    scene_latlon_center, scene_latlon_scale = estimate_scene_latlon_center_scale(
+        ref_rpc_gt=rpc_gt_views[int(ref_view_idx)],
+        image_hw=(crop_size, crop_size),
+        h_offset=rpc_gt_views[int(ref_view_idx)].HEIGHT_OFF,
+    )
 
     batch = {
         "images": images_t.unsqueeze(0),
@@ -459,6 +465,8 @@ def build_inference_batch(
         "height_ref": height_ref.unsqueeze(0).to(torch.float32),
         "scene_xy_center": scene_xy_center.unsqueeze(0).to(torch.float32),
         "scene_xy_scale": scene_xy_scale.unsqueeze(0).to(torch.float32),
+        "scene_latlon_center": scene_latlon_center.unsqueeze(0).to(torch.float32),
+        "scene_latlon_scale": scene_latlon_scale.unsqueeze(0).to(torch.float32),
         "ref_view_idx": torch.tensor([ref_view_idx], dtype=torch.long),
         "scene_id": torch.tensor([int(scene_id)], dtype=torch.long),
         "view_ids": torch.tensor([[v.view_id for v in selected_views]], dtype=torch.long),
@@ -528,24 +536,6 @@ def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
         f.write("end_header\n")
         for p, c in zip(xyz, rgb):
             f.write(f"{float(p[0]):.6f} {float(p[1]):.6f} {float(p[2]):.6f} {int(c[0])} {int(c[1])} {int(c[2])}\n")
-
-
-def point_map_norm_to_local_meter(point_map_bv3hw: torch.Tensor, scene_xy_scale_b2: torch.Tensor | None) -> torch.Tensor:
-    """将 point path 从归一化 (x,y,z) 转换为局部米制 (x,y,z)，仅反 scale，不加 center。"""
-    if scene_xy_scale_b2 is None:
-        return point_map_bv3hw
-    if not torch.is_tensor(scene_xy_scale_b2):
-        raise TypeError("scene_xy_scale must be tensor when provided")
-    if scene_xy_scale_b2.ndim != 2 or scene_xy_scale_b2.shape[-1] != 2:
-        raise ValueError(f"scene_xy_scale must be [B,2], got {tuple(scene_xy_scale_b2.shape)}")
-    if scene_xy_scale_b2.shape[0] != point_map_bv3hw.shape[0]:
-        raise ValueError("scene_xy_scale batch size mismatch with point map")
-    out = point_map_bv3hw.clone()
-    scale_x = scene_xy_scale_b2[:, 1].to(device=out.device, dtype=out.dtype).view(-1, 1, 1, 1, 1)
-    scale_y = scene_xy_scale_b2[:, 0].to(device=out.device, dtype=out.dtype).view(-1, 1, 1, 1, 1)
-    out[:, :, 0:1] = out[:, :, 0:1] * scale_x
-    out[:, :, 1:2] = out[:, :, 1:2] * scale_y
-    return out
 
 
 def flatten_xyzrgb_from_maps(
@@ -1078,7 +1068,14 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
                 scene_xy_scale=scene_scale_for_rpc,
                 downsample_factor=1,
             )
-            centers_point = point_map_norm_to_local_meter(outputs["point_abs"], batch.get("scene_xy_scale", None))
+            centers_point = outputs.get("gaussian_centers_point", None)
+            if centers_point is None:
+                centers_point = model._point_latlon_height_to_local_meter(
+                    outputs["point_latlon_norm"],
+                    outputs["height_abs"],
+                    batch.get("scene_latlon_center", None),
+                    batch.get("scene_latlon_scale", None),
+                )
 
             stride = max(int(args.pointcloud_sample_stride), 1)
             xyz_rpc, rgb_rpc = flatten_xyzrgb_from_maps(
