@@ -236,7 +236,7 @@ def build_optimizer_and_scheduler(cfg: dict[str, Any], model: torch.nn.Module):
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        group_lr = lr * (backbone_mult if "backbone" in name else 1.0)
+        group_lr = lr * (backbone_mult if "backbone" or "encoder" in name else 1.0)
         no_decay = name.endswith("bias") or ("norm" in name.lower()) or ("bn" in name.lower())
         item = {"params": [p], "lr": group_lr, "weight_decay": 0.0 if no_decay else wd}
         (no_decay_params if no_decay else decay_params).append(item)
