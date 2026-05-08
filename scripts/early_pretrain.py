@@ -89,10 +89,23 @@ def build_objective(cfg: dict[str, Any], model: torch.nn.Module) -> Any:
         max_pairs=int(lcfg.get("patch_match_max_pairs", 4096)),
         match_max_pair=int(lcfg.get("patch_match_match_max_pair", lcfg.get("match_max_pair", 12))),
     )
+    if hasattr(model, "_require_early_heads"):
+        _, _, early_height_head = model._require_early_heads()
+    else:
+        early_height_head = getattr(model, "early_height_head", None)
+        if (
+            getattr(model, "early_global_match_head", None) is None
+            or getattr(model, "early_projection_head", None) is None
+            or early_height_head is None
+        ):
+            raise RuntimeError(
+                "EarlyPretrainObjective requires Sat2World early heads. "
+                "Set model.enable_early_heads: true before constructing the early_pretrain model."
+            )
     return EarlyPretrainObjective(
         geometry_ops=model.rpc_ops,
         patch_matcher=model.patch_matcher,
-        early_height_head=model.early_height_head,
+        early_height_head=early_height_head,
         feature_nce_cfg=feature_nce_cfg,
         patch_match_cfg=patch_match_cfg,
         weights=weights,
@@ -181,11 +194,14 @@ def main() -> None:
     train_loader, val_loader = build_dataloaders(cfg, distributed=dist_state["distributed"])
     _startup_log("dataloaders_built", rank=int(dist_state["rank"]))
 
-    # Early pretrain 阶段禁用 Gaussian/render 分支（phase 1 仍复用现有 forward 主流程）。
+    # Early pretrain 是唯一构造 early heads 的阶段；同时禁用 Gaussian/render 分支。
     model_cfg = cfg.get("model", {})
     if bool(model_cfg.get("enable_gaussian_branch", True)):
         _startup_log("force_disable_gaussian_branch_for_early_pretrain", rank=int(dist_state["rank"]))
+    if not bool(model_cfg.get("enable_early_heads", False)):
+        _startup_log("force_enable_early_heads_for_early_pretrain", rank=int(dist_state["rank"]))
     model_cfg["enable_gaussian_branch"] = False
+    model_cfg["enable_early_heads"] = True
     cfg["model"] = model_cfg
 
     model = build_model(cfg).to(device)

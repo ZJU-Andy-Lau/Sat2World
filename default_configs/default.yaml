@@ -147,6 +147,7 @@ model:
   center_downsample_stage_steps: [0, 10, 20]
   center_downsample_factors: [4, 2, 1]
   enable_gaussian_branch: true
+  enable_early_heads: false
   sh_dim: 48
   gaussian_scale_epsilon: 1.0e-4
   output_raw_logits: true

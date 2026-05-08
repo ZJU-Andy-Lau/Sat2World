@@ -27,7 +27,7 @@ if str(_ROOT) not in sys.path:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("Sat2World Train")
-    p.add_argument("--config", type=str, default="config/default.yaml")
+    p.add_argument("--config", type=str, default="default_configs/default.yaml")
     p.add_argument("--work-dir", type=str, default="")
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--checkpoint", type=str, default="")
@@ -105,6 +105,7 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
     if "center_downsample_factors" in m:
         scfg.center_downsample_factors = tuple(int(x) for x in m.get("center_downsample_factors", scfg.center_downsample_factors))
     scfg.enable_gaussian_branch = bool(m.get("enable_gaussian_branch", scfg.enable_gaussian_branch))
+    scfg.enable_early_heads = bool(m.get("enable_early_heads", scfg.enable_early_heads))
     scfg.nce_layer_index = int(m.get("nce_layer_index", scfg.nce_layer_index))
     scfg.nce_projector_dim = int(m.get("nce_projector_dim", scfg.nce_projector_dim))
     scfg.nce_projector_hidden_dim = int(m.get("nce_projector_hidden_dim", scfg.nce_projector_hidden_dim))
@@ -112,13 +113,14 @@ def build_model(cfg: dict[str, Any]) -> Sat2World:
     scfg.detail_token_dim = int(m.get("detail_token_dim", scfg.detail_token_dim))
     scfg.patch_match_dim = int(m.get("patch_match_dim", scfg.patch_match_dim))
     scfg.patch_match_layers = int(m.get("patch_match_layers", scfg.patch_match_layers))
-    scfg.early_global_match.match_dim = int(m.get("early_match_dim", scfg.early_global_match.match_dim))
-    scfg.early_global_match.residual_hidden_dim = int(m.get("early_match_residual_hidden_dim", scfg.early_global_match.residual_hidden_dim))
-    scfg.early_global_match.residual_scale = float(m.get("early_match_residual_scale", scfg.early_global_match.residual_scale))
-    scfg.early_global_match.enable_residual = bool(m.get("early_match_enable_residual", scfg.early_global_match.enable_residual))
-    scfg.early_projection.hidden_dim = int(m.get("early_projection_hidden_dim", scfg.early_projection.hidden_dim))
-    scfg.early_height.hidden_dim = int(m.get("early_height_hidden_dim", scfg.early_height.hidden_dim))
-    scfg.early_height.height_scale = float(m.get("early_height_scale", scfg.early_height.height_scale))
+    if bool(scfg.enable_early_heads):
+        scfg.early_global_match.match_dim = int(m.get("early_match_dim", scfg.early_global_match.match_dim))
+        scfg.early_global_match.residual_hidden_dim = int(m.get("early_match_residual_hidden_dim", scfg.early_global_match.residual_hidden_dim))
+        scfg.early_global_match.residual_scale = float(m.get("early_match_residual_scale", scfg.early_global_match.residual_scale))
+        scfg.early_global_match.enable_residual = bool(m.get("early_match_enable_residual", scfg.early_global_match.enable_residual))
+        scfg.early_projection.hidden_dim = int(m.get("early_projection_hidden_dim", scfg.early_projection.hidden_dim))
+        scfg.early_height.hidden_dim = int(m.get("early_height_hidden_dim", scfg.early_height.hidden_dim))
+        scfg.early_height.height_scale = float(m.get("early_height_scale", scfg.early_height.height_scale))
     return Sat2World(scfg)
 
 
