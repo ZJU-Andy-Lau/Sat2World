@@ -96,6 +96,7 @@ class Sat2WorldCfg:
     detail_token_dim: int = 1024
     patch_match_dim: int = 256
     patch_match_layers: int = 2
+    enable_early_heads: bool = False
     early_global_match: GlobalPatchMatchHeadCfg = field(default_factory=GlobalPatchMatchHeadCfg)
     early_projection: ProjectionPredictionHeadCfg = field(default_factory=ProjectionPredictionHeadCfg)
     early_height: CrossViewHeightHeadCfg = field(default_factory=CrossViewHeightHeadCfg)
@@ -177,9 +178,17 @@ class Sat2World(nn.Module):
             nn.GELU(),
             nn.Linear(int(cfg.nce_projector_hidden_dim), int(cfg.nce_projector_dim)),
         )
-        self.early_global_match_head = GlobalPatchMatchHead(self.backbone.embed_dim, cfg.early_global_match)
-        self.early_projection_head = ProjectionPredictionHead(self.backbone.embed_dim, cfg.early_projection)
-        self.early_height_head = CrossViewHeightHead(self.backbone.embed_dim, cfg.early_height)
+        self.early_global_match_head: Optional[GlobalPatchMatchHead]
+        self.early_projection_head: Optional[ProjectionPredictionHead]
+        self.early_height_head: Optional[CrossViewHeightHead]
+        if bool(cfg.enable_early_heads):
+            self.early_global_match_head = GlobalPatchMatchHead(self.backbone.embed_dim, cfg.early_global_match)
+            self.early_projection_head = ProjectionPredictionHead(self.backbone.embed_dim, cfg.early_projection)
+            self.early_height_head = CrossViewHeightHead(self.backbone.embed_dim, cfg.early_height)
+        else:
+            self.early_global_match_head = None
+            self.early_projection_head = None
+            self.early_height_head = None
 
         self.height_offset_decoder = BoundedSinhOffsetDecoder(z_max=cfg.height_z_max)
         self.point_lat_coder = SymmetricBinScalarCoder(
@@ -219,6 +228,21 @@ class Sat2World(nn.Module):
                 self._set_gaussian_trainable(True)
 
 
+    def _require_early_heads(self) -> tuple[GlobalPatchMatchHead, ProjectionPredictionHead, CrossViewHeightHead]:
+        """Return early-pretrain heads or raise a clear configuration error."""
+        if not bool(self.cfg.enable_early_heads):
+            raise RuntimeError(
+                "Early pretrain runtime requires model.enable_early_heads=true. "
+                "Set model.enable_early_heads: true before constructing Sat2World for early_pretrain."
+            )
+        if self.early_global_match_head is None or self.early_projection_head is None or self.early_height_head is None:
+            raise RuntimeError(
+                "Early pretrain runtime requires early_global_match_head, early_projection_head, "
+                "and early_height_head to be constructed. Set model.enable_early_heads: true "
+                "before constructing Sat2World for early_pretrain."
+            )
+        return self.early_global_match_head, self.early_projection_head, self.early_height_head
+
     def set_early_pretrain_only(self, enabled: bool, *, train_detail_encoder: bool = False) -> None:
         """Enable the lightweight early encoder-pretraining runtime mode.
 
@@ -235,6 +259,8 @@ class Sat2World(nn.Module):
             self._set_gaussian_trainable(bool(self.cfg.enable_gaussian_branch))
             return
 
+        early_global_match_head, early_projection_head, early_height_head = self._require_early_heads()
+
         self.requires_grad_(False)
         train_modules = [
             self.geom_mlp,
@@ -242,9 +268,9 @@ class Sat2World(nn.Module):
             self.encoder,
             self.nce_projector,
             self.patch_matcher,
-            self.early_global_match_head,
-            self.early_projection_head,
-            self.early_height_head,
+            early_global_match_head,
+            early_projection_head,
+            early_height_head,
         ]
         if bool(train_detail_encoder):
             train_modules.append(self.detail_encoder)
@@ -440,18 +466,19 @@ class Sat2World(nn.Module):
         patch_tokens_nce_proj = self.nce_projector(patch_tokens_layer_sel)
 
         if self.runtime_early_pretrain_only:
+            early_global_match_head, early_projection_head, early_height_head = self._require_early_heads()
             image_hw = (int(backbone_out["orig_hw"][0]), int(backbone_out["orig_hw"][1]))
-            early_match = self.early_global_match_head(
+            early_match = early_global_match_head(
                 patch_tokens_final,
                 patch_centers,
                 patch_valid_mask,
                 image_hw=image_hw,
             )
-            early_projection = self.early_projection_head(patch_tokens_final, view_tokens_final, image_hw=image_hw)
+            early_projection = early_projection_head(patch_tokens_final, view_tokens_final, image_hw=image_hw)
             # Graph-connected dummy height output keeps the height head in the
             # DDP graph even when a batch has no valid rpc_gt correspondence.
-            early_height_dummy_0_to_1 = self.early_height_head(patch_tokens_final[:, 0], patch_tokens_final[:, 1])
-            early_height_dummy_1_to_0 = self.early_height_head(patch_tokens_final[:, 1], patch_tokens_final[:, 0])
+            early_height_dummy_0_to_1 = early_height_head(patch_tokens_final[:, 0], patch_tokens_final[:, 1])
+            early_height_dummy_1_to_0 = early_height_head(patch_tokens_final[:, 1], patch_tokens_final[:, 0])
             return {
                 "patch_tokens_final": patch_tokens_final,
                 "patch_tokens_match": patch_tokens_layer_sel,
